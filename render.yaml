@@ -3,7 +3,7 @@ services:
     name: the-watcher
     runtime: docker
     plan: starter
-    region: oregon
+    region: frankfurt
     branch: main
     healthCheckPath: /health
     dockerfilePath: ./Dockerfile
@@ -45,5 +45,5 @@ services:
 databases:
   - name: watcher-db
     plan: starter
-    region: oregon
+    region: frankfurt
     postgresMajorVersion: "16"
