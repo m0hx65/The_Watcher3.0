@@ -2,16 +2,12 @@ services:
   - type: web
     name: the-watcher
     runtime: docker
-    plan: starter
+    plan: free
     region: frankfurt
     branch: main
     healthCheckPath: /health
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    disk:
-      name: watcher-data
-      mountPath: /app/data
-      sizeGB: 1
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -44,6 +40,6 @@ services:
 
 databases:
   - name: watcher-db
-    plan: starter
+    plan: free
     region: frankfurt
     postgresMajorVersion: "16"
