@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: the-watcher
+    runtime: docker
+    plan: starter
+    region: oregon
+    branch: main
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    disk:
+      name: watcher-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_ADMIN_IDS
+        sync: false
+      - key: IG_APP_ID
+        value: "936619743392459"
+      - key: IG_SESSION_COOKIE
+        sync: false
+      - key: CHECK_INTERVAL
+        value: "1800"
+      - key: JITTER_SECONDS
+        value: "120"
+      - key: REQUEST_TIMEOUT
+        value: "20"
+      - key: MAX_CONCURRENT_FETCHES
+        value: "3"
+      - key: MEDIA_DIR
+        value: "/app/data/media"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: WEB_API_TOKEN
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: watcher-db
+          property: connectionString
+
+databases:
+  - name: watcher-db
+    plan: starter
+    region: oregon
+    postgresMajorVersion: "16"

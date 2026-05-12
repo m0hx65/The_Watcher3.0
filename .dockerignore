@@ -1,0 +1,17 @@
+.git/
+.github/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+data/
+*.log
+.pytest_cache/
+.mypy_cache/
+README.md

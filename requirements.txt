@@ -1,0 +1,17 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+python-telegram-bot==21.9
+APScheduler==3.10.4
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+tenacity==9.0.0
+loguru==0.7.3
+fake-useragent==1.5.1
+Pillow==11.0.0
+orjson==3.10.12
+psycopg2-binary==2.9.10

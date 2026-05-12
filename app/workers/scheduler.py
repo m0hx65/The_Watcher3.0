@@ -1,0 +1,87 @@
+"""Periodic monitoring scheduler built on APScheduler."""
+
+from __future__ import annotations
+
+import random
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+from app.config import settings
+from app.monitor.service import MonitorService
+from app.utils.logger import logger
+
+SWEEP_JOB_ID = "watcher-sweep"
+
+
+class WatcherScheduler:
+    """Wraps APScheduler with jittered sweep scheduling."""
+
+    def __init__(self, service: MonitorService) -> None:
+        self.service = service
+        self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self._on_state_change = None
+
+    def set_state_callback(self, callback) -> None:
+        """Callback invoked with (state_str, next_run_dt) on changes."""
+        self._on_state_change = callback
+
+    async def start(self) -> None:
+        # Add a single periodic job using an IntervalTrigger we can re-arm with jitter.
+        base_seconds = max(60, settings.check_interval)
+        jitter = max(0, settings.jitter_seconds)
+
+        trigger = IntervalTrigger(seconds=base_seconds, jitter=jitter)
+        first_run = datetime.now(timezone.utc) + timedelta(
+            seconds=random.randint(15, 60)
+        )
+
+        self.scheduler.add_job(
+            self._sweep_wrapper,
+            trigger=trigger,
+            id=SWEEP_JOB_ID,
+            next_run_time=first_run,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+        )
+        self.scheduler.start()
+        logger.info(
+            "Scheduler started — interval={}s jitter=±{}s first run={}",
+            base_seconds, jitter, first_run.isoformat(),
+        )
+        self._emit_state("running")
+
+    async def shutdown(self) -> None:
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+            logger.info("Scheduler stopped")
+        self._emit_state("stopped")
+
+    @property
+    def next_run_time(self) -> Optional[datetime]:
+        job = self.scheduler.get_job(SWEEP_JOB_ID)
+        return job.next_run_time if job else None
+
+    async def trigger_now(self) -> None:
+        """Run a sweep immediately, on top of the scheduled cadence."""
+        logger.info("Manual sweep triggered")
+        await self._sweep_wrapper()
+
+    async def _sweep_wrapper(self) -> None:
+        try:
+            await self.service.check_all()
+        except Exception as exc:
+            logger.exception("Sweep crashed: {}", exc)
+        finally:
+            self._emit_state("running")
+
+    def _emit_state(self, state: str) -> None:
+        if self._on_state_change is None:
+            return
+        try:
+            self._on_state_change(state, self.next_run_time)
+        except Exception:
+            logger.exception("State callback failed")
