@@ -17,8 +17,6 @@ services:
         sync: false
       - key: IG_APP_ID
         value: "936619743392459"
-      - key: IG_SESSION_COOKIE
-        sync: false
       - key: CHECK_INTERVAL
         value: "1800"
       - key: JITTER_SECONDS
