@@ -15,7 +15,9 @@ from telegram import Bot
 from telegram.ext import Application as TgApplication
 
 from app.api.routes import router as api_router
-from app.bot.handlers import BOT_COMMANDS, register_handlers
+from app.bot import keyboards
+from app.bot.handlers import BOT_COMMANDS, PANEL_CHAT_ID, PANEL_MSG_ID, register_handlers
+from app.bot.handlers import WELCOME_TEXT
 from app.bot.notifications import build_dispatcher
 from app.config import settings
 from app.database.session import dispose_engine, init_db
@@ -56,6 +58,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tg_app.bot_data["next_run"] = next_run
 
     scheduler.set_state_callback(_state_change)
+
+    async def _bump_panel() -> None:
+        """Move the main-menu panel to the bottom of the chat after a sweep."""
+        from telegram.constants import ParseMode
+        from telegram.error import BadRequest, Forbidden, TelegramError
+
+        msg_id = tg_app.bot_data.get(PANEL_MSG_ID)
+        chat_id = tg_app.bot_data.get(PANEL_CHAT_ID)
+        if msg_id is None or chat_id is None:
+            return
+        try:
+            await tg_app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except (BadRequest, Forbidden, TelegramError):
+            pass
+        tg_app.bot_data.pop(PANEL_MSG_ID, None)
+        try:
+            new_msg = await tg_app.bot.send_message(
+                chat_id=chat_id,
+                text=WELCOME_TEXT,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.main_menu(),
+                disable_web_page_preview=True,
+            )
+            tg_app.bot_data[PANEL_MSG_ID] = new_msg.message_id
+        except Exception as exc:
+            logger.warning("Panel bump failed: {}", exc)
+
+    scheduler.post_sweep_hook = _bump_panel
 
     # Save on app state for HTTP API access
     app.state.monitor = monitor

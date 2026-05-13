@@ -77,6 +77,10 @@ _AWAITING_INTERVAL = "awaiting_interval"
 # a Cancel button while we wait for typed input). Used so we can clean it
 # up once the user has actually responded.
 _PROMPT_MSG_ID = "prompt_msg_id"
+# Keys for tracking the active panel (main-menu message) so it can be
+# moved to the bottom of the chat after automated notifications arrive.
+PANEL_MSG_ID = "panel_msg_id"
+PANEL_CHAT_ID = "panel_chat_id"
 # Instagram usernames: 1–30 chars, ASCII letters/digits/dots/underscores.
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 # "30m", "1h", "1800s", "1h30m", or a bare integer (seconds).
@@ -226,6 +230,27 @@ async def _delete_callback_message(update: Update) -> None:
         await query.message.delete()
     except (BadRequest, Forbidden, TelegramError):
         pass
+
+
+async def _send_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete any existing panel then send a fresh menu at the bottom of the chat."""
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+    old_msg_id = context.application.bot_data.get(PANEL_MSG_ID)
+    if old_msg_id is not None:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+        except (BadRequest, Forbidden, TelegramError):
+            pass
+        context.application.bot_data.pop(PANEL_MSG_ID, None)
+    msg = await update.message.reply_text(
+        WELCOME_TEXT,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboards.main_menu(),
+    )
+    context.application.bot_data[PANEL_MSG_ID] = msg.message_id
+    context.application.bot_data[PANEL_CHAT_ID] = chat_id
 
 
 async def _reply_or_edit(
@@ -590,11 +615,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(_AWAITING_USERNAME, None)
     context.user_data.pop(_AWAITING_INTERVAL, None)
     await _consume_prompt_message(update, context)
-    await update.message.reply_text(
-        WELCOME_TEXT,
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.main_menu(),
-    )
+    await _send_panel(update, context)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -603,11 +624,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(_AWAITING_USERNAME, None)
     context.user_data.pop(_AWAITING_INTERVAL, None)
     await _consume_prompt_message(update, context)
-    await update.message.reply_text(
-        WELCOME_TEXT,
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.main_menu(),
-    )
+    await _send_panel(update, context)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -946,6 +963,9 @@ async def _handle_menu(
         await _safe_edit_text(
             query, WELCOME_TEXT, reply_markup=keyboards.main_menu()
         )
+        if query.message:
+            context.application.bot_data[PANEL_MSG_ID] = query.message.message_id
+            context.application.bot_data[PANEL_CHAT_ID] = query.message.chat_id
         return
 
     if action == "list":
