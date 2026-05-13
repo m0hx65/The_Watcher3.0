@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     telegram_chat_id: str = Field(..., alias="TELEGRAM_CHAT_ID")
     telegram_admin_ids: str = Field(default="", alias="TELEGRAM_ADMIN_IDS")
 
+    # Telegram webhook mode. If a public URL is available we run as a webhook
+    # (one HTTP consumer, no `getUpdates` Conflict). If no URL is set we fall
+    # back to long-polling, which is convenient for local development.
+    telegram_webhook_url: Optional[str] = Field(default=None, alias="TELEGRAM_WEBHOOK_URL")
+    telegram_webhook_secret: Optional[str] = Field(default=None, alias="TELEGRAM_WEBHOOK_SECRET")
+    telegram_webhook_path: str = Field(default="/telegram/webhook", alias="TELEGRAM_WEBHOOK_PATH")
+    # Render injects this with the public service URL — we use it as a fallback.
+    render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
+
     # Database
     database_url: str = Field(..., alias="DATABASE_URL")
 
@@ -75,6 +84,29 @@ class Settings(BaseSettings):
         p = Path(self.media_dir)
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    @property
+    def telegram_webhook_base(self) -> Optional[str]:
+        """Resolve the public base URL for the Telegram webhook.
+        Priority: explicit TELEGRAM_WEBHOOK_URL → Render's RENDER_EXTERNAL_URL."""
+        base = self.telegram_webhook_url or self.render_external_url
+        return base.rstrip("/") if base else None
+
+    @property
+    def telegram_webhook_full_url(self) -> Optional[str]:
+        """Full URL Telegram will POST updates to. None if webhook mode is off."""
+        base = self.telegram_webhook_base
+        if not base:
+            return None
+        path = self.telegram_webhook_path
+        if not path.startswith("/"):
+            path = "/" + path
+        return base + path
+
+    @property
+    def telegram_use_webhook(self) -> bool:
+        """Webhook mode is enabled whenever we have a public URL to receive on."""
+        return self.telegram_webhook_full_url is not None
 
     @property
     def proxy(self) -> Optional[str]:

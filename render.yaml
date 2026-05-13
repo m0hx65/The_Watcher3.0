@@ -15,8 +15,10 @@ services:
         sync: false
       - key: TELEGRAM_ADMIN_IDS
         sync: false
-      - key: IG_APP_ID
-        value: "936619743392459"
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true
+      - key: TELEGRAM_WEBHOOK_PATH
+        value: "/telegram/webhook"
       - key: CHECK_INTERVAL
         value: "1800"
       - key: JITTER_SECONDS

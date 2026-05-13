@@ -52,6 +52,9 @@ Then in Telegram, message your bot: `/add target_username`.
 | `TELEGRAM_BOT_TOKEN` | _required_ | BotFather token |
 | `TELEGRAM_CHAT_ID` | _required_ | Chat/channel that receives alerts |
 | `TELEGRAM_ADMIN_IDS` | _empty_ | Comma-separated user IDs authorized to use the bot. Empty = allow all |
+| `TELEGRAM_WEBHOOK_URL` | _empty_ | Public base URL for Telegram webhooks. If empty, `RENDER_EXTERNAL_URL` is used when available |
+| `TELEGRAM_WEBHOOK_SECRET` | _empty_ | Optional secret checked against Telegram's webhook secret header |
+| `TELEGRAM_WEBHOOK_PATH` | `/telegram/webhook` | Webhook path registered with Telegram and exposed by FastAPI |
 | `DATABASE_URL` | _required_ | Postgres URL; `postgres://`, `postgresql://`, and `postgresql+asyncpg://` are all accepted |
 | `CHECK_INTERVAL` | `1800` | Sweep interval, seconds |
 | `JITTER_SECONDS` | `120` | Random jitter applied to each interval |
@@ -61,6 +64,7 @@ Then in Telegram, message your bot: `/add target_username`.
 | `LOG_LEVEL` | `INFO` | loguru level |
 | `HTTP_PROXY` / `HTTPS_PROXY` | _empty_ | Optional outbound proxy |
 | `WEB_API_TOKEN` | _empty_ | If set, required as `X-API-Token` for `/sweep` and `/accounts/*/recheck` |
+| `RENDER_EXTERNAL_URL` | _empty_ | Render-provided public URL used as webhook base when `TELEGRAM_WEBHOOK_URL` is unset |
 
 ## Telegram commands
 
@@ -84,7 +88,7 @@ Then in Telegram, message your bot: `/add target_username`.
    - A managed Postgres 16 instance.
    - A 1 GB persistent disk mounted at `/app/data` for stored profile pictures.
 3. Set the required environment variables in the Render dashboard (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ADMIN_IDS`). `DATABASE_URL` and `WEB_API_TOKEN` are populated automatically.
-4. Deploy. The service starts polling Telegram and runs sweeps on the schedule.
+4. Deploy. On Render, the service registers a Telegram webhook using the public service URL and runs sweeps on the schedule. Without a public webhook URL, it falls back to long-polling.
 
 ### Optional: Render Cron Job
 

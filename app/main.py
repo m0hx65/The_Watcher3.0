@@ -64,18 +64,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.instagram = instagram
     app.state.hasher = hasher
 
-    # Start Telegram polling in the background
+    # Start the Telegram Application. In webhook mode we never start the
+    # updater — incoming updates are pushed into `tg_app.update_queue` by
+    # the FastAPI webhook endpoint. In polling mode we run the updater.
     await tg_app.initialize()
     await tg_app.start()
     try:
         await tg_app.bot.set_my_commands(BOT_COMMANDS)
     except Exception as exc:
         logger.warning("Failed to set bot commands menu: {}", exc)
-    if tg_app.updater:
-        await tg_app.updater.start_polling(
+
+    allowed_updates = ["message", "edited_message", "callback_query"]
+
+    if settings.telegram_use_webhook:
+        webhook_url = settings.telegram_webhook_full_url
+        # Drop the webhook first so any prior URL/secret is cleared, then
+        # register ours. `drop_pending_updates` discards the backlog that
+        # built up while polling was running, preventing a flood at switchover.
+        try:
+            await tg_app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as exc:
+            logger.warning("Failed to clear prior webhook: {}", exc)
+        await tg_app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=settings.telegram_webhook_secret or None,
+            allowed_updates=allowed_updates,
             drop_pending_updates=True,
-            allowed_updates=["message", "edited_message", "callback_query"],
         )
+        logger.info("Telegram webhook registered: {}", webhook_url)
+    else:
+        # Local dev fallback — long-polling. Only one consumer per token works,
+        # so do not run this alongside a deployed webhook.
+        if tg_app.updater:
+            await tg_app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=allowed_updates,
+            )
+            logger.info("Telegram long-polling started (no webhook URL configured)")
 
     await scheduler.start()
     logger.info("The Watcher is online.")
@@ -90,7 +115,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.warning("Scheduler shutdown error: {}", exc)
 
         try:
-            if tg_app.updater and tg_app.updater.running:
+            if settings.telegram_use_webhook:
+                # Leave the webhook registered on shutdown — Render's rolling
+                # deploys overlap, so deleting here would briefly break the
+                # incoming side for the new instance. The new instance will
+                # re-register on startup with the same URL/secret.
+                pass
+            elif tg_app.updater and tg_app.updater.running:
                 await tg_app.updater.stop()
             await tg_app.stop()
             await tg_app.shutdown()

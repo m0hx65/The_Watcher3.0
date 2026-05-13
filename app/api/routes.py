@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from telegram import Update
 
 from app.config import settings
 from app.database import crud
@@ -120,3 +121,40 @@ async def trigger_sweep(
     logger.info("Sweep triggered via HTTP")
     await scheduler.trigger_now()
     return {"ok": True}
+
+
+@router.post(settings.telegram_webhook_path)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+) -> Response:
+    """Receive Telegram updates via webhook.
+
+    Telegram passes the secret we registered with `setWebhook` in the
+    `X-Telegram-Bot-Api-Secret-Token` header. We verify it before accepting
+    anything, then hand the parsed `Update` to the running Application's
+    queue — the dispatcher picks it up and runs the matching handler. We
+    return 200 immediately so Telegram doesn't retry; handler errors are
+    handled by python-telegram-bot's own error handlers.
+    """
+    expected_secret = settings.telegram_webhook_secret
+    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+        logger.warning("Rejected webhook with bad/missing secret header")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret")
+
+    tg_app = getattr(request.app.state, "tg_app", None)
+    if tg_app is None:
+        raise HTTPException(status_code=503, detail="Telegram app not initialized")
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    update = Update.de_json(payload, tg_app.bot)
+    if update is None:
+        # Telegram occasionally posts events we don't subscribe to; ack and ignore.
+        return Response(status_code=200)
+
+    await tg_app.update_queue.put(update)
+    return Response(status_code=200)

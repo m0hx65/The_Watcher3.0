@@ -7,12 +7,17 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 # Windows console defaults to cp1252; force UTF-8 so we can print Arabic bios etc.
 try:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 except Exception:
     pass
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 # Inject env vars before importing settings — they're required by the pydantic model.
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
