@@ -218,6 +218,7 @@ class InstagramClient:
                 last_error = f"HTTP {response.status_code}"
                 if response.status_code in (401, 403):
                     if attempt < self.max_retries:
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
                         continue
 
             except Timeout as exc:
