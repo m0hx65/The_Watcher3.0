@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     database_url: str = Field(..., alias="DATABASE_URL")
 
     # Instagram request shape is fixed in app.monitor.instagram.
+    # Optional Cookie header value. Paste the full cookie string from a
+    # logged-in browser session (e.g.
+    # "sessionid=...; csrftoken=...; ds_user_id=...; mid=...; ig_did=...").
+    # When unset, requests go out unauthenticated.
+    ig_session_cookie: Optional[str] = Field(default=None, alias="IG_SESSION_COOKIE")
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")

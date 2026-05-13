@@ -27,9 +27,7 @@ INSTAGRAM_HOST = "www.instagram.com"
 PROFILE_PATH = "/api/v1/users/web_profile_info/"
 PROFILE_URL = f"https://{INSTAGRAM_HOST}{PROFILE_PATH}"
 FORCED_IG_APP_ID = "936619743392459"
-# Pin to a known Chrome fingerprint shipped with curl_cffi. Bump alongside the
-# curl_cffi version when newer chromeNNN literals become available.
-CHROME_IMPERSONATE = "chrome146"
+CHROME_IMPERSONATE = "chrome120"
 
 
 class InstagramError(Exception):
@@ -61,9 +59,13 @@ class ProfileFetchResult:
 
 def _build_headers() -> dict[str, str]:
     # Chrome impersonation already injects accept, accept-language, sec-ch-ua*,
-    # sec-fetch-*, and a Chrome user-agent. Only the IG-specific app id needs
-    # to be added on top — matches the minimal Burp-confirmed request shape.
-    return {"x-ig-app-id": FORCED_IG_APP_ID}
+    # sec-fetch-*, and a Chrome user-agent. Only the IG-specific app id and the
+    # optional session cookie need to be added on top — matches the minimal
+    # Burp-confirmed request shape for both anonymous and logged-in fetches.
+    headers = {"x-ig-app-id": FORCED_IG_APP_ID}
+    if settings.ig_session_cookie:
+        headers["cookie"] = settings.ig_session_cookie
+    return headers
 
 
 def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -114,7 +116,7 @@ class InstagramClient:
 
     def __init__(
         self,
-        max_retries: int = 8,
+        max_retries: int = 5,
         session: _SessionLike | None = None,
     ):
         self.max_retries = max_retries
@@ -208,8 +210,7 @@ class InstagramClient:
                     await asyncio.sleep(delay)
                     continue
 
-                # 401/403 and other blocks — keep retrying with backoff in
-                # case it's a transient IP/UA challenge.
+                # 401/403 — retry immediately, IG usually returns 200 within a few tries.
                 logger.warning(
                     "HTTP {} on @{} (attempt {}/{})",
                     response.status_code, username, attempt, self.max_retries,
@@ -217,7 +218,6 @@ class InstagramClient:
                 last_error = f"HTTP {response.status_code}"
                 if response.status_code in (401, 403):
                     if attempt < self.max_retries:
-                        await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
                         continue
 
             except Timeout as exc:
