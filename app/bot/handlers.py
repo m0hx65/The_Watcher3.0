@@ -12,7 +12,7 @@ from typing import Optional
 
 from telegram import BotCommand, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -77,6 +77,10 @@ BOT_COMMANDS: list[BotCommand] = [
 
 _AWAITING_USERNAME = "awaiting_username"
 _AWAITING_INTERVAL = "awaiting_interval"
+# Message id of the bot's most recent prompt (the message that displays
+# a Cancel button while we wait for typed input). Used so we can clean it
+# up once the user has actually responded.
+_PROMPT_MSG_ID = "prompt_msg_id"
 # Instagram usernames: 1–30 chars, ASCII letters/digits/dots/underscores.
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 # "30m", "1h", "1800s", "1h30m", or a bare integer (seconds).
@@ -162,6 +166,15 @@ def _chat_id(update: Update) -> Optional[int]:
     return chat.id if chat else None
 
 
+_EDIT_IGNORED_ERRORS = (
+    "not modified",
+    "message to edit not found",
+    "message can't be edited",
+    "message_id_invalid",
+    "message identifier is not specified",
+)
+
+
 async def _safe_edit_text(
     query,
     text: str,
@@ -169,7 +182,7 @@ async def _safe_edit_text(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: str = ParseMode.HTML,
 ) -> None:
-    """Edit a callback message, swallowing harmless "not modified" / "not found" errors."""
+    """Edit a callback message, swallowing benign 'can't edit this message' errors."""
     try:
         await query.edit_message_text(
             text=text,
@@ -179,9 +192,44 @@ async def _safe_edit_text(
         )
     except BadRequest as exc:
         msg = str(exc).lower()
-        if "not modified" in msg or "message to edit not found" in msg:
+        if any(s in msg for s in _EDIT_IGNORED_ERRORS):
             return
         raise
+
+
+async def _safe_answer(query, text: Optional[str] = None, *, show_alert: bool = False) -> None:
+    """Acknowledge a callback query, ignoring 'too old / already answered' errors."""
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+    except BadRequest:
+        # Query expired or already answered — the spinner has gone anyway.
+        pass
+    except TelegramError:
+        pass
+
+
+async def _consume_prompt_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete the bot's stored prompt message (the one with a Cancel button), if any."""
+    msg_id = context.user_data.pop(_PROMPT_MSG_ID, None)
+    chat_id = _chat_id(update)
+    if msg_id is None or chat_id is None:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except (BadRequest, Forbidden, TelegramError):
+        # Already gone, too old, or perms — ignore.
+        pass
+
+
+async def _delete_callback_message(update: Update) -> None:
+    """Remove the inline-keyboard message that triggered the active callback."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    try:
+        await query.message.delete()
+    except (BadRequest, Forbidden, TelegramError):
+        pass
 
 
 async def _reply_or_edit(
@@ -502,6 +550,8 @@ async def _send_profile_photo(
             parse_mode=ParseMode.HTML,
             reply_markup=keyboards.account_actions(username),
         )
+    # Photo successfully sent — drop the now-redundant card that hosted the button.
+    await _delete_callback_message(update)
 
 
 async def _send_csv_export(
@@ -526,6 +576,9 @@ async def _send_csv_export(
                 caption=f"Exported {count} notification rows",
                 reply_markup=keyboards.back_to_menu(),
             )
+        # The export landed — remove the menu message that triggered it so
+        # the user isn't left with stale buttons above the document.
+        await _delete_callback_message(update)
     finally:
         try:
             tmp_path.unlink()
@@ -540,6 +593,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.user_data.pop(_AWAITING_USERNAME, None)
     context.user_data.pop(_AWAITING_INTERVAL, None)
+    await _consume_prompt_message(update, context)
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode=ParseMode.HTML,
@@ -552,6 +606,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.user_data.pop(_AWAITING_USERNAME, None)
     context.user_data.pop(_AWAITING_INTERVAL, None)
+    await _consume_prompt_message(update, context)
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode=ParseMode.HTML,
@@ -585,13 +640,16 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _do_add(update, context, username)
         return
     # No argument: enter the username-prompt state.
+    # Clear any lingering prompt from a previous interaction first.
+    await _consume_prompt_message(update, context)
     context.user_data[_AWAITING_USERNAME] = True
-    await update.message.reply_text(
+    prompt = await update.message.reply_text(
         "Send the Instagram <b>username</b> you want to monitor "
         "(with or without <code>@</code>).",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboards.cancel_only(),
     )
+    context.user_data[_PROMPT_MSG_ID] = prompt.message_id
 
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -773,6 +831,10 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if context.user_data.get(_AWAITING_INTERVAL):
         context.user_data.pop(_AWAITING_INTERVAL, None)
+        # The user has answered the prompt — clear the message that's still
+        # showing a Cancel button so they don't see a stale control.
+        await _consume_prompt_message(update, context)
+
         raw = (update.message.text or "").strip()
         seconds = _parse_interval(raw)
         if seconds is None:
@@ -805,6 +867,7 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not context.user_data.get(_AWAITING_USERNAME):
         return  # Ignore typed text unless we're waiting for input.
     context.user_data.pop(_AWAITING_USERNAME, None)
+    await _consume_prompt_message(update, context)
 
     raw = (update.message.text or "").strip()
     username = _normalize_username(raw)
@@ -825,14 +888,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     query = update.callback_query
     data = query.data or ""
+    current_msg_id = query.message.message_id if query.message else None
+
     # A new button press supersedes any pending text prompt — but keep the
-    # interval-prompt alive if this same press was the one that opened it.
-    if not (data == "menu:setinterval:custom"):
+    # awaiting flag alive if this same press is the one that opens that prompt.
+    keep_interval_prompt = (data == "menu:setinterval:custom")
+    keep_username_prompt = (data == "menu:add")
+    if not keep_interval_prompt:
         context.user_data.pop(_AWAITING_INTERVAL, None)
-    context.user_data.pop(_AWAITING_USERNAME, None)
+    if not keep_username_prompt:
+        context.user_data.pop(_AWAITING_USERNAME, None)
+
+    # If the user has a Cancel-button prompt left over on a different message
+    # than the one they're now interacting with, remove the orphaned prompt
+    # so they don't see stale buttons.
+    stale_prompt_id = context.user_data.get(_PROMPT_MSG_ID)
+    if stale_prompt_id is not None and stale_prompt_id != current_msg_id:
+        chat_id = _chat_id(update)
+        if chat_id is not None:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id, message_id=stale_prompt_id
+                )
+            except (BadRequest, Forbidden, TelegramError):
+                pass
+        context.user_data.pop(_PROMPT_MSG_ID, None)
+    elif not (keep_interval_prompt or keep_username_prompt):
+        # Same message, but we're navigating it away from being a prompt.
+        context.user_data.pop(_PROMPT_MSG_ID, None)
 
     if data == "noop":
-        await query.answer()
+        await _safe_answer(query)
         return
 
     parts = data.split(":")
@@ -842,13 +928,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif parts[0] == "acc":
             await _handle_account(update, context, parts[1:])
         else:
-            await query.answer("Unknown action.")
+            await _safe_answer(query, "Unknown action.")
     except Exception as exc:
         logger.exception("Callback handler failed for {}: {}", data, exc)
-        try:
-            await query.answer("Something went wrong. Check logs.", show_alert=True)
-        except Exception:
-            pass
+        await _safe_answer(query, "Something went wrong. Check logs.", show_alert=True)
 
 
 async def _handle_menu(
@@ -858,18 +941,19 @@ async def _handle_menu(
 ) -> None:
     query = update.callback_query
     if not parts:
-        await query.answer()
+        await _safe_answer(query)
         return
     action = parts[0]
 
     if action == "main":
-        await query.answer()
+        await _safe_answer(query)
         await _safe_edit_text(
             query, WELCOME_TEXT, reply_markup=keyboards.main_menu()
         )
         return
 
     if action == "list":
+        await _safe_answer(query)
         page = (
             int(parts[1])
             if len(parts) > 1 and parts[1].lstrip("-").isdigit()
@@ -877,7 +961,6 @@ async def _handle_menu(
         )
         async with get_session() as session:
             accounts = await crud.list_accounts(session, only_active=False)
-        await query.answer()
         if not accounts:
             await _safe_edit_text(
                 query,
@@ -895,7 +978,7 @@ async def _handle_menu(
         return
 
     if action == "status":
-        await query.answer()
+        await _safe_answer(query)
         text = await _render_status_message(context)
         await _safe_edit_text(
             query, text, reply_markup=keyboards.status_actions()
@@ -903,7 +986,7 @@ async def _handle_menu(
         return
 
     if action == "interval":
-        await query.answer()
+        await _safe_answer(query)
         sched = _scheduler(context)
         current = sched.interval_seconds if sched else settings.check_interval
         text = await _render_interval_message(context)
@@ -915,8 +998,10 @@ async def _handle_menu(
     if action == "setinterval":
         choice = parts[1] if len(parts) > 1 else ""
         if choice == "custom":
+            await _safe_answer(query)
             context.user_data[_AWAITING_INTERVAL] = True
-            await query.answer()
+            if query.message:
+                context.user_data[_PROMPT_MSG_ID] = query.message.message_id
             await _safe_edit_text(
                 query,
                 "Send a duration like <code>45m</code>, <code>2h</code>, "
@@ -925,19 +1010,21 @@ async def _handle_menu(
             )
             return
         if not choice.isdigit():
-            await query.answer("Invalid preset.")
+            await _safe_answer(query, "Invalid preset.")
             return
         seconds = int(choice)
         if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
-            await query.answer("Out of range.")
+            await _safe_answer(query, "Out of range.")
             return
-        await query.answer("Updating…")
+        await _safe_answer(query, "Updating…")
         await _apply_interval(update, context, seconds)
         return
 
     if action == "add":
+        await _safe_answer(query)
         context.user_data[_AWAITING_USERNAME] = True
-        await query.answer()
+        if query.message:
+            context.user_data[_PROMPT_MSG_ID] = query.message.message_id
         await _safe_edit_text(
             query,
             "Send the Instagram <b>username</b> you want to monitor "
@@ -947,18 +1034,18 @@ async def _handle_menu(
         return
 
     if action == "export":
-        await query.answer("Building CSV…")
+        await _safe_answer(query, "Building CSV…")
         await _send_csv_export(update, context)
         return
 
     if action == "help":
-        await query.answer()
+        await _safe_answer(query)
         await _safe_edit_text(
             query, HELP_TEXT, reply_markup=keyboards.back_to_menu()
         )
         return
 
-    await query.answer("Unknown menu action.")
+    await _safe_answer(query, "Unknown menu action.")
 
 
 async def _handle_account(
@@ -968,13 +1055,13 @@ async def _handle_account(
 ) -> None:
     query = update.callback_query
     if len(parts) < 2:
-        await query.answer()
+        await _safe_answer(query)
         return
     action = parts[0]
     username = _normalize_username(parts[1]) or parts[1].lower()
 
     if action == "open":
-        await query.answer()
+        await _safe_answer(query)
         text = await _render_account_card(username)
         if text is None:
             await _safe_edit_text(
@@ -989,7 +1076,7 @@ async def _handle_account(
         return
 
     if action == "recheck":
-        await query.answer("Checking…")
+        await _safe_answer(query, "Checking…")
         await _safe_edit_text(
             query, f"⏳ Forcing check for <b>@{esc(username)}</b>…"
         )
@@ -1023,7 +1110,7 @@ async def _handle_account(
         return
 
     if action == "history":
-        await query.answer()
+        await _safe_answer(query)
         text = await _render_history_message(username)
         await _safe_edit_text(
             query, text, reply_markup=keyboards.account_actions(username)
@@ -1031,12 +1118,12 @@ async def _handle_account(
         return
 
     if action == "photo":
-        await query.answer("Sending photo…")
+        await _safe_answer(query, "Sending photo…")
         await _send_profile_photo(update, context, username)
         return
 
     if action == "remove":
-        await query.answer()
+        await _safe_answer(query)
         await _safe_edit_text(
             query,
             f"⚠️ Remove <b>@{esc(username)}</b> from monitoring?\n"
@@ -1046,9 +1133,9 @@ async def _handle_account(
         return
 
     if action == "remove_yes":
+        await _safe_answer(query, "Removing…")
         async with get_session() as session:
             removed = await crud.remove_account(session, username)
-        await query.answer("Removed." if removed else "Not monitored.")
         await _safe_edit_text(
             query,
             (
@@ -1060,7 +1147,7 @@ async def _handle_account(
         )
         return
 
-    await query.answer("Unknown action.")
+    await _safe_answer(query, "Unknown action.")
 
 
 # ---------- Errors / unknown commands ----------
