@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional
 
 from sqlalchemy import delete, desc, func, select, update
@@ -263,3 +263,75 @@ async def set_setting(session: AsyncSession, key: str, value: str) -> None:
     else:
         row.value = value
     await session.flush()
+
+
+# ---------- Data retention ----------
+
+async def purge_old_data(
+    session: AsyncSession,
+    snapshot_days: int,
+    notification_days: int,
+    raw_response_days: int,
+) -> dict[str, int]:
+    """
+    Delete aged-out rows and reclaim JSONB space.
+
+    Rules:
+    - account_snapshots older than snapshot_days are deleted, EXCEPT the single
+      most-recent snapshot per account (needed as the change-detection baseline).
+    - raw_response is NULLed on snapshots older than raw_response_days even when
+      the row itself is kept — this is the biggest space saver.
+    - notification_logs older than notification_days are deleted.
+    - profile_media_hashes are never purged (sparse table, serves dedup).
+
+    Pass 0 for any threshold to skip that step.
+    Returns counts of affected rows.
+    """
+    now = datetime.now(timezone.utc)
+    totals: dict[str, int] = {
+        "snapshots_deleted": 0,
+        "raw_responses_nulled": 0,
+        "notifications_deleted": 0,
+    }
+
+    # --- NULL out raw_response on old-but-kept snapshots ---
+    if raw_response_days > 0:
+        cutoff = now - timedelta(days=raw_response_days)
+        result = await session.execute(
+            update(AccountSnapshot)
+            .where(
+                AccountSnapshot.created_at < cutoff,
+                AccountSnapshot.raw_response.isnot(None),
+            )
+            .values(raw_response=None)
+        )
+        totals["raw_responses_nulled"] = result.rowcount
+
+    # --- Delete old snapshots, preserving the newest per account ---
+    if snapshot_days > 0:
+        cutoff = now - timedelta(days=snapshot_days)
+
+        # Subquery: id of the most-recent snapshot per account
+        latest_ids_sq = (
+            select(func.max(AccountSnapshot.id))
+            .group_by(AccountSnapshot.account_id)
+            .scalar_subquery()
+        )
+
+        result = await session.execute(
+            delete(AccountSnapshot).where(
+                AccountSnapshot.created_at < cutoff,
+                AccountSnapshot.id.notin_(latest_ids_sq),
+            )
+        )
+        totals["snapshots_deleted"] = result.rowcount
+
+    # --- Delete old notification logs ---
+    if notification_days > 0:
+        cutoff = now - timedelta(days=notification_days)
+        result = await session.execute(
+            delete(NotificationLog).where(NotificationLog.created_at < cutoff)
+        )
+        totals["notifications_deleted"] = result.rowcount
+
+    return totals

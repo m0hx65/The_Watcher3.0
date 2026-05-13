@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     # Storage
     media_dir: str = Field(default="./data/media", alias="MEDIA_DIR")
 
+    # Data retention (days; 0 = keep forever)
+    snapshot_retention_days: int = Field(default=30, alias="SNAPSHOT_RETENTION_DAYS")
+    notification_retention_days: int = Field(default=90, alias="NOTIFICATION_RETENTION_DAYS")
+    # raw_response JSONB is nulled after this many days even when the row is kept
+    raw_response_retention_days: int = Field(default=7, alias="RAW_RESPONSE_RETENTION_DAYS")
+
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 

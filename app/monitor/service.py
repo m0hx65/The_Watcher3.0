@@ -114,14 +114,20 @@ class MonitorService:
         )
 
         async with get_session() as session:
-            snapshot = AccountSnapshot(
-                account_id=account_id,
-                username=username,
-                http_status=fetch.http_status,
-                raw_response=fetch.raw_response,
-                error=fetch.error,
-            )
-            await crud.insert_snapshot(session, snapshot)
+            # Only store a failure snapshot when transitioning from success
+            # (i.e. the previous snapshot was OK). Repeated identical failures
+            # are not stored — they add no information.
+            previous = await crud.get_latest_snapshot(session, account_id, successful_only=False)
+            is_new_failure = previous is None or previous.http_status == 200
+            if is_new_failure:
+                snapshot = AccountSnapshot(
+                    account_id=account_id,
+                    username=username,
+                    http_status=fetch.http_status,
+                    raw_response=fetch.raw_response,
+                    error=fetch.error,
+                )
+                await crud.insert_snapshot(session, snapshot)
             failure_count = await crud.mark_checked(
                 session, account_id, fetch.http_status, success=False
             )
@@ -191,9 +197,13 @@ class MonitorService:
                 http_status=200,
                 raw_response=fetch.raw_response,
             )
-            await crud.insert_snapshot(session, snapshot)
 
+            # Diff first, persist only when something actually changed.
             changeset = detect_changes(previous, snapshot, new_pic_hash=new_pic_hash)
+            if previous is None or changeset.has_changes:
+                await crud.insert_snapshot(session, snapshot)
+            else:
+                logger.debug("@{} — no changes detected, skipping snapshot insert", username)
 
             # Persist profile picture hash if new.
             if hashed is not None:

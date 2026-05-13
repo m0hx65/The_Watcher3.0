@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
@@ -16,6 +17,7 @@ from app.monitor.service import MonitorService
 from app.utils.logger import logger
 
 SWEEP_JOB_ID = "watcher-sweep"
+CLEANUP_JOB_ID = "watcher-cleanup"
 SETTING_INTERVAL = "check_interval_seconds"
 
 # Sane bounds enforced wherever interval values are accepted.
@@ -74,6 +76,14 @@ class WatcherScheduler:
             coalesce=True,
             misfire_grace_time=300,
         )
+        self.scheduler.add_job(
+            self._cleanup_wrapper,
+            trigger=CronTrigger(hour=3, minute=0, timezone="UTC"),
+            id=CLEANUP_JOB_ID,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
         self.scheduler.start()
         logger.info(
             "Scheduler started — interval={}s jitter=±{}s first run={}",
@@ -120,6 +130,29 @@ class WatcherScheduler:
             logger.exception("Sweep crashed: {}", exc)
         finally:
             self._emit_state("running")
+
+    async def _cleanup_wrapper(self) -> None:
+        snap_days = settings.snapshot_retention_days
+        notif_days = settings.notification_retention_days
+        raw_days = settings.raw_response_retention_days
+        if snap_days == 0 and notif_days == 0 and raw_days == 0:
+            return
+        try:
+            async with get_session() as session:
+                totals = await crud.purge_old_data(
+                    session,
+                    snapshot_days=snap_days,
+                    notification_days=notif_days,
+                    raw_response_days=raw_days,
+                )
+            logger.info(
+                "Daily cleanup done — snapshots deleted={} raw_responses_nulled={} notifications deleted={}",
+                totals["snapshots_deleted"],
+                totals["raw_responses_nulled"],
+                totals["notifications_deleted"],
+            )
+        except Exception as exc:
+            logger.exception("Cleanup job crashed: {}", exc)
 
     def _emit_state(self, state: str) -> None:
         if self._on_state_change is None:
