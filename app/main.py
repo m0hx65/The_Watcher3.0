@@ -15,7 +15,7 @@ from telegram import Bot
 from telegram.ext import Application as TgApplication
 
 from app.api.routes import router as api_router
-from app.bot.handlers import register_handlers
+from app.bot.handlers import BOT_COMMANDS, register_handlers
 from app.bot.notifications import build_dispatcher
 from app.config import settings
 from app.database.session import dispose_engine, init_db
@@ -67,10 +67,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start Telegram polling in the background
     await tg_app.initialize()
     await tg_app.start()
+    try:
+        await tg_app.bot.set_my_commands(BOT_COMMANDS)
+    except Exception as exc:
+        logger.warning("Failed to set bot commands menu: {}", exc)
     if tg_app.updater:
         await tg_app.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=["message", "edited_message"],
+            allowed_updates=["message", "edited_message", "callback_query"],
         )
 
     await scheduler.start()
