@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-import httpx
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 
 from app.config import settings
 from app.utils.logger import logger
-from app.utils.user_agents import random_user_agent
+
+CHROME_IMPERSONATE = "chrome120"
 
 
 @dataclass
@@ -69,15 +71,17 @@ class MediaHasher:
     """Downloads images, computes SHA256, and stores them on disk."""
 
     def __init__(self) -> None:
-        timeout = httpx.Timeout(settings.request_timeout, connect=10.0)
-        self._client = httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=True,
-            proxy=settings.proxy,
-        )
+        session_kwargs = {
+            "impersonate": CHROME_IMPERSONATE,
+            "timeout": (10.0, float(settings.request_timeout)),
+            "allow_redirects": True,
+        }
+        if settings.proxy:
+            session_kwargs["proxy"] = settings.proxy
+        self._client = AsyncSession(**session_kwargs)
 
     async def close(self) -> None:
-        await self._client.aclose()
+        await self._client.close()
 
     async def __aenter__(self) -> "MediaHasher":
         return self
@@ -114,12 +118,11 @@ class MediaHasher:
             response = await self._client.get(
                 url,
                 headers={
-                    "User-Agent": random_user_agent(),
                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                     "Referer": "https://www.instagram.com/",
                 },
             )
-        except httpx.HTTPError as exc:
+        except RequestException as exc:
             logger.warning("Failed to download profile picture for @{}: {}", username, exc)
             return None
 
