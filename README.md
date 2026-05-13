@@ -5,9 +5,9 @@ A production-ready Instagram intelligence monitoring platform operated entirely 
 ## Features
 
 - **Modular architecture** — FastAPI app, APScheduler worker, SQLAlchemy async ORM, python-telegram-bot.
-- **Robust Instagram client** — calls `GET /api/v1/users/web_profile_info/`, rotating UAs, exponential backoff for 429/5xx, optional session cookie & proxies.
+- **Locked Instagram profile lookup** — profile data is fetched with `GET /api/v1/users/web_profile_info/?username=<username>` on `www.instagram.com` over HTTP/2 with `X-Ig-App-Id: 936619743392459`.
 - **Change detection** — followers/following/posts/reels/highlights, bio, full name, username, verification, business flag, public/private toggle, external link, profile picture (SHA-256 of binary).
-- **Profile picture hashing** — compares image bytes (not URLs); stores image on disk and reuses for /photo.
+- **Profile picture hashing** — downloads the media URL returned by `web_profile_info`, compares image bytes, stores image on disk, and reuses it for `/photo`.
 - **Telegram bot control** — `/add`, `/remove`, `/list`, `/recheck`, `/status`, `/history`, `/photo`, `/export`, `/help`. Authorization via `TELEGRAM_ADMIN_IDS`.
 - **Resilient sweeps** — randomized jitter, throttled concurrency, debounced failure notifications.
 - **HTTP API** — `/health`, `/ready`, `/status`, `/accounts`, `/sweep` (cron-trigger compatible), token-gated mutating endpoints.
@@ -53,8 +53,6 @@ Then in Telegram, message your bot: `/add target_username`.
 | `TELEGRAM_CHAT_ID` | _required_ | Chat/channel that receives alerts |
 | `TELEGRAM_ADMIN_IDS` | _empty_ | Comma-separated user IDs authorized to use the bot. Empty = allow all |
 | `DATABASE_URL` | _required_ | Postgres URL; `postgres://`, `postgresql://`, and `postgresql+asyncpg://` are all accepted |
-| `IG_APP_ID` | `936619743392459` | Sent as `X-IG-App-Id` |
-| `IG_SESSION_COOKIE` | _empty_ | Optional cookie string for accounts that need authentication |
 | `CHECK_INTERVAL` | `1800` | Sweep interval, seconds |
 | `JITTER_SECONDS` | `120` | Random jitter applied to each interval |
 | `REQUEST_TIMEOUT` | `20` | Per-request timeout, seconds |
@@ -85,7 +83,7 @@ Then in Telegram, message your bot: `/add target_username`.
    - A web service running the Dockerfile.
    - A managed Postgres 16 instance.
    - A 1 GB persistent disk mounted at `/app/data` for stored profile pictures.
-3. Set the required environment variables in the Render dashboard (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ADMIN_IDS`, optionally `IG_SESSION_COOKIE`). `DATABASE_URL` and `WEB_API_TOKEN` are populated automatically.
+3. Set the required environment variables in the Render dashboard (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ADMIN_IDS`). `DATABASE_URL` and `WEB_API_TOKEN` are populated automatically.
 4. Deploy. The service starts polling Telegram and runs sweeps on the schedule.
 
 ### Optional: Render Cron Job

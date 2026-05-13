@@ -31,6 +31,7 @@ def headers(username: str) -> dict[str, str]:
     return {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9,ar;q=0.8,de;q=0.7,nl;q=0.6,zh-CN;q=0.5,zh;q=0.4",
+        "host": "www.instagram.com",
         "priority": "u=1, i",
         "referer": f"https://www.instagram.com/{username}",
         "sec-ch-prefers-color-scheme": "dark",
@@ -66,6 +67,9 @@ def main() -> int:
                     f"[attempt {attempt}] {r.http_version} {r.status_code} "
                     f"bytes={len(r.content)} ct={r.headers.get('content-type')}"
                 )
+                if r.http_version != "HTTP/2":
+                    print("  ! expected HTTP/2")
+                    return 1
                 if r.status_code == 200:
                     data = r.json()
                     user = data.get("data", {}).get("user")

@@ -161,7 +161,7 @@ class MonitorService:
         assert fetch.parsed is not None
         parsed = fetch.parsed
 
-        # Hash profile picture
+        # Hash profile picture from the media URL returned by web_profile_info.
         hashed: Optional[HashedMedia] = None
         if parsed.get("profile_pic_url"):
             hashed = await self.hasher.hash_url(parsed["profile_pic_url"], username)
@@ -194,7 +194,7 @@ class MonitorService:
 
             changeset = detect_changes(previous, snapshot, new_pic_hash=new_pic_hash)
 
-            # Persist profile picture hash if new
+            # Persist profile picture hash if new.
             if hashed is not None:
                 existing = await crud.find_media_hash(session, account_id, hashed.sha256)
                 if existing is None:

@@ -1,15 +1,12 @@
-"""Instagram web_profile_info client with anti-detection and retry behavior.
+"""Instagram web_profile_info client with retry behavior.
 
-Header set mirrors a real Chrome 148 XHR captured from devtools — same shape
-the public profile page issues, minus the session cookies (we are not logged
-in and we explicitly do not want to ship a session). HTTP/2 is required;
-HTTP/1.1 with the same headers gets throttled.
+This client is locked to the single public profile request shape below.
+No alternate Instagram endpoints, cookies, or profile-media downloads are used
+by this client. HTTP/2 is required.
 
     GET /api/v1/users/web_profile_info/?username=<u> HTTP/2
     Host: www.instagram.com
-    user-agent: Mozilla/5.0 ... Chrome/148 ...
     x-ig-app-id: 936619743392459
-    x-asbd-id, x-ig-www-claim, x-requested-with, sec-ch-ua-*, referer, ...
 
 See `scripts/test_ig_fetch.py` for a stand-alone repro.
 """
@@ -26,7 +23,11 @@ import httpx
 from app.config import settings
 from app.utils.logger import logger
 
-PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+INSTAGRAM_HOST = "www.instagram.com"
+PROFILE_PATH = "/api/v1/users/web_profile_info/"
+PROFILE_URL = f"https://{INSTAGRAM_HOST}{PROFILE_PATH}"
+FORCED_IG_APP_ID = "936619743392459"
+REQUIRED_HTTP_VERSION = "HTTP/2"
 
 
 class InstagramError(Exception):
@@ -70,10 +71,11 @@ _SEC_CH_UA_FULL = (
 
 
 def _build_headers(username: str) -> dict[str, str]:
-    """Headers matching a real Chrome 148 XHR. No cookies — public endpoint."""
+    """Headers for the single allowed public profile endpoint. No cookies."""
     return {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9,ar;q=0.8,de;q=0.7,nl;q=0.6,zh-CN;q=0.5,zh;q=0.4",
+        "host": INSTAGRAM_HOST,
         "priority": "u=1, i",
         "referer": f"https://www.instagram.com/{username}",
         "sec-ch-prefers-color-scheme": "dark",
@@ -88,7 +90,7 @@ def _build_headers(username: str) -> dict[str, str]:
         "sec-fetch-site": "same-origin",
         "user-agent": _CHROME_UA,
         "x-asbd-id": "359341",
-        "x-ig-app-id": settings.ig_app_id,
+        "x-ig-app-id": FORCED_IG_APP_ID,
         "x-ig-max-touch-points": "0",
         "x-ig-www-claim": "0",
         "x-requested-with": "XMLHttpRequest",
@@ -136,18 +138,26 @@ def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
 class InstagramClient:
     """Async client for the web_profile_info endpoint."""
 
-    def __init__(self, max_retries: int = 8):
+    def __init__(
+        self,
+        max_retries: int = 8,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.max_retries = max_retries
         timeout = httpx.Timeout(
             settings.request_timeout, connect=10.0, read=settings.request_timeout
         )
-        # HTTP/2 is required — HTTP/1.1 with the same minimal headers is rate-limited.
-        self._client = httpx.AsyncClient(
-            http2=True,
-            timeout=timeout,
-            follow_redirects=True,
-            proxy=settings.proxy,
-        )
+        # HTTP/2 is required; HTTP/1.1 responses are rejected below.
+        client_kwargs: dict[str, Any] = {
+            "http2": True,
+            "timeout": timeout,
+            "follow_redirects": True,
+        }
+        if transport is not None:
+            client_kwargs["transport"] = transport
+        else:
+            client_kwargs["proxy"] = settings.proxy
+        self._client = httpx.AsyncClient(**client_kwargs)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -173,6 +183,24 @@ class InstagramClient:
                     headers=_build_headers(username),
                 )
                 last_status = response.status_code
+
+                if response.http_version != REQUIRED_HTTP_VERSION:
+                    last_error = (
+                        f"Unexpected HTTP version {response.http_version}; "
+                        f"{REQUIRED_HTTP_VERSION} is required"
+                    )
+                    logger.warning(
+                        "{} for @{} on attempt {}/{}",
+                        last_error,
+                        username,
+                        attempt,
+                        self.max_retries,
+                    )
+                    return ProfileFetchResult(
+                        username=username,
+                        http_status=response.status_code,
+                        error=last_error,
+                    )
 
                 if response.status_code == 200:
                     try:

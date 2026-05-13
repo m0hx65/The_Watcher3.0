@@ -25,9 +25,7 @@ class Settings(BaseSettings):
     # Database
     database_url: str = Field(..., alias="DATABASE_URL")
 
-    # Instagram
-    ig_app_id: str = Field(default="936619743392459", alias="IG_APP_ID")
-    ig_session_cookie: str = Field(default="", alias="IG_SESSION_COOKIE")
+    # Instagram request shape is fixed in app.monitor.instagram.
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")
