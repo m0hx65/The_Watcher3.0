@@ -151,13 +151,22 @@ class InstagramClient:
         last_status = 0
         last_error: Optional[str] = None
 
+        if settings.ig_proxy_url:
+            fetch_url = settings.ig_proxy_url
+            fetch_params: dict[str, str] = {"username": username}
+            fetch_headers: dict[str, str] = {}
+        else:
+            fetch_url = PROFILE_URL
+            fetch_params = {"username": username}
+            fetch_headers = headers
+
         for attempt in range(1, self.max_retries + 1):
             jitter = random.uniform(0.0, 1.5)
             try:
                 response = await self._session.get(
-                    PROFILE_URL,
-                    params={"username": username},
-                    headers=headers,
+                    fetch_url,
+                    params=fetch_params,
+                    headers=fetch_headers,
                 )
                 last_status = response.status_code
 

@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # "sessionid=...; csrftoken=...; ds_user_id=...; mid=...; ig_did=...").
     # When unset, requests go out unauthenticated.
     ig_session_cookie: Optional[str] = Field(default=None, alias="IG_SESSION_COOKIE")
+    ig_proxy_url: Optional[str] = Field(default=None, alias="IG_PROXY_URL")
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")

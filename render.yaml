@@ -17,6 +17,8 @@ services:
         sync: false
       - key: IG_SESSION_COOKIE
         sync: false
+      - key: IG_PROXY_URL
+        value: "https://ig-proxy.m-asaad2005-ma.workers.dev"
       - key: TELEGRAM_WEBHOOK_SECRET
         generateValue: true
       - key: TELEGRAM_WEBHOOK_PATH
