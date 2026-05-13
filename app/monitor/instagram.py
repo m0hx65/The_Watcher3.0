@@ -1,14 +1,17 @@
 """Instagram web_profile_info client with anti-detection and retry behavior.
 
-The wire format that survives Instagram's anti-bot is intentionally minimal:
+Header set mirrors a real Chrome 148 XHR captured from devtools — same shape
+the public profile page issues, minus the session cookies (we are not logged
+in and we explicitly do not want to ship a session). HTTP/2 is required;
+HTTP/1.1 with the same headers gets throttled.
 
     GET /api/v1/users/web_profile_info/?username=<u> HTTP/2
     Host: www.instagram.com
-    X-Ig-App-Id: 936619743392459
+    user-agent: Mozilla/5.0 ... Chrome/148 ...
+    x-ig-app-id: 936619743392459
+    x-asbd-id, x-ig-www-claim, x-requested-with, sec-ch-ua-*, referer, ...
 
-Adding Sec-Fetch-*, Origin, Referer, X-Requested-With, or a desktop UA flips
-the response to HTTP 429 with an empty body. HTTP/2 is required — HTTP/1.1
-with the same headers also gets throttled. See `scripts/test_ig_fetch.py`.
+See `scripts/test_ig_fetch.py` for a stand-alone repro.
 """
 
 from __future__ import annotations
@@ -53,11 +56,43 @@ class ProfileFetchResult:
         return self.http_status == 200 and self.parsed is not None
 
 
-def _build_headers() -> dict[str, str]:
-    headers = {"X-Ig-App-Id": settings.ig_app_id}
-    if settings.ig_session_cookie:
-        headers["Cookie"] = settings.ig_session_cookie
-    return headers
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
+_SEC_CH_UA = (
+    '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
+)
+_SEC_CH_UA_FULL = (
+    '"Chromium";v="148.0.7778.167", "Google Chrome";v="148.0.7778.167", '
+    '"Not/A)Brand";v="99.0.0.0"'
+)
+
+
+def _build_headers(username: str) -> dict[str, str]:
+    """Headers matching a real Chrome 148 XHR. No cookies — public endpoint."""
+    return {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9,ar;q=0.8,de;q=0.7,nl;q=0.6,zh-CN;q=0.5,zh;q=0.4",
+        "priority": "u=1, i",
+        "referer": f"https://www.instagram.com/{username}",
+        "sec-ch-prefers-color-scheme": "dark",
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-full-version-list": _SEC_CH_UA_FULL,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform-version": '"19.0.0"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": _CHROME_UA,
+        "x-asbd-id": "359341",
+        "x-ig-app-id": settings.ig_app_id,
+        "x-ig-max-touch-points": "0",
+        "x-ig-www-claim": "0",
+        "x-requested-with": "XMLHttpRequest",
+    }
 
 
 def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -135,7 +170,7 @@ class InstagramClient:
                 response = await self._client.get(
                     PROFILE_URL,
                     params={"username": username},
-                    headers=_build_headers(),
+                    headers=_build_headers(username),
                 )
                 last_status = response.status_code
 
