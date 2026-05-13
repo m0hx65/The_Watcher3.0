@@ -18,6 +18,7 @@ from app.database.session import get_session
 from app.monitor.change_detector import ChangeSet, detect_changes
 from app.monitor.instagram import InstagramClient, ProfileFetchResult
 from app.monitor.media_hasher import HashedMedia, MediaHasher
+from app.utils.formatting import fmt_timestamp
 from app.utils.logger import logger
 
 
@@ -249,7 +250,7 @@ class MonitorService:
             if notify_unchanged:
                 await self.notifier.send_text(
                     f"<b>@{username}</b>\nNo changes detected.\n"
-                    f"Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                    f"Checked at {fmt_timestamp(datetime.now(timezone.utc))}"
                 )
             return
 

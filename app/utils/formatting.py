@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+DAMASCUS_TZ = timezone(timedelta(hours=3))
 
 
 def esc(value: Optional[str]) -> str:
@@ -41,7 +43,8 @@ def fmt_timestamp(dt: Optional[datetime]) -> str:
         return "—"
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    dt = dt.astimezone(DAMASCUS_TZ)
+    return dt.strftime("%Y-%m-%d %I:%M:%S %p")
 
 
 def truncate(text: Optional[str], limit: int = 1000) -> str:
