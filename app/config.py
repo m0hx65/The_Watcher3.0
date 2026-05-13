@@ -68,6 +68,18 @@ class Settings(BaseSettings):
             v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
         return v
 
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def sanitize_webhook_secret(cls, v: Optional[str]) -> Optional[str]:
+        # Telegram's setWebhook rejects secret_token outside [A-Za-z0-9_-]{1,256}.
+        # Render's `generateValue: true` produces a base64-ish string that can
+        # include `+`, `/`, or `=` and crashes startup. Strip the disallowed
+        # characters so the registered secret is always accepted.
+        if v is None:
+            return None
+        cleaned = "".join(c for c in v if c.isalnum() or c in "_-")[:256]
+        return cleaned or None
+
     @property
     def admin_ids(self) -> List[int]:
         if not self.telegram_admin_ids:
