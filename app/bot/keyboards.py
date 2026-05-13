@@ -36,10 +36,11 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📊 Status", callback_data="menu:status"),
             ],
             [
-                InlineKeyboardButton("➕ Add account", callback_data="menu:add"),
-                InlineKeyboardButton("📤 Export CSV", callback_data="menu:export"),
+                InlineKeyboardButton("➕ Add", callback_data="menu:add"),
+                InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
             ],
             [
+                InlineKeyboardButton("📤 Export", callback_data="menu:export"),
                 InlineKeyboardButton("ℹ️ Help", callback_data="menu:help"),
             ],
         ]
@@ -72,7 +73,7 @@ def accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("◀️", callback_data=f"menu:list:{page - 1}")
             )
         nav.append(
-            InlineKeyboardButton(f"Page {page + 1}/{pages}", callback_data="noop")
+            InlineKeyboardButton(f"· {page + 1} / {pages} ·", callback_data="noop")
         )
         if page < pages - 1:
             nav.append(
@@ -84,7 +85,7 @@ def accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("➕ Add", callback_data="menu:add"),
             InlineKeyboardButton("🔄 Refresh", callback_data=f"menu:list:{page}"),
-            InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+            InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
         ]
     )
 
@@ -111,10 +112,8 @@ def account_actions(username: str) -> InlineKeyboardMarkup:
                 ),
             ],
             [
-                InlineKeyboardButton(
-                    "◀️ Accounts", callback_data="menu:list:0"
-                ),
-                InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+                InlineKeyboardButton("◀️ List", callback_data="menu:list:0"),
+                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ],
         ]
     )
@@ -125,11 +124,11 @@ def confirm_remove(username: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "✅ Yes, remove",
+                    "🗑 Remove",
                     callback_data=f"acc:remove_yes:{username}",
                 ),
                 InlineKeyboardButton(
-                    "❌ Cancel", callback_data=f"acc:open:{username}"
+                    "✕ Cancel", callback_data=f"acc:open:{username}"
                 ),
             ],
         ]
@@ -142,10 +141,10 @@ def open_account(username: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    f"Open @{username}",
+                    f"👁 @{username}",
                     callback_data=f"acc:open:{username}",
                 ),
-                InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ]
         ]
     )
@@ -153,7 +152,7 @@ def open_account(username: str) -> InlineKeyboardMarkup:
 
 def back_to_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🏠 Back to menu", callback_data="menu:main")]]
+        [[InlineKeyboardButton("🏠 Home", callback_data="menu:main")]]
     )
 
 
@@ -161,10 +160,8 @@ def status_actions() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "⏱ Interval", callback_data="menu:interval"
-                ),
-                InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+                InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
+                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ]
         ]
     )
@@ -172,13 +169,13 @@ def status_actions() -> InlineKeyboardMarkup:
 
 def back_to_list() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("◀️ Back to list", callback_data="menu:list:0")]]
+        [[InlineKeyboardButton("◀️ List", callback_data="menu:list:0")]]
     )
 
 
 def cancel_only() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Cancel", callback_data="menu:main")]]
+        [[InlineKeyboardButton("✕ Cancel", callback_data="menu:main")]]
     )
 
 
@@ -197,7 +194,7 @@ def interval_presets(current_seconds: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for label, seconds in INTERVAL_PRESETS:
-        marker = "• " if seconds == current_seconds else ""
+        marker = "✓ " if seconds == current_seconds else ""
         row.append(
             InlineKeyboardButton(
                 f"{marker}{label}",
@@ -211,15 +208,13 @@ def interval_presets(current_seconds: int) -> InlineKeyboardMarkup:
         rows.append(row)
     rows.append(
         [
-            InlineKeyboardButton(
-                "✏️ Custom…", callback_data="menu:setinterval:custom"
-            ),
+            InlineKeyboardButton("✏️ Custom", callback_data="menu:setinterval:custom"),
         ]
     )
     rows.append(
         [
             InlineKeyboardButton("◀️ Status", callback_data="menu:status"),
-            InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+            InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
         ]
     )
     return InlineKeyboardMarkup(rows)

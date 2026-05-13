@@ -36,29 +36,25 @@ from app.workers.scheduler import MAX_INTERVAL, MIN_INTERVAL, WatcherScheduler
 
 WELCOME_TEXT = (
     "<b>👁 The Watcher</b>\n"
-    "<i>Instagram intelligence monitoring</i>\n\n"
-    "Tap a button below, or send a command (for example "
-    "<code>/add @username</code>)."
+    "<i>Silent Instagram profile monitoring</i>\n\n"
+    "Use the buttons below, or type <code>/add @username</code> to start."
 )
 
 HELP_TEXT = (
-    "<b>👁 The Watcher — help</b>\n\n"
-    "<b>How it works</b>\n"
-    "Use the inline buttons to navigate. Open an account to see its actions: "
-    "Recheck · History · Photo · Remove. The 🏠 button always returns to the "
-    "main menu.\n\n"
+    "<b>👁 The Watcher</b>\n\n"
+    "<b>Navigation</b>\n"
+    "Tap any account in the list to open its card. From there: "
+    "Recheck · History · Photo · Remove. 🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
-    "<code>/menu</code> — open the main menu\n"
     "<code>/add @user</code> — start monitoring\n"
     "<code>/remove @user</code> — stop monitoring\n"
-    "<code>/list</code> — paginated accounts list\n"
+    "<code>/list</code> — all accounts\n"
     "<code>/recheck @user</code> — force a check now\n"
-    "<code>/status</code> — global monitoring stats\n"
-    "<code>/interval [value]</code> — show or set recheck interval "
-    "(e.g. <code>/interval 30m</code>)\n"
+    "<code>/status</code> — monitoring stats\n"
+    "<code>/interval [value]</code> — get or set interval (e.g. <code>30m</code>)\n"
     "<code>/history @user</code> — recent changes\n"
-    "<code>/photo @user</code> — current profile picture\n"
-    "<code>/export</code> — CSV of all changes"
+    "<code>/photo @user</code> — stored profile picture\n"
+    "<code>/export</code> — download CSV"
 )
 
 BOT_COMMANDS: list[BotCommand] = [
