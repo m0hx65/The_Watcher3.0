@@ -98,19 +98,26 @@ class MediaHasher:
         if not url:
             return None
 
+        logger.info("Downloading pic for @{} — source URL: {}", username, url)
+
         # Try the full-resolution version of the CDN URL first.
         hd_url = _strip_cdn_size(url)
         if hd_url:
+            logger.info("Trying size-stripped URL for @{}: {}", username, hd_url)
             result = await self._fetch_and_store(hd_url, username)
             if result is not None:
-                logger.debug(
-                    "HD image downloaded for @{}: {} bytes ({})",
-                    username, result.byte_size, hd_url,
+                logger.info(
+                    "HD image for @{}: {} bytes", username, result.byte_size
                 )
                 return result
-            logger.debug("HD URL attempt failed for @{}, falling back to original", username)
+            logger.info("HD URL failed for @{}, falling back to original", username)
+        else:
+            logger.info("No CDN size constraint found in URL for @{} — using as-is", username)
 
-        return await self._fetch_and_store(url, username)
+        result = await self._fetch_and_store(url, username)
+        if result:
+            logger.info("Downloaded pic for @{}: {} bytes", username, result.byte_size)
+        return result
 
     async def _fetch_and_store(self, url: str, username: str) -> Optional[HashedMedia]:
         """Download one URL, hash it, and persist to disk."""
