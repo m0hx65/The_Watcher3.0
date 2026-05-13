@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Optional, Union
+from typing import Awaitable, Callable, Optional, Union
 
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -24,6 +24,7 @@ class NotificationDispatcher:
         self.bot = bot
         self.chat_id = chat_id
         self._send_lock = asyncio.Lock()
+        self.post_send_hook: Optional[Callable[[], Awaitable[None]]] = None
 
     async def send_text(self, text: str, *, parse_mode: str = ParseMode.HTML) -> bool:
         # Telegram caps text at 4096 chars
@@ -38,6 +39,8 @@ class NotificationDispatcher:
                     disable_web_page_preview=True,
                 )
             )
+        if delivered_any and self.post_send_hook is not None:
+            await self.post_send_hook()
         return delivered_any
 
     async def send_photo(
@@ -52,7 +55,10 @@ class NotificationDispatcher:
                     parse_mode=ParseMode.HTML,
                 )
 
-        return await self._send_with_retry(_send)
+        ok = await self._send_with_retry(_send)
+        if ok and self.post_send_hook is not None:
+            await self.post_send_hook()
+        return ok
 
     async def send_document(self, path: Path, caption: Optional[str] = None) -> bool:
         async def _send():

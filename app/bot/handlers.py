@@ -251,6 +251,9 @@ async def _send_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     context.application.bot_data[PANEL_MSG_ID] = msg.message_id
     context.application.bot_data[PANEL_CHAT_ID] = chat_id
+    async with get_session() as session:
+        await crud.set_setting(session, "panel_msg_id", str(msg.message_id))
+        await crud.set_setting(session, "panel_chat_id", str(chat_id))
 
 
 async def _reply_or_edit(
@@ -964,8 +967,13 @@ async def _handle_menu(
             query, WELCOME_TEXT, reply_markup=keyboards.main_menu()
         )
         if query.message:
-            context.application.bot_data[PANEL_MSG_ID] = query.message.message_id
-            context.application.bot_data[PANEL_CHAT_ID] = query.message.chat_id
+            mid = query.message.message_id
+            cid = query.message.chat_id
+            context.application.bot_data[PANEL_MSG_ID] = mid
+            context.application.bot_data[PANEL_CHAT_ID] = cid
+            async with get_session() as session:
+                await crud.set_setting(session, "panel_msg_id", str(mid))
+                await crud.set_setting(session, "panel_chat_id", str(cid))
         return
 
     if action == "list":

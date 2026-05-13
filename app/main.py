@@ -6,8 +6,9 @@ notification dispatcher, change detection engine, and APScheduler-driven worker.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -20,7 +21,8 @@ from app.bot.handlers import BOT_COMMANDS, PANEL_CHAT_ID, PANEL_MSG_ID, register
 from app.bot.handlers import WELCOME_TEXT
 from app.bot.notifications import build_dispatcher
 from app.config import settings
-from app.database.session import dispose_engine, init_db
+from app.database import crud
+from app.database.session import dispose_engine, get_session, init_db
 from app.monitor.instagram import InstagramClient
 from app.monitor.media_hasher import MediaHasher
 from app.monitor.service import MonitorService
@@ -59,11 +61,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     scheduler.set_state_callback(_state_change)
 
-    async def _bump_panel() -> None:
-        """Move the main-menu panel to the bottom of the chat after a sweep."""
+    # --- Panel-bump: keep the main-menu message at the bottom of the chat ---
+    # Load persisted panel position from DB so it survives server restarts.
+    async with get_session() as _s:
+        _saved_mid = await crud.get_setting(_s, "panel_msg_id")
+        _saved_cid = await crud.get_setting(_s, "panel_chat_id")
+    if _saved_mid and _saved_cid:
+        tg_app.bot_data[PANEL_MSG_ID] = int(_saved_mid)
+        tg_app.bot_data[PANEL_CHAT_ID] = int(_saved_cid)
+
+    _pending_bump: Optional[asyncio.Task] = None
+
+    async def _do_bump() -> None:
         from telegram.constants import ParseMode
         from telegram.error import BadRequest, Forbidden, TelegramError
 
+        # 2-second debounce: let concurrent sweep notifications all land first.
+        await asyncio.sleep(2)
         msg_id = tg_app.bot_data.get(PANEL_MSG_ID)
         chat_id = tg_app.bot_data.get(PANEL_CHAT_ID)
         if msg_id is None or chat_id is None:
@@ -82,10 +96,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 disable_web_page_preview=True,
             )
             tg_app.bot_data[PANEL_MSG_ID] = new_msg.message_id
+            async with get_session() as session:
+                await crud.set_setting(session, "panel_msg_id", str(new_msg.message_id))
+                await crud.set_setting(session, "panel_chat_id", str(chat_id))
         except Exception as exc:
             logger.warning("Panel bump failed: {}", exc)
 
-    scheduler.post_sweep_hook = _bump_panel
+    async def _schedule_bump() -> None:
+        nonlocal _pending_bump
+        if _pending_bump is not None and not _pending_bump.done():
+            return  # A bump is already queued; this notification will be included
+        _pending_bump = asyncio.create_task(_do_bump())
+
+    dispatcher.post_send_hook = _schedule_bump
 
     # Save on app state for HTTP API access
     app.state.monitor = monitor

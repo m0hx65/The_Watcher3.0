@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -47,7 +47,6 @@ class WatcherScheduler:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self._on_state_change = None
         self._interval_seconds: int = max(MIN_INTERVAL, settings.check_interval)
-        self.post_sweep_hook: Optional[Callable[[], Awaitable[None]]] = None
 
     def set_state_callback(self, callback) -> None:
         """Callback invoked with (state_str, next_run_dt) on changes."""
@@ -121,11 +120,6 @@ class WatcherScheduler:
             logger.exception("Sweep crashed: {}", exc)
         finally:
             self._emit_state("running")
-        if self.post_sweep_hook is not None:
-            try:
-                await self.post_sweep_hook()
-            except Exception as exc:
-                logger.warning("Post-sweep hook failed: {}", exc)
 
     def _emit_state(self, state: str) -> None:
         if self._on_state_change is None:
