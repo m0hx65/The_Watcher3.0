@@ -26,8 +26,15 @@ from app.utils.logger import logger
 INSTAGRAM_HOST = "www.instagram.com"
 PROFILE_PATH = "/api/v1/users/web_profile_info/"
 PROFILE_URL = f"https://{INSTAGRAM_HOST}{PROFILE_PATH}"
+MOBILE_HOST = "i.instagram.com"
+MOBILE_USER_INFO_PATH = "/api/v1/users/{user_id}/info/"
 FORCED_IG_APP_ID = "936619743392459"
 CHROME_IMPERSONATE = "chrome120"
+# Android Instagram UA — used for the mobile API endpoint to retrieve hd_profile_pic_url_info
+_ANDROID_UA = (
+    "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; "
+    "samsung; SM-G998B; p3s; exynos2100; en_US; 458229258)"
+)
 
 
 class InstagramError(Exception):
@@ -143,6 +150,44 @@ class InstagramClient:
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
+
+    async def fetch_hd_pic_url(self, user_id: str) -> Optional[str]:
+        """Return the highest-resolution profile picture URL via the mobile API.
+
+        Instagram's mobile endpoint returns hd_profile_pic_url_info which holds
+        the full-size image (up to ~1440px) rather than the ~320px thumbnail that
+        web_profile_info exposes via profile_pic_url_hd.  Falls back gracefully.
+        """
+        if not user_id:
+            return None
+        url = f"https://{MOBILE_HOST}/api/v1/users/{user_id}/info/"
+        headers: dict[str, str] = {
+            "User-Agent": _ANDROID_UA,
+            "x-ig-app-id": FORCED_IG_APP_ID,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if settings.ig_session_cookie:
+            headers["cookie"] = settings.ig_session_cookie
+        try:
+            response = await self._session.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                user = data.get("user") or {}
+                hd_info = user.get("hd_profile_pic_url_info") or {}
+                if hd_info.get("url"):
+                    logger.debug("HD pic URL obtained for user_id={}", user_id)
+                    return hd_info["url"]
+                # Fallback fields in the mobile response
+                return (
+                    user.get("profile_pic_url_hd")
+                    or user.get("profile_pic_url")
+                )
+            logger.debug(
+                "Mobile API returned HTTP {} for user_id={}", response.status_code, user_id
+            )
+        except Exception as exc:
+            logger.debug("fetch_hd_pic_url failed for user_id={}: {}", user_id, exc)
+        return None
 
     async def fetch_profile(self, username: str) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff."""

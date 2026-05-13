@@ -835,7 +835,15 @@ async def cmd_fetchphoto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    pic_url = (fetch.parsed or {}).get("profile_pic_url")
+    parsed = fetch.parsed or {}
+    pic_url = parsed.get("profile_pic_url")
+    # Try mobile API for full-resolution image (hd_profile_pic_url_info)
+    instagram_id = parsed.get("instagram_id")
+    if instagram_id:
+        hd_url = await service.instagram.fetch_hd_pic_url(str(instagram_id))
+        if hd_url:
+            pic_url = hd_url
+
     if not pic_url:
         await status_msg.edit_text(
             f"<b>@{esc(username)}</b> has no profile picture.",

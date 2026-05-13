@@ -168,10 +168,19 @@ class MonitorService:
         assert fetch.parsed is not None
         parsed = fetch.parsed
 
-        # Hash profile picture from the media URL returned by web_profile_info.
+        # Resolve the best available profile picture URL.
+        # Try the mobile API first (returns hd_profile_pic_url_info, up to ~1440px).
+        # Fall back to the web API's profile_pic_url_hd (~320px) if unavailable.
+        pic_url = parsed.get("profile_pic_url")
+        instagram_id = parsed.get("instagram_id")
+        if instagram_id:
+            hd_url = await self.instagram.fetch_hd_pic_url(str(instagram_id))
+            if hd_url:
+                pic_url = hd_url
+
         hashed: Optional[HashedMedia] = None
-        if parsed.get("profile_pic_url"):
-            hashed = await self.hasher.hash_url(parsed["profile_pic_url"], username)
+        if pic_url:
+            hashed = await self.hasher.hash_url(pic_url, username)
 
         new_pic_hash = hashed.sha256 if hashed else None
 
