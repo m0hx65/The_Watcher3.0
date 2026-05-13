@@ -281,14 +281,14 @@ class MonitorService:
                     delivered=delivered,
                 )
 
-        # Profile picture sent separately so it shows inline
+        # Profile picture sent as a document to preserve full quality
         if changeset.profile_pic_changed and new_pic_path is not None:
             caption = (
                 f"<b>@{username}</b> changed profile picture\n"
                 f"Old hash: <code>{changeset.old_pic_hash}</code>\n"
                 f"New hash: <code>{changeset.new_pic_hash}</code>"
             )
-            ok = await self.notifier.send_photo(new_pic_path, caption=caption)
+            ok = await self.notifier.send_document(new_pic_path, caption=caption)
             async with get_session() as session:
                 await crud.log_notification(
                     session,

@@ -54,6 +54,7 @@ HELP_TEXT = (
     "<code>/interval [value]</code> — get or set interval (e.g. <code>30m</code>)\n"
     "<code>/history @user</code> — recent changes\n"
     "<code>/photo @user</code> — stored profile picture\n"
+    "<code>/fetchphoto @user</code> — download current profile picture on demand\n"
     "<code>/export</code> — download CSV"
 )
 
@@ -67,6 +68,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("recheck", "Force a check for a username"),
     BotCommand("history", "Recent changes for a username"),
     BotCommand("photo", "Current profile picture"),
+    BotCommand("fetchphoto", "Download current profile picture on demand"),
     BotCommand("export", "Export change history as CSV"),
     BotCommand("help", "Show help"),
 ]
@@ -567,9 +569,10 @@ async def _send_profile_photo(
     if chat_id is None:
         return
     with open(path, "rb") as f:
-        await context.bot.send_photo(
+        await context.bot.send_document(
             chat_id=chat_id,
-            photo=f,
+            document=f,
+            filename=f"{username}_profile.jpg",
             caption=caption_or_err,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboards.account_actions(username),
@@ -795,6 +798,80 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     await _send_profile_photo(update, context, username)
+
+
+async def cmd_fetchphoto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch and send the current profile picture for any username, monitored or not."""
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/fetchphoto &lt;username&gt;</code>\n"
+            "Downloads the current Instagram profile picture without adding the account to monitoring.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+
+    status_msg = await update.message.reply_text(
+        f"⏳ Fetching profile picture for <b>@{esc(username)}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    service: MonitorService = context.application.bot_data["monitor"]
+    fetch = await service.instagram.fetch_profile(username)
+
+    if not fetch.success:
+        await status_msg.edit_text(
+            f"Failed to fetch <b>@{esc(username)}</b>: "
+            f"<code>{esc(fetch.error or str(fetch.http_status))}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+
+    pic_url = (fetch.parsed or {}).get("profile_pic_url")
+    if not pic_url:
+        await status_msg.edit_text(
+            f"<b>@{esc(username)}</b> has no profile picture.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+
+    hashed = await service.hasher.hash_url(pic_url, username)
+    if hashed is None:
+        await status_msg.edit_text(
+            f"Failed to download profile picture for <b>@{esc(username)}</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+
+    caption = (
+        f"<b>@{esc(username)}</b>\n"
+        f"SHA256: <code>{esc(hashed.sha256)}</code>\n"
+        f"Size: {hashed.byte_size // 1024} KB"
+    )
+    try:
+        await status_msg.delete()
+    except (BadRequest, TelegramError):
+        pass
+
+    with open(hashed.local_path, "rb") as f:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename=f"{username}_profile.jpg",
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1205,6 +1282,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("photo", cmd_photo))
+    app.add_handler(CommandHandler("fetchphoto", cmd_fetchphoto))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(on_callback))
     # Plain text — used to capture usernames after the Add prompt.

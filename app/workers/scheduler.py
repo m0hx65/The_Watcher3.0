@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -19,6 +18,7 @@ from app.utils.logger import logger
 SWEEP_JOB_ID = "watcher-sweep"
 CLEANUP_JOB_ID = "watcher-cleanup"
 SETTING_INTERVAL = "check_interval_seconds"
+SETTING_LAST_SWEEP_AT = "last_sweep_at"
 
 # Sane bounds enforced wherever interval values are accepted.
 MIN_INTERVAL = 60
@@ -62,10 +62,37 @@ class WatcherScheduler:
         self._interval_seconds = await load_persisted_interval()
         jitter = max(0, settings.jitter_seconds)
 
+        async with get_session() as session:
+            raw_last = await crud.get_setting(session, SETTING_LAST_SWEEP_AT)
+
+        now = datetime.now(timezone.utc)
+        first_run: datetime
+        if raw_last:
+            try:
+                last_sweep_at = datetime.fromisoformat(raw_last)
+                expected_next = last_sweep_at + timedelta(seconds=self._interval_seconds)
+                if now >= expected_next:
+                    # Overdue or on-time — run shortly after boot
+                    first_run = now + timedelta(seconds=5)
+                    logger.info(
+                        "Scheduler: last sweep was {}, next was due {}. Running soon.",
+                        last_sweep_at.isoformat(), expected_next.isoformat(),
+                    )
+                else:
+                    # Still within the window — wait until originally-scheduled time
+                    first_run = expected_next
+                    logger.info(
+                        "Scheduler: next sweep not due until {}. Waiting.",
+                        expected_next.isoformat(),
+                    )
+            except ValueError:
+                first_run = now + timedelta(seconds=30)
+        else:
+            # No prior sweep on record — fresh install, small startup delay
+            first_run = now + timedelta(seconds=30)
+            logger.info("Scheduler: no prior sweep recorded, first run in 30s.")
+
         trigger = IntervalTrigger(seconds=self._interval_seconds, jitter=jitter)
-        first_run = datetime.now(timezone.utc) + timedelta(
-            seconds=random.randint(15, 60)
-        )
 
         self.scheduler.add_job(
             self._sweep_wrapper,
@@ -126,6 +153,11 @@ class WatcherScheduler:
     async def _sweep_wrapper(self) -> None:
         try:
             await self.service.check_all()
+            async with get_session() as session:
+                await crud.set_setting(
+                    session, SETTING_LAST_SWEEP_AT,
+                    datetime.now(timezone.utc).isoformat(),
+                )
         except Exception as exc:
             logger.exception("Sweep crashed: {}", exc)
         finally:
