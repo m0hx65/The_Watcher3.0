@@ -1,4 +1,15 @@
-"""Instagram web_profile_info client with anti-detection and retry behavior."""
+"""Instagram web_profile_info client with anti-detection and retry behavior.
+
+The wire format that survives Instagram's anti-bot is intentionally minimal:
+
+    GET /api/v1/users/web_profile_info/?username=<u> HTTP/2
+    Host: www.instagram.com
+    X-Ig-App-Id: 936619743392459
+
+Adding Sec-Fetch-*, Origin, Referer, X-Requested-With, or a desktop UA flips
+the response to HTTP 429 with an empty body. HTTP/2 is required — HTTP/1.1
+with the same headers also gets throttled. See `scripts/test_ig_fetch.py`.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +22,6 @@ import httpx
 
 from app.config import settings
 from app.utils.logger import logger
-from app.utils.user_agents import random_user_agent
 
 PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 
@@ -44,22 +54,7 @@ class ProfileFetchResult:
 
 
 def _build_headers() -> dict[str, str]:
-    headers = {
-        "Host": "www.instagram.com",
-        "User-Agent": random_user_agent(),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "X-IG-App-ID": settings.ig_app_id,
-        "X-Requested-With": "XMLHttpRequest",
-        "X-ASBD-ID": "129477",
-        "Referer": "https://www.instagram.com/",
-        "Origin": "https://www.instagram.com",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "Connection": "keep-alive",
-    }
+    headers = {"X-Ig-App-Id": settings.ig_app_id}
     if settings.ig_session_cookie:
         headers["Cookie"] = settings.ig_session_cookie
     return headers
@@ -106,12 +101,14 @@ def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
 class InstagramClient:
     """Async client for the web_profile_info endpoint."""
 
-    def __init__(self, max_retries: int = 4):
+    def __init__(self, max_retries: int = 8):
         self.max_retries = max_retries
         timeout = httpx.Timeout(
             settings.request_timeout, connect=10.0, read=settings.request_timeout
         )
+        # HTTP/2 is required — HTTP/1.1 with the same minimal headers is rate-limited.
         self._client = httpx.AsyncClient(
+            http2=True,
             timeout=timeout,
             follow_redirects=True,
             proxy=settings.proxy,
