@@ -177,13 +177,13 @@ class InstagramClient:
                 if hd_info.get("url"):
                     logger.debug("HD pic URL obtained for user_id={}", user_id)
                     return hd_info["url"]
-                # Fallback fields in the mobile response
-                return (
-                    user.get("profile_pic_url_hd")
-                    or user.get("profile_pic_url")
-                )
+                # hd_profile_pic_url_info absent (no session / private account).
+                # Do NOT fall back to the mobile API's profile_pic_url — that is
+                # the 150px thumbnail, smaller than what web_profile_info already
+                # gave us. Return None so the caller keeps the web API URL.
             logger.debug(
-                "Mobile API returned HTTP {} for user_id={}", response.status_code, user_id
+                "Mobile API returned HTTP {} or no hd info for user_id={}",
+                response.status_code, user_id,
             )
         except Exception as exc:
             logger.debug("fetch_hd_pic_url failed for user_id={}: {}", user_id, exc)
