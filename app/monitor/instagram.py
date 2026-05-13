@@ -251,28 +251,14 @@ class InstagramClient:
                     await asyncio.sleep(delay)
                     continue
 
-                # 401 = login required for this specific account (sensitive /
-                # age-gated / private-walled). Retrying never succeeds and just
-                # burns ~70s of the sweep, so short-circuit immediately.
-                if response.status_code == 401:
-                    logger.warning(
-                        "HTTP 401 on @{} — account requires login, skipping retries",
-                        username,
-                    )
-                    return ProfileFetchResult(
-                        username=username,
-                        http_status=401,
-                        error="Account requires login (sensitive/age-gated or private-walled)",
-                    )
-
-                # 403 and other blocks — keep retrying with backoff in case
-                # it's a transient IP/UA challenge.
+                # 401/403 and other blocks — keep retrying with backoff in
+                # case it's a transient IP/UA challenge.
                 logger.warning(
                     "HTTP {} on @{} (attempt {}/{})",
                     response.status_code, username, attempt, self.max_retries,
                 )
                 last_error = f"HTTP {response.status_code}"
-                if response.status_code == 403:
+                if response.status_code in (401, 403):
                     if attempt < self.max_retries:
                         await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
                         continue
