@@ -29,6 +29,7 @@ from app.database.session import get_session
 from app.monitor.service import MonitorService
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
+from app.workers.scheduler import MAX_INTERVAL, MIN_INTERVAL, WatcherScheduler
 
 
 # ---------- Static text & bot menu ----------
@@ -53,6 +54,8 @@ HELP_TEXT = (
     "<code>/list</code> — paginated accounts list\n"
     "<code>/recheck @user</code> — force a check now\n"
     "<code>/status</code> — global monitoring stats\n"
+    "<code>/interval [value]</code> — show or set recheck interval "
+    "(e.g. <code>/interval 30m</code>)\n"
     "<code>/history @user</code> — recent changes\n"
     "<code>/photo @user</code> — current profile picture\n"
     "<code>/export</code> — CSV of all changes"
@@ -64,6 +67,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("remove", "Stop monitoring an account"),
     BotCommand("list", "List monitored accounts"),
     BotCommand("status", "Show monitoring statistics"),
+    BotCommand("interval", "Show or change the recheck interval"),
     BotCommand("recheck", "Force a check for a username"),
     BotCommand("history", "Recent changes for a username"),
     BotCommand("photo", "Current profile picture"),
@@ -72,8 +76,14 @@ BOT_COMMANDS: list[BotCommand] = [
 ]
 
 _AWAITING_USERNAME = "awaiting_username"
+_AWAITING_INTERVAL = "awaiting_interval"
 # Instagram usernames: 1–30 chars, ASCII letters/digits/dots/underscores.
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+# "30m", "1h", "1800s", "1h30m", or a bare integer (seconds).
+_INTERVAL_RE = re.compile(
+    r"^\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$",
+    re.IGNORECASE,
+)
 
 
 # ---------- Authorization ----------
@@ -114,6 +124,37 @@ def _normalize_username(raw: str) -> Optional[str]:
     if not raw or not _USERNAME_RE.match(raw):
         return None
     return raw.lower()
+
+
+def _parse_interval(raw: str) -> Optional[int]:
+    """Accept '30m', '1h', '1800s', '1h30m', or a bare integer (seconds)."""
+    text = raw.strip().lower()
+    if not text:
+        return None
+    if text.isdigit():
+        n = int(text)
+        return n or None
+    m = _INTERVAL_RE.match(text)
+    if not m or not any(m.groups()):
+        return None
+    h, mm, s = (int(x) if x else 0 for x in m.groups())
+    total = h * 3600 + mm * 60 + s
+    return total or None
+
+
+def _format_interval(seconds: int) -> str:
+    """Render seconds as the shortest 'XhYmZs' form, dropping zeros."""
+    seconds = int(seconds)
+    parts: list[str] = []
+    if seconds >= 3600:
+        h, seconds = divmod(seconds, 3600)
+        parts.append(f"{h}h")
+    if seconds >= 60:
+        m, seconds = divmod(seconds, 60)
+        parts.append(f"{m}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return "".join(parts)
 
 
 def _chat_id(update: Update) -> Optional[int]:
@@ -221,6 +262,11 @@ async def _render_account_card(username: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+def _scheduler(context: ContextTypes.DEFAULT_TYPE) -> Optional[WatcherScheduler]:
+    sched = context.application.bot_data.get("scheduler")
+    return sched if isinstance(sched, WatcherScheduler) else None
+
+
 async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     async with get_session() as session:
         stats = await crud.stats_summary(session)
@@ -229,6 +275,9 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     next_run = context.application.bot_data.get("next_run")
     next_run_str = fmt_timestamp(next_run) if next_run else "—"
 
+    sched = _scheduler(context)
+    interval = sched.interval_seconds if sched else settings.check_interval
+
     return (
         "<b>📊 Watcher status</b>\n\n"
         f"Accounts: <b>{stats['accounts_total']}</b> "
@@ -236,9 +285,51 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"Snapshots stored: <b>{fmt_number(stats['snapshots_total'])}</b>\n"
         f"Notifications sent: <b>{fmt_number(stats['notifications_total'])}</b>\n\n"
         f"Scheduler: <b>{esc(str(scheduler_state))}</b>\n"
-        f"Interval: <b>{settings.check_interval}s</b> "
+        f"Interval: <b>{_format_interval(interval)}</b> "
         f"(±{settings.jitter_seconds}s jitter)\n"
         f"Next sweep: <b>{next_run_str}</b>"
+    )
+
+
+async def _render_interval_message(context: ContextTypes.DEFAULT_TYPE) -> str:
+    sched = _scheduler(context)
+    current = sched.interval_seconds if sched else settings.check_interval
+    next_run = context.application.bot_data.get("next_run")
+    next_run_str = fmt_timestamp(next_run) if next_run else "—"
+    return (
+        "<b>⏱ Recheck interval</b>\n\n"
+        f"Current: <b>{_format_interval(current)}</b> "
+        f"(±{settings.jitter_seconds}s jitter)\n"
+        f"Next sweep: <b>{next_run_str}</b>\n\n"
+        f"Tap a preset, or send a custom value like "
+        f"<code>45m</code>, <code>2h</code>, or <code>900s</code>.\n"
+        f"Range: <code>{MIN_INTERVAL}s</code> – <code>{MAX_INTERVAL // 3600}h</code>."
+    )
+
+
+async def _apply_interval(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    seconds: int,
+) -> None:
+    sched = _scheduler(context)
+    if sched is None:
+        await _reply_or_edit(
+            update,
+            "Scheduler is unavailable — try again in a moment.",
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    applied = await sched.set_interval(seconds)
+    if applied != seconds:
+        note = f" (clamped to {_format_interval(applied)})"
+    else:
+        note = ""
+    text = await _render_interval_message(context)
+    await _reply_or_edit(
+        update,
+        f"✅ Interval set to <b>{_format_interval(applied)}</b>{note}.\n\n{text}",
+        reply_markup=keyboards.interval_presets(applied),
     )
 
 
@@ -448,6 +539,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
     context.user_data.pop(_AWAITING_USERNAME, None)
+    context.user_data.pop(_AWAITING_INTERVAL, None)
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode=ParseMode.HTML,
@@ -459,6 +551,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
     context.user_data.pop(_AWAITING_USERNAME, None)
+    context.user_data.pop(_AWAITING_INTERVAL, None)
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode=ParseMode.HTML,
@@ -594,7 +687,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.back_to_menu(),
+        reply_markup=keyboards.status_actions(),
     )
 
 
@@ -636,13 +729,81 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _send_csv_export(update, context)
 
 
+async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    context.user_data.pop(_AWAITING_INTERVAL, None)
+
+    if not context.args:
+        sched = _scheduler(context)
+        current = sched.interval_seconds if sched else settings.check_interval
+        text = await _render_interval_message(context)
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.interval_presets(current),
+            disable_web_page_preview=True,
+        )
+        return
+
+    seconds = _parse_interval(" ".join(context.args))
+    if seconds is None:
+        await update.message.reply_text(
+            "Couldn't read that as a duration. Examples: "
+            "<code>30m</code>, <code>1h</code>, <code>1800s</code>, <code>1800</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
+        await update.message.reply_text(
+            f"Out of range. Use between <code>{MIN_INTERVAL}s</code> and "
+            f"<code>{MAX_INTERVAL // 3600}h</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await _apply_interval(update, context, seconds)
+
+
 # ---------- Text capture (for the "Add account" prompt) ----------
 
 async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
+
+    if context.user_data.get(_AWAITING_INTERVAL):
+        context.user_data.pop(_AWAITING_INTERVAL, None)
+        raw = (update.message.text or "").strip()
+        seconds = _parse_interval(raw)
+        if seconds is None:
+            await update.message.reply_text(
+                "Couldn't read that as a duration. Examples: "
+                "<code>30m</code>, <code>1h</code>, <code>1800s</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.interval_presets(
+                    _scheduler(context).interval_seconds
+                    if _scheduler(context)
+                    else settings.check_interval
+                ),
+            )
+            return
+        if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
+            await update.message.reply_text(
+                f"Out of range. Use between <code>{MIN_INTERVAL}s</code> and "
+                f"<code>{MAX_INTERVAL // 3600}h</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.interval_presets(
+                    _scheduler(context).interval_seconds
+                    if _scheduler(context)
+                    else settings.check_interval
+                ),
+            )
+            return
+        await _apply_interval(update, context, seconds)
+        return
+
     if not context.user_data.get(_AWAITING_USERNAME):
-        return  # Ignore typed text unless we're waiting for a username.
+        return  # Ignore typed text unless we're waiting for input.
     context.user_data.pop(_AWAITING_USERNAME, None)
 
     raw = (update.message.text or "").strip()
@@ -664,7 +825,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     query = update.callback_query
     data = query.data or ""
-    # A new button press supersedes any pending text prompt.
+    # A new button press supersedes any pending text prompt — but keep the
+    # interval-prompt alive if this same press was the one that opened it.
+    if not (data == "menu:setinterval:custom"):
+        context.user_data.pop(_AWAITING_INTERVAL, None)
     context.user_data.pop(_AWAITING_USERNAME, None)
 
     if data == "noop":
@@ -734,8 +898,41 @@ async def _handle_menu(
         await query.answer()
         text = await _render_status_message(context)
         await _safe_edit_text(
-            query, text, reply_markup=keyboards.back_to_menu()
+            query, text, reply_markup=keyboards.status_actions()
         )
+        return
+
+    if action == "interval":
+        await query.answer()
+        sched = _scheduler(context)
+        current = sched.interval_seconds if sched else settings.check_interval
+        text = await _render_interval_message(context)
+        await _safe_edit_text(
+            query, text, reply_markup=keyboards.interval_presets(current)
+        )
+        return
+
+    if action == "setinterval":
+        choice = parts[1] if len(parts) > 1 else ""
+        if choice == "custom":
+            context.user_data[_AWAITING_INTERVAL] = True
+            await query.answer()
+            await _safe_edit_text(
+                query,
+                "Send a duration like <code>45m</code>, <code>2h</code>, "
+                "or <code>900s</code>.",
+                reply_markup=keyboards.cancel_only(),
+            )
+            return
+        if not choice.isdigit():
+            await query.answer("Invalid preset.")
+            return
+        seconds = int(choice)
+        if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
+            await query.answer("Out of range.")
+            return
+        await query.answer("Updating…")
+        await _apply_interval(update, context, seconds)
         return
 
     if action == "add":
@@ -894,6 +1091,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("recheck", cmd_recheck))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("export", cmd_export))

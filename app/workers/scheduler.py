@@ -10,10 +10,33 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
+from app.database import crud
+from app.database.session import get_session
 from app.monitor.service import MonitorService
 from app.utils.logger import logger
 
 SWEEP_JOB_ID = "watcher-sweep"
+SETTING_INTERVAL = "check_interval_seconds"
+
+# Sane bounds enforced wherever interval values are accepted.
+MIN_INTERVAL = 60
+MAX_INTERVAL = 86_400
+
+
+async def load_persisted_interval() -> int:
+    """Return the interval in seconds — DB value if set, otherwise env default."""
+    async with get_session() as session:
+        raw = await crud.get_setting(session, SETTING_INTERVAL)
+    if raw and raw.isdigit():
+        value = int(raw)
+        if MIN_INTERVAL <= value <= MAX_INTERVAL:
+            return value
+    return max(MIN_INTERVAL, settings.check_interval)
+
+
+async def persist_interval(seconds: int) -> None:
+    async with get_session() as session:
+        await crud.set_setting(session, SETTING_INTERVAL, str(seconds))
 
 
 class WatcherScheduler:
@@ -23,17 +46,21 @@ class WatcherScheduler:
         self.service = service
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self._on_state_change = None
+        self._interval_seconds: int = max(MIN_INTERVAL, settings.check_interval)
 
     def set_state_callback(self, callback) -> None:
         """Callback invoked with (state_str, next_run_dt) on changes."""
         self._on_state_change = callback
 
+    @property
+    def interval_seconds(self) -> int:
+        return self._interval_seconds
+
     async def start(self) -> None:
-        # Add a single periodic job using an IntervalTrigger we can re-arm with jitter.
-        base_seconds = max(60, settings.check_interval)
+        self._interval_seconds = await load_persisted_interval()
         jitter = max(0, settings.jitter_seconds)
 
-        trigger = IntervalTrigger(seconds=base_seconds, jitter=jitter)
+        trigger = IntervalTrigger(seconds=self._interval_seconds, jitter=jitter)
         first_run = datetime.now(timezone.utc) + timedelta(
             seconds=random.randint(15, 60)
         )
@@ -50,7 +77,7 @@ class WatcherScheduler:
         self.scheduler.start()
         logger.info(
             "Scheduler started — interval={}s jitter=±{}s first run={}",
-            base_seconds, jitter, first_run.isoformat(),
+            self._interval_seconds, jitter, first_run.isoformat(),
         )
         self._emit_state("running")
 
@@ -69,6 +96,22 @@ class WatcherScheduler:
         """Run a sweep immediately, on top of the scheduled cadence."""
         logger.info("Manual sweep triggered")
         await self._sweep_wrapper()
+
+    async def set_interval(self, seconds: int) -> int:
+        """Persist a new interval and reschedule the live job. Returns clamped value."""
+        seconds = max(MIN_INTERVAL, min(MAX_INTERVAL, int(seconds)))
+        await persist_interval(seconds)
+        self._interval_seconds = seconds
+
+        if self.scheduler.running and self.scheduler.get_job(SWEEP_JOB_ID):
+            jitter = max(0, settings.jitter_seconds)
+            self.scheduler.reschedule_job(
+                SWEEP_JOB_ID,
+                trigger=IntervalTrigger(seconds=seconds, jitter=jitter),
+            )
+            logger.info("Scheduler interval updated to {}s", seconds)
+            self._emit_state("running")
+        return seconds
 
     async def _sweep_wrapper(self) -> None:
         try:

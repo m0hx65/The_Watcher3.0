@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import (
     AccountSnapshot,
+    AppSetting,
     MonitoredAccount,
     NotificationLog,
     ProfileMediaHash,
@@ -244,3 +245,21 @@ async def export_all(session: AsyncSession) -> Iterable[NotificationLog]:
     )
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+# ---------- AppSetting (runtime-tunable KV) ----------
+
+async def get_setting(session: AsyncSession, key: str) -> Optional[str]:
+    result = await session.execute(select(AppSetting).where(AppSetting.key == key))
+    row = result.scalar_one_or_none()
+    return row.value if row else None
+
+
+async def set_setting(session: AsyncSession, key: str, value: str) -> None:
+    result = await session.execute(select(AppSetting).where(AppSetting.key == key))
+    row = result.scalar_one_or_none()
+    if row is None:
+        session.add(AppSetting(key=key, value=value))
+    else:
+        row.value = value
+    await session.flush()

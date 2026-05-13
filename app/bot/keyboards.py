@@ -7,6 +7,9 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   menu:add                 — prompt user for a username to add
   menu:export              — send CSV export
   menu:help                — show help
+  menu:interval            — show interval preset chooser
+  menu:setinterval:<sec>   — set scheduler interval to <sec>
+  menu:setinterval:custom  — prompt for free-form interval text
   acc:open:<username>      — open account card
   acc:recheck:<username>   — force a re-check
   acc:history:<username>   — recent change log for account
@@ -154,6 +157,19 @@ def back_to_menu() -> InlineKeyboardMarkup:
     )
 
 
+def status_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⏱ Interval", callback_data="menu:interval"
+                ),
+                InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+            ]
+        ]
+    )
+
+
 def back_to_list() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("◀️ Back to list", callback_data="menu:list:0")]]
@@ -164,3 +180,46 @@ def cancel_only() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Cancel", callback_data="menu:main")]]
     )
+
+
+INTERVAL_PRESETS: list[tuple[str, int]] = [
+    ("5m", 300),
+    ("15m", 900),
+    ("30m", 1800),
+    ("1h", 3600),
+    ("2h", 7200),
+    ("6h", 21600),
+]
+
+
+def interval_presets(current_seconds: int) -> InlineKeyboardMarkup:
+    """Two-by-three preset grid + Custom + back."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for label, seconds in INTERVAL_PRESETS:
+        marker = "• " if seconds == current_seconds else ""
+        row.append(
+            InlineKeyboardButton(
+                f"{marker}{label}",
+                callback_data=f"menu:setinterval:{seconds}",
+            )
+        )
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✏️ Custom…", callback_data="menu:setinterval:custom"
+            ),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("◀️ Status", callback_data="menu:status"),
+            InlineKeyboardButton("🏠 Menu", callback_data="menu:main"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
