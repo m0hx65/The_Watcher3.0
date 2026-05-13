@@ -1,14 +1,13 @@
-"""Instagram web_profile_info client with retry behavior.
+"""Instagram web_profile_info client.
 
-This client is locked to the single public profile request shape below.
-No alternate Instagram endpoints, cookies, or profile-media downloads are used
-by this client. HTTP/2 is required.
+Uses curl_cffi with Chrome TLS impersonation so the JA3/JA4 handshake matches
+a real browser. Instagram's anti-bot compares the TLS fingerprint against the
+declared User-Agent — httpx (Python OpenSSL stack) gets 401s where Chrome gets
+200s on the same IP.
 
     GET /api/v1/users/web_profile_info/?username=<u> HTTP/2
     Host: www.instagram.com
     x-ig-app-id: 936619743392459
-
-See `scripts/test_ig_fetch.py` for a stand-alone repro.
 """
 
 from __future__ import annotations
@@ -16,9 +15,10 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
-import httpx
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException, Timeout
 
 from app.config import settings
 from app.utils.logger import logger
@@ -27,7 +27,9 @@ INSTAGRAM_HOST = "www.instagram.com"
 PROFILE_PATH = "/api/v1/users/web_profile_info/"
 PROFILE_URL = f"https://{INSTAGRAM_HOST}{PROFILE_PATH}"
 FORCED_IG_APP_ID = "936619743392459"
-REQUIRED_HTTP_VERSION = "HTTP/2"
+# Pin to a known Chrome fingerprint shipped with curl_cffi. Bump alongside the
+# curl_cffi version when newer chromeNNN literals become available.
+CHROME_IMPERSONATE = "chrome146"
 
 
 class InstagramError(Exception):
@@ -57,44 +59,11 @@ class ProfileFetchResult:
         return self.http_status == 200 and self.parsed is not None
 
 
-_CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-)
-_SEC_CH_UA = (
-    '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
-)
-_SEC_CH_UA_FULL = (
-    '"Chromium";v="148.0.7778.167", "Google Chrome";v="148.0.7778.167", '
-    '"Not/A)Brand";v="99.0.0.0"'
-)
-
-
-def _build_headers(username: str) -> dict[str, str]:
-    """Headers for the single allowed public profile endpoint. No cookies."""
-    return {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9,ar;q=0.8,de;q=0.7,nl;q=0.6,zh-CN;q=0.5,zh;q=0.4",
-        "host": INSTAGRAM_HOST,
-        "priority": "u=1, i",
-        "referer": f"https://www.instagram.com/{username}",
-        "sec-ch-prefers-color-scheme": "dark",
-        "sec-ch-ua": _SEC_CH_UA,
-        "sec-ch-ua-full-version-list": _SEC_CH_UA_FULL,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-model": '""',
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-ch-ua-platform-version": '"19.0.0"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": _CHROME_UA,
-        "x-asbd-id": "359341",
-        "x-ig-app-id": FORCED_IG_APP_ID,
-        "x-ig-max-touch-points": "0",
-        "x-ig-www-claim": "0",
-        "x-requested-with": "XMLHttpRequest",
-    }
+def _build_headers() -> dict[str, str]:
+    # Chrome impersonation already injects accept, accept-language, sec-ch-ua*,
+    # sec-fetch-*, and a Chrome user-agent. Only the IG-specific app id needs
+    # to be added on top — matches the minimal Burp-confirmed request shape.
+    return {"x-ig-app-id": FORCED_IG_APP_ID}
 
 
 def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -135,32 +104,37 @@ def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
+class _SessionLike(Protocol):
+    async def get(self, url: str, *, params: Any = ..., headers: Any = ...) -> Any: ...
+    async def close(self) -> None: ...
+
+
 class InstagramClient:
     """Async client for the web_profile_info endpoint."""
 
     def __init__(
         self,
         max_retries: int = 8,
-        transport: httpx.AsyncBaseTransport | None = None,
+        session: _SessionLike | None = None,
     ):
         self.max_retries = max_retries
-        timeout = httpx.Timeout(
-            settings.request_timeout, connect=10.0, read=settings.request_timeout
-        )
-        # HTTP/2 is required; HTTP/1.1 responses are rejected below.
-        client_kwargs: dict[str, Any] = {
-            "http2": True,
-            "timeout": timeout,
-            "follow_redirects": True,
-        }
-        if transport is not None:
-            client_kwargs["transport"] = transport
+        if session is not None:
+            self._session: _SessionLike = session
+            self._own_session = False
         else:
-            client_kwargs["proxy"] = settings.proxy
-        self._client = httpx.AsyncClient(**client_kwargs)
+            session_kwargs: dict[str, Any] = {
+                "impersonate": CHROME_IMPERSONATE,
+                "timeout": (10.0, float(settings.request_timeout)),
+                "allow_redirects": True,
+            }
+            if settings.proxy:
+                session_kwargs["proxy"] = settings.proxy
+            self._session = AsyncSession(**session_kwargs)
+            self._own_session = True
 
     async def close(self) -> None:
-        await self._client.aclose()
+        if self._own_session:
+            await self._session.close()
 
     async def __aenter__(self) -> "InstagramClient":
         return self
@@ -171,41 +145,24 @@ class InstagramClient:
     async def fetch_profile(self, username: str) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff."""
         username = username.strip().lstrip("@")
+        headers = _build_headers()
         last_status = 0
         last_error: Optional[str] = None
 
         for attempt in range(1, self.max_retries + 1):
             jitter = random.uniform(0.0, 1.5)
             try:
-                response = await self._client.get(
+                response = await self._session.get(
                     PROFILE_URL,
                     params={"username": username},
-                    headers=_build_headers(username),
+                    headers=headers,
                 )
                 last_status = response.status_code
-
-                if response.http_version != REQUIRED_HTTP_VERSION:
-                    last_error = (
-                        f"Unexpected HTTP version {response.http_version}; "
-                        f"{REQUIRED_HTTP_VERSION} is required"
-                    )
-                    logger.warning(
-                        "{} for @{} on attempt {}/{}",
-                        last_error,
-                        username,
-                        attempt,
-                        self.max_retries,
-                    )
-                    return ProfileFetchResult(
-                        username=username,
-                        http_status=response.status_code,
-                        error=last_error,
-                    )
 
                 if response.status_code == 200:
                     try:
                         payload = response.json()
-                    except ValueError:
+                    except Exception:
                         last_error = "Invalid JSON in response"
                         logger.warning(
                             "Non-JSON 200 for {} on attempt {}", username, attempt
@@ -263,7 +220,7 @@ class InstagramClient:
                         await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
                         continue
 
-            except httpx.TimeoutException as exc:
+            except Timeout as exc:
                 last_status = 0
                 last_error = f"timeout: {exc!r}"
                 logger.warning(
@@ -271,7 +228,7 @@ class InstagramClient:
                     username, attempt, self.max_retries, exc,
                 )
                 await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
-            except httpx.HTTPError as exc:
+            except RequestException as exc:
                 last_status = 0
                 last_error = f"http error: {exc!r}"
                 logger.warning(

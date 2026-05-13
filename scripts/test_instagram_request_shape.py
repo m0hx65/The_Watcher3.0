@@ -6,8 +6,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-
-import httpx
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -19,8 +18,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
 from app.monitor.instagram import (  # noqa: E402
     FORCED_IG_APP_ID,
-    INSTAGRAM_HOST,
-    PROFILE_PATH,
+    PROFILE_URL,
     InstagramClient,
 )
 
@@ -44,55 +42,62 @@ def _payload() -> dict:
     }
 
 
+class _MockResponse:
+    def __init__(self, status_code: int, body: dict):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> Any:
+        return self._body
+
+
+class _MockSession:
+    def __init__(self, handler: Callable[[str, dict, dict], _MockResponse]):
+        self.handler = handler
+        self.requests: list[dict[str, Any]] = []
+
+    async def get(self, url: str, *, params: Any = None, headers: Any = None) -> _MockResponse:
+        self.requests.append({"url": url, "params": dict(params or {}), "headers": dict(headers or {})})
+        return self.handler(url, dict(params or {}), dict(headers or {}))
+
+    async def close(self) -> None:
+        pass
+
+
 async def test_profile_request_shape() -> None:
-    seen: list[httpx.Request] = []
+    session = _MockSession(lambda url, params, headers: _MockResponse(200, _payload()))
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return httpx.Response(
-            200,
-            json=_payload(),
-            extensions={"http_version": b"HTTP/2"},
-        )
-
-    async with InstagramClient(
-        max_retries=1,
-        transport=httpx.MockTransport(handler),
-    ) as client:
+    async with InstagramClient(max_retries=1, session=session) as client:
         result = await client.fetch_profile("65xim")
 
     assert result.success, result.error
-    assert len(seen) == 1
-    request = seen[0]
-    assert request.method == "GET"
-    assert request.url.host == INSTAGRAM_HOST
-    assert request.url.path == PROFILE_PATH
-    assert request.url.params.get("username") == "65xim"
-    assert request.headers.get("host") == INSTAGRAM_HOST
-    assert request.headers.get("x-ig-app-id") == FORCED_IG_APP_ID
+    assert len(session.requests) == 1
+    req = session.requests[0]
+    assert req["url"] == PROFILE_URL
+    assert req["params"].get("username") == "65xim"
+    assert req["headers"].get("x-ig-app-id") == FORCED_IG_APP_ID
 
 
-async def test_http1_response_rejected() -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json=_payload(),
-            extensions={"http_version": b"HTTP/1.1"},
-        )
+async def test_401_retries_then_succeeds() -> None:
+    calls = {"n": 0}
 
-    async with InstagramClient(
-        max_retries=1,
-        transport=httpx.MockTransport(handler),
-    ) as client:
+    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _MockResponse(401, {})
+        return _MockResponse(200, _payload())
+
+    session = _MockSession(handler)
+    async with InstagramClient(max_retries=3, session=session) as client:
         result = await client.fetch_profile("65xim")
 
-    assert not result.success
-    assert result.error and "HTTP/2 is required" in result.error
+    assert result.success, result.error
+    assert calls["n"] == 2
 
 
 async def main() -> int:
     await test_profile_request_shape()
-    await test_http1_response_rejected()
+    await test_401_retries_then_succeeds()
     print("OK")
     return 0
 
