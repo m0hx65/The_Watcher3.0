@@ -72,6 +72,22 @@ class NotificationDispatcher:
 
         return await self._send_with_retry(_send)
 
+    async def send_video(self, path: Path, caption: Optional[str] = None) -> bool:
+        async def _send():
+            with open(path, "rb") as f:
+                await self.bot.send_video(
+                    chat_id=self.chat_id,
+                    video=f,
+                    caption=caption or "",
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True,
+                )
+
+        ok = await self._send_with_retry(_send)
+        if ok and self.post_send_hook is not None:
+            await self.post_send_hook()
+        return ok
+
     async def _send_with_retry(self, action) -> bool:
         async with self._send_lock:
             for attempt in range(1, 5):

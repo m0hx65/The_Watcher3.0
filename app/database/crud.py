@@ -14,6 +14,7 @@ from app.database.models import (
     MonitoredAccount,
     NotificationLog,
     ProfileMediaHash,
+    SeenStory,
 )
 
 
@@ -245,6 +246,38 @@ async def export_all(session: AsyncSession) -> Iterable[NotificationLog]:
     )
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+# ---------- SeenStory (deduplication for stories & highlights) ----------
+
+async def get_seen_story_pks(session: AsyncSession, account_id: int) -> set[str]:
+    """Return the set of story PKs already delivered for this account."""
+    result = await session.execute(
+        select(SeenStory.story_pk).where(SeenStory.account_id == account_id)
+    )
+    return set(result.scalars().all())
+
+
+async def mark_story_seen(
+    session: AsyncSession,
+    account_id: int,
+    story_pk: str,
+    source: str,
+    highlight_id: Optional[str],
+    highlight_title: Optional[str],
+    media_type: str,
+    taken_at: int,
+) -> None:
+    session.add(SeenStory(
+        account_id=account_id,
+        story_pk=story_pk,
+        source=source,
+        highlight_id=highlight_id,
+        highlight_title=highlight_title,
+        media_type=media_type,
+        taken_at=taken_at,
+    ))
+    await session.flush()
 
 
 # ---------- AppSetting (runtime-tunable KV) ----------

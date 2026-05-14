@@ -26,6 +26,7 @@ from app.database.session import dispose_engine, get_session, init_db
 from app.monitor.instagram import InstagramClient
 from app.monitor.media_hasher import MediaHasher
 from app.monitor.service import MonitorService
+from app.monitor.stories import StoriesClient
 from app.utils.logger import logger
 from app.workers.scheduler import WatcherScheduler
 
@@ -47,8 +48,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Build core services
     instagram = InstagramClient()
     hasher = MediaHasher()
+    stories = StoriesClient()
     dispatcher = build_dispatcher(tg_app.bot)
-    monitor = MonitorService(instagram, hasher, dispatcher)
+    monitor = MonitorService(instagram, hasher, dispatcher, stories)
     scheduler = WatcherScheduler(monitor)
 
     # Cross-wire so /status can read scheduler info & handlers can run checks
@@ -184,6 +186,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             await instagram.close()
             await hasher.close()
+            await stories.close()
         except Exception as exc:
             logger.warning("HTTP client shutdown error: {}", exc)
 

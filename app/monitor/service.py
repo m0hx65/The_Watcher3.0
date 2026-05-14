@@ -18,7 +18,8 @@ from app.database.session import get_session
 from app.monitor.change_detector import ChangeSet, detect_changes
 from app.monitor.instagram import InstagramClient, ProfileFetchResult
 from app.monitor.media_hasher import HashedMedia, MediaHasher
-from app.utils.formatting import fmt_timestamp
+from app.monitor.stories import StoriesClient
+from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
 
 
@@ -30,10 +31,12 @@ class MonitorService:
         instagram: InstagramClient,
         hasher: MediaHasher,
         notifier: NotificationDispatcher,
+        stories: Optional[StoriesClient] = None,
     ) -> None:
         self.instagram = instagram
         self.hasher = hasher
         self.notifier = notifier
+        self.stories = stories
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
 
     async def check_username(
@@ -82,6 +85,12 @@ class MonitorService:
         logger.info(
             "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
         )
+
+        if self.stories is not None:
+            await asyncio.gather(
+                *(self._check_stories_and_highlights(aid, uname) for aid, uname in targets),
+                return_exceptions=True,
+            )
 
         noun = "profile" if checked == 1 else "profiles"
         summary = f"👁 Sweep complete — {checked} {noun} checked."
@@ -316,4 +325,80 @@ class MonitorService:
                     },
                     message=caption,
                     delivered=ok,
+                )
+
+    async def _check_stories_and_highlights(
+        self, account_id: int, username: str
+    ) -> None:
+        """Fetch new story/highlight items for one account and deliver them."""
+        assert self.stories is not None
+        async with self._semaphore:
+            try:
+                stories, highlights = await asyncio.gather(
+                    self.stories.fetch_stories(username),
+                    self.stories.fetch_highlights(username),
+                )
+                all_items = stories + highlights
+                if not all_items:
+                    return
+
+                async with get_session() as session:
+                    seen_pks = await crud.get_seen_story_pks(session, account_id)
+
+                new_items = [i for i in all_items if i.pk and i.pk not in seen_pks]
+                if not new_items:
+                    return
+
+                logger.info(
+                    "Found {} new story item(s) for @{}", len(new_items), username
+                )
+
+                for item in new_items:
+                    path = await self.stories.download(item, username)
+                    if path is None:
+                        logger.warning(
+                            "Could not download story {} for @{}", item.pk, username
+                        )
+                        # Mark seen anyway so expired items don't loop forever.
+                        async with get_session() as session:
+                            await crud.mark_story_seen(
+                                session,
+                                account_id=account_id,
+                                story_pk=item.pk,
+                                source=item.source,
+                                highlight_id=item.highlight_id,
+                                highlight_title=item.highlight_title,
+                                media_type=item.media_type,
+                                taken_at=item.taken_at,
+                            )
+                        continue
+
+                    if item.source == "highlight":
+                        caption = (
+                            f"✨ <b>@{esc(username)}</b> — highlight: "
+                            f"<b>{esc(item.highlight_title or '')}</b>"
+                        )
+                    else:
+                        caption = f"📖 <b>@{esc(username)}</b> — new story"
+
+                    if item.media_type == "video":
+                        ok = await self.notifier.send_video(path, caption=caption)
+                    else:
+                        ok = await self.notifier.send_photo(path, caption=caption)
+
+                    if ok:
+                        async with get_session() as session:
+                            await crud.mark_story_seen(
+                                session,
+                                account_id=account_id,
+                                story_pk=item.pk,
+                                source=item.source,
+                                highlight_id=item.highlight_id,
+                                highlight_title=item.highlight_title,
+                                media_type=item.media_type,
+                                taken_at=item.taken_at,
+                            )
+            except Exception as exc:
+                logger.exception(
+                    "Story check failed for @{}: {}", username, exc
                 )

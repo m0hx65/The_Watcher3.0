@@ -155,3 +155,29 @@ class NotificationLog(Base):
     )
 
     account: Mapped["MonitoredAccount"] = relationship(back_populates="notifications")
+
+
+class SeenStory(Base):
+    """Tracks every story/highlight item that has been delivered to Telegram."""
+
+    __tablename__ = "seen_stories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("monitored_accounts.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    story_pk: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)   # "story" | "highlight"
+    highlight_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    highlight_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    media_type: Mapped[str] = mapped_column(String(8), nullable=False) # "image" | "video"
+    taken_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_seen_stories_account_pk", "account_id", "story_pk", unique=True),
+    )
