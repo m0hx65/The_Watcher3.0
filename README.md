@@ -40,6 +40,8 @@ Telegram Chat ──► Bot Commands ──► FastAPI + APScheduler
 **Monitoring**
 - Tracks 10+ profile fields: followers, following, posts, reels, highlights, biography, full name, username, external link, verification badge, business flag, public/private status
 - Profile picture change detection — SHA-256 hashes each downloaded image and stores it to disk for later retrieval
+- Story and highlight monitoring — fetches new story and highlight items each sweep, downloads them, and sends photos/videos directly to Telegram with deduplication so each item is delivered exactly once
+- Sweep-complete notification — fires a summary message after every scheduled sweep so you always know the bot is alive and working
 - Configurable sweep interval with per-check jitter to avoid synchronized request bursts
 - Throttled concurrency — configurable max parallel fetches per sweep
 
@@ -268,6 +270,7 @@ Tables are created automatically on first boot via SQLAlchemy `create_all`.
 | `account_snapshots` | One row per fetch. Stores all parsed profile fields, raw JSON response, and HTTP status |
 | `profile_media_hashes` | One row per unique profile picture (SHA-256 + local disk path). Deduplicates across accounts |
 | `notification_logs` | One row per dispatched change event, including change type, payload, and delivery status |
+| `seen_stories` | One row per delivered story or highlight item. Deduplicates by `(account_id, story_pk)` so each item is sent exactly once |
 | `app_settings` | Key-value store for runtime-tunable config (check interval, panel message IDs) persisted across restarts |
 
 ---
