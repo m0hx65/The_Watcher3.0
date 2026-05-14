@@ -82,6 +82,13 @@ class MonitorService:
         logger.info(
             "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
         )
+
+        noun = "profile" if checked == 1 else "profiles"
+        summary = f"👁 Sweep complete — {checked} {noun} checked."
+        if failed:
+            summary += f" {failed} failed."
+        await self.notifier.send_text(summary)
+
         return {"checked": checked, "changed": changed, "failed": failed}
 
     async def _run_check(
