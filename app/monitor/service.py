@@ -71,9 +71,11 @@ class MonitorService:
         checked = 0
         changed = 0
         failed = 0
-        for r in results:
+        failed_usernames: list[str] = []
+        for (_, uname), r in zip(targets, results):
             if isinstance(r, Exception):
                 failed += 1
+                failed_usernames.append(uname)
                 logger.exception("Unhandled error during sweep: {}", r)
                 continue
             checked += 1
@@ -81,6 +83,7 @@ class MonitorService:
                 changed += 1
             if not r.get("ok"):
                 failed += 1
+                failed_usernames.append(r.get("username", uname))
 
         logger.info(
             "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
@@ -95,7 +98,8 @@ class MonitorService:
         noun = "profile" if checked == 1 else "profiles"
         summary = f"👁 Sweep complete — {checked} {noun} checked."
         if failed:
-            summary += f" {failed} failed."
+            names = ", ".join(f"@{u}" for u in failed_usernames)
+            summary += f" {failed} failed: {names}"
         await self.notifier.send_text(summary)
 
         return {"checked": checked, "changed": changed, "failed": failed}
