@@ -43,6 +43,9 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📤 Export", callback_data="menu:export"),
                 InlineKeyboardButton("ℹ️ Help", callback_data="menu:help"),
             ],
+            [
+                InlineKeyboardButton("🔄 Sweep All", callback_data="menu:sweep"),
+            ],
         ]
     )
 
@@ -160,9 +163,12 @@ def status_actions() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("🔄 Sweep Now", callback_data="menu:sweep"),
+            ],
+            [
                 InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
                 InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
-            ]
+            ],
         ]
     )
 

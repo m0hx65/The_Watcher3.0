@@ -89,27 +89,31 @@ class NotificationDispatcher:
         return ok
 
     async def _send_with_retry(self, action) -> bool:
-        async with self._send_lock:
-            for attempt in range(1, 5):
+        for attempt in range(1, 5):
+            delay: float = 0.0
+            async with self._send_lock:
                 try:
                     result = action()
                     if asyncio.iscoroutine(result):
                         await result
                     return True
                 except RetryAfter as ra:
-                    delay = float(ra.retry_after) + 1.0
+                    # Cap at 30s so the lock isn't held (or slept) for minutes
+                    delay = min(float(ra.retry_after) + 1.0, 30.0)
                     logger.warning(
                         "Telegram rate limit, sleeping {:.1f}s (attempt {})", delay, attempt
                     )
-                    await asyncio.sleep(delay)
                 except TelegramError as exc:
+                    delay = min(10.0, 2 ** attempt)
                     logger.warning(
                         "Telegram error attempt {}/4: {}", attempt, exc
                     )
-                    await asyncio.sleep(min(10.0, 2 ** attempt))
                 except Exception as exc:
                     logger.exception("Unexpected Telegram send error: {}", exc)
                     return False
+            # Sleep *outside* the lock so other sends aren't blocked during backoff
+            if delay > 0:
+                await asyncio.sleep(delay)
         logger.error("Telegram send permanently failed")
         return False
 

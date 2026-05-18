@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import re
@@ -174,6 +175,7 @@ _EDIT_IGNORED_ERRORS = (
     "message can't be edited",
     "message_id_invalid",
     "message identifier is not specified",
+    "there is no text in the message to edit",
 )
 
 
@@ -183,8 +185,13 @@ async def _safe_edit_text(
     *,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: str = ParseMode.HTML,
-) -> None:
-    """Edit a callback message, swallowing benign 'can't edit this message' errors."""
+):
+    """Edit a callback message, swallowing benign errors.
+
+    For media messages (photo/document/video) that cannot be text-edited,
+    deletes the media message and sends a fresh text message instead.
+    Returns the resulting Message object so callers can track its id.
+    """
     try:
         await query.edit_message_text(
             text=text,
@@ -192,11 +199,32 @@ async def _safe_edit_text(
             parse_mode=parse_mode,
             disable_web_page_preview=True,
         )
+        return query.message
     except BadRequest as exc:
-        msg = str(exc).lower()
-        if any(s in msg for s in _EDIT_IGNORED_ERRORS):
-            return
-        raise
+        err = str(exc).lower()
+        if not any(s in err for s in _EDIT_IGNORED_ERRORS):
+            raise
+        # Telegram rejects edit_message_text on photo/document/video messages.
+        # Fall back to deleting the media message and sending plain text.
+        if query.message and (
+            query.message.document
+            or query.message.photo
+            or query.message.video
+            or query.message.animation
+        ):
+            try:
+                await query.message.delete()
+            except (BadRequest, Forbidden, TelegramError):
+                pass
+            new_msg = await query.get_bot().send_message(
+                chat_id=query.message.chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+            return new_msg
+        return query.message
 
 
 async def _safe_answer(query, text: Optional[str] = None, *, show_alert: bool = False) -> None:
@@ -1048,12 +1076,14 @@ async def _handle_menu(
 
     if action == "main":
         await _safe_answer(query)
-        await _safe_edit_text(
+        result = await _safe_edit_text(
             query, WELCOME_TEXT, reply_markup=keyboards.main_menu()
         )
-        if query.message:
-            mid = query.message.message_id
-            cid = query.message.chat_id
+        # result may be a new message if the original was a media message
+        panel = result or query.message
+        if panel:
+            mid = panel.message_id
+            cid = panel.chat_id
             context.application.bot_data[PANEL_MSG_ID] = mid
             context.application.bot_data[PANEL_CHAT_ID] = cid
             async with get_session() as session:
@@ -1151,6 +1181,21 @@ async def _handle_menu(
         await _safe_answer(query)
         await _safe_edit_text(
             query, HELP_TEXT, reply_markup=keyboards.back_to_menu()
+        )
+        return
+
+    if action == "sweep":
+        sched = _scheduler(context)
+        if sched is None:
+            await _safe_answer(query, "Scheduler unavailable.", show_alert=True)
+            return
+        await _safe_answer(query, "Sweep started!")
+        asyncio.create_task(sched.trigger_now())
+        text = await _render_status_message(context)
+        await _safe_edit_text(
+            query,
+            f"🔄 Sweep running — results will appear in the chat.\n\n{text}",
+            reply_markup=keyboards.status_actions(),
         )
         return
 

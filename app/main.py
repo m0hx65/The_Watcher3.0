@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tg_app = (
         TgApplication.builder()
         .token(settings.telegram_bot_token)
+        .concurrent_updates(True)
         .build()
     )
     register_handlers(tg_app)
