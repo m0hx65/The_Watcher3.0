@@ -46,8 +46,12 @@ Telegram Chat ──► Bot Commands ──► FastAPI + APScheduler
 - Throttled concurrency — configurable max parallel fetches per sweep
 
 **Telegram Interface**
-- Full command set: `/add`, `/remove`, `/list`, `/recheck`, `/status`, `/history`, `/photo`, `/export`, `/help`
-- Inline keyboard menus — no commands to memorize
+- Full command set: `/menu`, `/add`, `/remove` (alias `/rm`), `/list`, `/recheck`, `/interval`, `/status`, `/history`, `/photo`, `/fetchphoto`, `/export`, `/help`
+- Inline keyboard menus — every feature is reachable through buttons, no commands required
+  - **Main menu**: Accounts · Status · Add · Interval · Export · Help · **Sweep All**
+  - **Account card**: per-account Recheck · History · Photo · Remove
+  - **Interval picker**: six presets (5 m / 15 m / 30 m / 1 h / 2 h / 6 h) plus free-form custom entry
+  - **Status view**: live stats with a **Sweep Now** button to trigger an immediate sweep
 - Panel bumping — after each notification the main menu re-posts at the bottom of the chat so it stays accessible
 - Authorization via `TELEGRAM_ADMIN_IDS`; leave empty to allow all users
 
@@ -226,13 +230,16 @@ All settings are read from environment variables. Copy `.env.example` to `.env` 
 
 | Command | Description |
 |---|---|
+| `/menu` | Open the main inline menu |
 | `/add <username>` | Start monitoring an account; runs an immediate baseline fetch |
-| `/remove <username>` | Stop monitoring and delete all stored history |
+| `/remove <username>` | Stop monitoring and delete all stored history (`/rm` is an alias) |
 | `/list` | Show all monitored accounts with last-check status and failure count |
 | `/recheck <username>` | Force an immediate check outside the normal schedule |
+| `/interval [value]` | Show or set the sweep interval — e.g. `30m`, `1h`, `1800s`. No argument shows current setting and presets |
 | `/status` | Global stats: account count, last sweep time, next scheduled sweep |
 | `/history <username>` | Last 15 detected changes for an account |
 | `/photo <username>` | Latest stored profile picture and its SHA-256 hash |
+| `/fetchphoto <username>` | Download the current live profile picture on demand — works for any public account, even ones not in the monitoring list |
 | `/export` | Download full notification history as a CSV file |
 | `/help` | Command reference |
 
