@@ -118,6 +118,8 @@ async def trigger_sweep(
 ) -> dict:
     """Cron-style endpoint. Render Cron Jobs can call this to trigger a sweep."""
     _check_token(x_api_token)
+    if scheduler.sweep_in_flight:
+        return {"ok": False, "detail": "sweep already in progress"}
     logger.info("Sweep triggered via HTTP")
     await scheduler.trigger_now()
     return {"ok": True}

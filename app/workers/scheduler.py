@@ -49,6 +49,7 @@ class WatcherScheduler:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self._on_state_change = None
         self._interval_seconds: int = max(MIN_INTERVAL, settings.check_interval)
+        self._sweep_in_flight: bool = False
 
     def set_state_callback(self, callback) -> None:
         """Callback invoked with (state_str, next_run_dt) on changes."""
@@ -57,6 +58,10 @@ class WatcherScheduler:
     @property
     def interval_seconds(self) -> int:
         return self._interval_seconds
+
+    @property
+    def sweep_in_flight(self) -> bool:
+        return self._sweep_in_flight
 
     async def start(self) -> None:
         self._interval_seconds = await load_persisted_interval()
@@ -151,16 +156,22 @@ class WatcherScheduler:
         return seconds
 
     async def _sweep_wrapper(self) -> None:
+        if self._sweep_in_flight:
+            logger.info("Sweep skipped — another sweep is already in progress")
+            return
+        self._sweep_in_flight = True
+        # Write timestamp immediately so rapid restarts don't pile up duplicate sweeps.
+        async with get_session() as session:
+            await crud.set_setting(
+                session, SETTING_LAST_SWEEP_AT,
+                datetime.now(timezone.utc).isoformat(),
+            )
         try:
             await self.service.check_all()
-            async with get_session() as session:
-                await crud.set_setting(
-                    session, SETTING_LAST_SWEEP_AT,
-                    datetime.now(timezone.utc).isoformat(),
-                )
         except Exception as exc:
             logger.exception("Sweep crashed: {}", exc)
         finally:
+            self._sweep_in_flight = False
             self._emit_state("running")
 
     async def _cleanup_wrapper(self) -> None:

@@ -1189,6 +1189,9 @@ async def _handle_menu(
         if sched is None:
             await _safe_answer(query, "Scheduler unavailable.", show_alert=True)
             return
+        if sched.sweep_in_flight:
+            await _safe_answer(query, "⏳ Sweep already in progress.", show_alert=True)
+            return
         await _safe_answer(query, "Sweep started!")
         asyncio.create_task(sched.trigger_now())
         text = await _render_status_message(context)
