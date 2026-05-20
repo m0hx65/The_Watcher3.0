@@ -16,6 +16,8 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:photo:<username>     — send latest stored profile picture
   acc:remove:<username>    — show remove confirmation
   acc:remove_yes:<u>       — confirmed remove
+  menu:cleardb             — show clear-history confirmation
+  menu:cleardb_yes         — execute clear-history
   noop                     — non-actionable button (e.g. page indicator)
 """
 
@@ -168,6 +170,22 @@ def status_actions() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
                 InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
+            ],
+            [
+                InlineKeyboardButton("🗑 Clear Old Data", callback_data="menu:cleardb"),
+            ],
+        ]
+    )
+
+
+def confirm_clear_db() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🗑 Yes, clear it", callback_data="menu:cleardb_yes"
+                ),
+                InlineKeyboardButton("✕ Cancel", callback_data="menu:status"),
             ],
         ]
     )

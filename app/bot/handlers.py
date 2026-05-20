@@ -1202,6 +1202,33 @@ async def _handle_menu(
         )
         return
 
+    if action == "cleardb":
+        await _safe_answer(query)
+        await _safe_edit_text(
+            query,
+            "⚠️ <b>Clear history?</b>\n\n"
+            "This will delete all snapshots (except the latest per account), "
+            "all notification logs, and all seen stories.\n"
+            "Monitored accounts will not be affected.",
+            reply_markup=keyboards.confirm_clear_db(),
+        )
+        return
+
+    if action == "cleardb_yes":
+        await _safe_answer(query, "Clearing…")
+        async with get_session() as session:
+            totals = await crud.clear_history(session)
+        await _safe_edit_text(
+            query,
+            "✅ <b>History cleared</b>\n\n"
+            f"Snapshots deleted: <b>{totals['snapshots_deleted']}</b>\n"
+            f"Notifications deleted: <b>{totals['notifications_deleted']}</b>\n"
+            f"Seen stories deleted: <b>{totals['stories_deleted']}</b>\n\n"
+            "<i>Latest snapshot per account was kept as the change-detection baseline.</i>",
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+
     await _safe_answer(query, "Unknown menu action.")
 
 

@@ -368,3 +368,35 @@ async def purge_old_data(
         totals["notifications_deleted"] = result.rowcount
 
     return totals
+
+
+async def clear_history(session: AsyncSession) -> dict[str, int]:
+    """Delete all history except the newest snapshot per account.
+
+    Keeps monitored_accounts, app_settings, and profile_media_hashes untouched.
+    Returns counts of deleted rows.
+    """
+    totals: dict[str, int] = {
+        "snapshots_deleted": 0,
+        "notifications_deleted": 0,
+        "stories_deleted": 0,
+    }
+
+    # Keep only the most-recent snapshot per account (needed as change-detection baseline)
+    latest_ids_sq = (
+        select(func.max(AccountSnapshot.id))
+        .group_by(AccountSnapshot.account_id)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        delete(AccountSnapshot).where(AccountSnapshot.id.notin_(latest_ids_sq))
+    )
+    totals["snapshots_deleted"] = result.rowcount
+
+    result = await session.execute(delete(NotificationLog))
+    totals["notifications_deleted"] = result.rowcount
+
+    result = await session.execute(delete(SeenStory))
+    totals["stories_deleted"] = result.rowcount
+
+    return totals
