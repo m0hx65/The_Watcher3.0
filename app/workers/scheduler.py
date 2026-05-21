@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -167,7 +168,12 @@ class WatcherScheduler:
                 datetime.now(timezone.utc).isoformat(),
             )
         try:
-            await self.service.check_all()
+            # Hard cap: if check_all() never returns (hung HTTP connection, etc.)
+            # _sweep_in_flight would stay True and block every subsequent scheduled
+            # run indefinitely. 10 minutes is generous for any realistic account count.
+            await asyncio.wait_for(self.service.check_all(), timeout=600)
+        except asyncio.TimeoutError:
+            logger.error("Sweep timed out after 10 minutes — forcing flag reset")
         except Exception as exc:
             logger.exception("Sweep crashed: {}", exc)
         finally:

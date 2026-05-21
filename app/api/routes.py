@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -43,6 +44,7 @@ def get_scheduler(request: Request) -> WatcherScheduler:
 
 
 @router.get("/health")
+@router.head("/health")
 async def health() -> dict:
     return {"ok": True}
 
@@ -116,12 +118,16 @@ async def trigger_sweep(
     x_api_token: Optional[str] = Header(default=None),
     scheduler: WatcherScheduler = Depends(get_scheduler),
 ) -> dict:
-    """Cron-style endpoint. Render Cron Jobs can call this to trigger a sweep."""
+    """Cron-style endpoint. Render Cron Jobs can call this to trigger a sweep.
+
+    Returns immediately so the HTTP caller (e.g. a Render Cron Job) does not
+    time out waiting for all profiles to be checked.
+    """
     _check_token(x_api_token)
     if scheduler.sweep_in_flight:
         return {"ok": False, "detail": "sweep already in progress"}
     logger.info("Sweep triggered via HTTP")
-    await scheduler.trigger_now()
+    asyncio.create_task(scheduler.trigger_now())
     return {"ok": True}
 
 
