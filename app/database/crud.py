@@ -129,6 +129,29 @@ async def insert_snapshot(
     return snapshot
 
 
+async def cleanup_old_snapshots(
+    session: AsyncSession, account_id: int, keep_count: int = 200
+) -> int:
+    """Delete old snapshots keeping only the most recent keep_count records. Returns count deleted."""
+    # Get all snapshot IDs for this account ordered by creation time (newest first)
+    stmt = (
+        select(AccountSnapshot.id)
+        .where(AccountSnapshot.account_id == account_id)
+        .order_by(desc(AccountSnapshot.created_at))
+        .offset(keep_count)
+    )
+    result = await session.execute(stmt)
+    old_ids = result.scalars().all()
+    
+    if not old_ids:
+        return 0
+    
+    # Delete snapshots with IDs in the old_ids list
+    delete_stmt = delete(AccountSnapshot).where(AccountSnapshot.id.in_(old_ids))
+    delete_result = await session.execute(delete_stmt)
+    return delete_result.rowcount
+
+
 async def recent_snapshots(
     session: AsyncSession, account_id: int, limit: int = 10
 ) -> List[AccountSnapshot]:

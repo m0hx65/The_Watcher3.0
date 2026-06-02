@@ -63,6 +63,10 @@ class MonitorService:
             return {"checked": 0, "changed": 0, "failed": 0}
 
         logger.info("Starting scheduled sweep across {} accounts", len(targets))
+        noun = "profile" if len(targets) == 1 else "profiles"
+        await self.notifier.send_text(
+            f"ðŸ‘ Sweep started â€” {len(targets)} {noun} queued."
+        )
         results = await asyncio.gather(
             *(self._run_check(aid, uname) for aid, uname in targets),
             return_exceptions=True,
@@ -72,18 +76,21 @@ class MonitorService:
         changed = 0
         failed = 0
         failed_usernames: list[str] = []
-        for (_, uname), r in zip(targets, results):
+        story_targets: list[tuple[int, str]] = []
+        for (target_account_id, uname), r in zip(targets, results):
             if isinstance(r, Exception):
                 failed += 1
                 failed_usernames.append(uname)
                 logger.exception("Unhandled error during sweep: {}", r)
                 continue
             checked += 1
+            result_username = r.get("username", uname)
+            story_targets.append((target_account_id, result_username))
             if r.get("changed"):
                 changed += 1
             if not r.get("ok"):
                 failed += 1
-                failed_usernames.append(r.get("username", uname))
+                failed_usernames.append(result_username)
 
         logger.info(
             "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
@@ -91,12 +98,15 @@ class MonitorService:
 
         if self.stories is not None:
             await asyncio.gather(
-                *(self._check_stories_and_highlights(aid, uname) for aid, uname in targets),
+                *(
+                    self._check_stories_and_highlights(aid, uname)
+                    for aid, uname in story_targets
+                ),
                 return_exceptions=True,
             )
 
         noun = "profile" if checked == 1 else "profiles"
-        summary = f"👁 Sweep complete — {checked} {noun} checked."
+        summary = f"ðŸ‘ Sweep complete â€” {checked} {noun} checked."
         if failed:
             names = ", ".join(f"@{u}" for u in failed_usernames)
             summary += f" {failed} failed: {names}"
@@ -121,9 +131,83 @@ class MonitorService:
         fetch = await self.instagram.fetch_profile(username)
 
         if not fetch.success:
+            if fetch.http_status == 404:
+                recovered = await self._recover_after_404(
+                    account_id, username, notify_unchanged
+                )
+                if recovered is not None:
+                    return recovered
             return await self._handle_failure(account_id, username, fetch)
 
         return await self._handle_success(account_id, username, fetch, notify_unchanged)
+
+    async def _recover_after_404(
+        self, account_id: int, username: str, notify_unchanged: bool
+    ) -> Optional[dict]:
+        async with get_session() as session:
+            account = await session.get(MonitoredAccount, account_id)
+            instagram_id = account.instagram_id if account else None
+            if not instagram_id:
+                previous = await crud.get_latest_snapshot(session, account_id)
+                raw_response = previous.raw_response if previous else None
+                instagram_id = self._extract_instagram_id(raw_response)
+                if instagram_id and account is not None:
+                    account.instagram_id = instagram_id
+
+        if not instagram_id:
+            logger.info("Cannot recover @{} after 404: no Instagram ID stored", username)
+            return None
+
+        new_username = await self.instagram.fetch_username_by_id(str(instagram_id))
+        if not new_username:
+            logger.info(
+                "Could not resolve current username for @{} using id={}",
+                username,
+                instagram_id,
+            )
+            return None
+        if new_username == username:
+            logger.info(
+                "Username lookup for id={} still resolves to @{} after 404",
+                instagram_id,
+                username,
+            )
+            return None
+
+        logger.info(
+            "Recovered renamed account id={}: @{} -> @{}",
+            instagram_id,
+            username,
+            new_username,
+        )
+        retry = await self.instagram.fetch_profile(new_username)
+        if not retry.success:
+            logger.warning(
+                "Recovered username @{} for id={} but profile fetch failed: status={} error={}",
+                new_username,
+                instagram_id,
+                retry.http_status,
+                retry.error,
+            )
+            return None
+        result = await self._handle_success(
+            account_id, new_username, retry, notify_unchanged
+        )
+        result["recovered_from_username"] = username
+        return result
+
+    @staticmethod
+    def _extract_instagram_id(raw_response: Optional[dict]) -> Optional[str]:
+        if not isinstance(raw_response, dict):
+            return None
+        try:
+            user = raw_response["data"]["user"]
+        except (KeyError, TypeError):
+            return None
+        if not isinstance(user, dict):
+            return None
+        instagram_id = user.get("id")
+        return str(instagram_id) if instagram_id else None
 
     async def _handle_failure(
         self, account_id: int, username: str, fetch: ProfileFetchResult
@@ -134,9 +218,17 @@ class MonitorService:
         )
 
         async with get_session() as session:
+            if fetch.http_status in (401, 404):
+                return {
+                    "ok": False,
+                    "username": username,
+                    "status": fetch.http_status,
+                    "error": fetch.error,
+                }
+
             # Only store a failure snapshot when transitioning from success
             # (i.e. the previous snapshot was OK). Repeated identical failures
-            # are not stored — they add no information.
+            # are not stored â€” they add no information.
             previous = await crud.get_latest_snapshot(session, account_id, successful_only=False)
             is_new_failure = previous is None or previous.http_status == 200
             if is_new_failure:
@@ -148,6 +240,8 @@ class MonitorService:
                     error=fetch.error,
                 )
                 await crud.insert_snapshot(session, snapshot)
+                # Keep only the latest 200 snapshots per account
+                await crud.cleanup_old_snapshots(session, account_id, keep_count=200)
             failure_count = await crud.mark_checked(
                 session, account_id, fetch.http_status, success=False
             )
@@ -231,8 +325,17 @@ class MonitorService:
             changeset = detect_changes(previous, snapshot, new_pic_hash=new_pic_hash)
             if previous is None or changeset.has_changes:
                 await crud.insert_snapshot(session, snapshot)
+                # Keep only the latest 200 snapshots per account
+                await crud.cleanup_old_snapshots(session, account_id, keep_count=200)
             else:
-                logger.debug("@{} — no changes detected, skipping snapshot insert", username)
+                previous.raw_response = fetch.raw_response
+                previous.profile_pic_url = parsed.get("profile_pic_url")
+                previous.profile_pic_hash = new_pic_hash
+                previous.error = None
+                logger.debug(
+                    "@{} - no changes detected; refreshed latest 200 response",
+                    username,
+                )
 
             # Persist profile picture hash if new.
             if hashed is not None:
@@ -253,8 +356,27 @@ class MonitorService:
             # Update Instagram ID & last-checked
             account = await session.get(MonitoredAccount, account_id)
             if account is not None:
-                if parsed.get("instagram_id") and not account.instagram_id:
-                    account.instagram_id = parsed["instagram_id"]
+                parsed_username = (parsed.get("username") or username).lower()
+                parsed_instagram_id = parsed.get("instagram_id")
+                # Store Instagram ID if account doesn't have one yet
+                if parsed_instagram_id and not account.instagram_id:
+                    account.instagram_id = str(parsed_instagram_id)
+                    logger.info(
+                        "Stored Instagram ID for @{}: {}",
+                        account.username,
+                        parsed_instagram_id,
+                    )
+                if parsed_username and parsed_username != account.username:
+                    existing = await crud.get_account(session, parsed_username)
+                    if existing is None or existing.id == account.id:
+                        account.username = parsed_username
+                    else:
+                        logger.warning(
+                            "Could not update @{} to @{}: username already monitored by account_id={}",
+                            account.username,
+                            parsed_username,
+                            existing.id,
+                        )
             await crud.mark_checked(session, account_id, 200, success=True)
 
         await self._dispatch_changes(
@@ -379,11 +501,11 @@ class MonitorService:
 
                     if item.source == "highlight":
                         caption = (
-                            f"✨ <b>@{esc(username)}</b> — highlight: "
+                            f"âœ¨ <b>@{esc(username)}</b> â€” highlight: "
                             f"<b>{esc(item.highlight_title or '')}</b>"
                         )
                     else:
-                        caption = f"📖 <b>@{esc(username)}</b> — new story"
+                        caption = f"ðŸ“– <b>@{esc(username)}</b> â€” new story"
 
                     if item.media_type == "video":
                         ok = await self.notifier.send_video(path, caption=caption)
