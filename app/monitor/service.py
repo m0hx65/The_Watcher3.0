@@ -153,14 +153,28 @@ class MonitorService:
                 instagram_id = self._extract_instagram_id(raw_response)
                 if instagram_id and account is not None:
                     account.instagram_id = instagram_id
+                    await session.flush()  # Persist extracted ID immediately
+                    logger.info(
+                        "Extracted and stored Instagram ID from previous snapshot for @{}: {}",
+                        account.username,
+                        instagram_id,
+                    )
 
         if not instagram_id:
-            logger.info("Cannot recover @{} after 404: no Instagram ID stored", username)
+            logger.warning(
+                "Cannot recover @{} after 404: no Instagram ID stored or found in snapshots",
+                username,
+            )
             return None
 
+        logger.info(
+            "Attempting to recover @{} using stored Instagram ID: {}",
+            username,
+            instagram_id,
+        )
         new_username = await self.instagram.fetch_username_by_id(str(instagram_id))
         if not new_username:
-            logger.info(
+            logger.warning(
                 "Could not resolve current username for @{} using id={}",
                 username,
                 instagram_id,
@@ -175,7 +189,7 @@ class MonitorService:
             return None
 
         logger.info(
-            "Recovered renamed account id={}: @{} -> @{}",
+            "Successfully recovered renamed account (id={}): @{} -> @{}",
             instagram_id,
             username,
             new_username,
@@ -361,6 +375,7 @@ class MonitorService:
                 # Store Instagram ID if account doesn't have one yet
                 if parsed_instagram_id and not account.instagram_id:
                     account.instagram_id = str(parsed_instagram_id)
+                    await session.flush()  # Ensure ID is persisted immediately
                     logger.info(
                         "Stored Instagram ID for @{}: {}",
                         account.username,
@@ -370,6 +385,11 @@ class MonitorService:
                     existing = await crud.get_account(session, parsed_username)
                     if existing is None or existing.id == account.id:
                         account.username = parsed_username
+                        logger.info(
+                            "Updated @{} to @{} via parsed response",
+                            username,
+                            parsed_username,
+                        )
                     else:
                         logger.warning(
                             "Could not update @{} to @{}: username already monitored by account_id={}",
