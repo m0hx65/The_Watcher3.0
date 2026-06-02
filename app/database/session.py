@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -40,6 +41,17 @@ async def init_db() -> None:
     """Create all tables if they don't yet exist."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in inspect(sync_conn).get_columns("monitored_accounts")
+            }
+        )
+        if "instagram_id" not in columns:
+            await conn.execute(
+                text("ALTER TABLE monitored_accounts ADD COLUMN instagram_id VARCHAR(64)")
+            )
+            logger.info("Added monitored_accounts.instagram_id column")
     logger.info("Database schema verified")
 
 

@@ -206,25 +206,26 @@ async def _safe_edit_text(
             raise
         # Telegram rejects edit_message_text on photo/document/video messages.
         # Fall back to deleting the media message and sending plain text.
-        if query.message and (
-            query.message.document
-            or query.message.photo
-            or query.message.video
-            or query.message.animation
+        message = getattr(query, "message", None)
+        if message and (
+            message.document
+            or message.photo
+            or message.video
+            or message.animation
         ):
             try:
-                await query.message.delete()
+                await message.delete()
             except (BadRequest, Forbidden, TelegramError):
                 pass
             new_msg = await query.get_bot().send_message(
-                chat_id=query.message.chat_id,
+                chat_id=message.chat_id,
                 text=text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode,
                 disable_web_page_preview=True,
             )
             return new_msg
-        return query.message
+        return message
 
 
 async def _safe_answer(query, text: Optional[str] = None, *, show_alert: bool = False) -> None:
@@ -329,6 +330,7 @@ async def _render_account_card(username: str) -> Optional[str]:
 
     lines = [
         f"<b>@{esc(account.username)}</b>",
+        f"Instagram ID: <code>{esc(account.instagram_id or 'unknown')}</code>",
         f"State: {marker}",
         f"Last check: <code>{last}</code> · {status}",
     ]
@@ -774,6 +776,7 @@ async def cmd_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    username = result.get("username", username)
     msg = (
         f"<b>@{esc(username)}</b> check done · status {result['status']} · "
         f"{'CHANGES' if result.get('changed') else 'no changes'}"
@@ -1185,6 +1188,7 @@ async def _handle_menu(
         return
 
     if action == "sweep":
+        backfill_ids = len(parts) > 1 and parts[1] == "ids"
         sched = _scheduler(context)
         if sched is None:
             await _safe_answer(query, "Scheduler unavailable.", show_alert=True)
@@ -1192,12 +1196,16 @@ async def _handle_menu(
         if sched.sweep_in_flight:
             await _safe_answer(query, "⏳ Sweep already in progress.", show_alert=True)
             return
-        await _safe_answer(query, "Sweep started!")
-        asyncio.create_task(sched.trigger_now())
+        alert = "Sweep started — also fetching missing Instagram IDs!" if backfill_ids else "Sweep started!"
+        await _safe_answer(query, alert)
+        asyncio.create_task(sched.trigger_now(backfill_ids=backfill_ids))
         text = await _render_status_message(context)
+        running_msg = "🔄 Sweep running"
+        if backfill_ids:
+            running_msg += " (resolving Instagram IDs + checking profiles)"
         await _safe_edit_text(
             query,
-            f"🔄 Sweep running — results will appear in the chat.\n\n{text}",
+            f"{running_msg} — results will appear in the chat.\n\n{text}",
             reply_markup=keyboards.status_actions(),
         )
         return
@@ -1208,7 +1216,7 @@ async def _handle_menu(
             query,
             "⚠️ <b>Clear history?</b>\n\n"
             "This will delete all snapshots (except the latest per account), "
-            "all notification logs, and all seen stories.\n"
+            "all notification logs, seen stories, and stored highlight catalogs.\n"
             "Monitored accounts will not be affected.",
             reply_markup=keyboards.confirm_clear_db(),
         )
@@ -1223,7 +1231,8 @@ async def _handle_menu(
             "✅ <b>History cleared</b>\n\n"
             f"Snapshots deleted: <b>{totals['snapshots_deleted']}</b>\n"
             f"Notifications deleted: <b>{totals['notifications_deleted']}</b>\n"
-            f"Seen stories deleted: <b>{totals['stories_deleted']}</b>\n\n"
+            f"Seen stories deleted: <b>{totals['stories_deleted']}</b>\n"
+            f"Highlight catalogs cleared: <b>{totals.get('highlights_deleted', 0)}</b>\n\n"
             "<i>Latest snapshot per account was kept as the change-detection baseline.</i>",
             reply_markup=keyboards.back_to_menu(),
         )
@@ -1274,6 +1283,7 @@ async def _handle_account(
                 reply_markup=keyboards.account_actions(username),
             )
             return
+        username = result.get("username", username)
         text = await _render_account_card(username)
         suffix = (
             "\n\n<i>Changes detected ✓</i>"

@@ -55,6 +55,43 @@ class StoriesClient:
             logger.warning("Failed to fetch stories for @{}: {}", username, exc)
             return []
 
+    async def fetch_highlight_catalog(self, username: str) -> dict[str, str]:
+        """Return highlight reel id -> title without downloading every item."""
+        pk = await self._get_user_pk(username)
+        if not pk:
+            return {}
+        try:
+            resp = await self._session.get(f"{_API}/highlights/{pk}")
+            if resp.status_code != 200:
+                return {}
+            highlights = resp.json().get("result", [])
+        except Exception as exc:
+            logger.warning("Failed to fetch highlight catalog for @{}: {}", username, exc)
+            return {}
+        catalog: dict[str, str] = {}
+        for h in highlights:
+            hid = h.get("id")
+            if hid:
+                catalog[str(hid)] = str(h.get("title") or "")
+        return catalog
+
+    async def fetch_highlight_items(self, username: str, highlight_id: str, title: str) -> list[StoryItem]:
+        """Download story items for one highlight reel."""
+        items: list[StoryItem] = []
+        try:
+            resp = await self._session.get(f"{_API}/highlightStories/{highlight_id}")
+            if resp.status_code != 200:
+                return items
+            for item in self._parse_content(resp.json(), source="highlight"):
+                item.highlight_id = highlight_id
+                item.highlight_title = title
+                items.append(item)
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch highlight {} for @{}: {}", highlight_id, username, exc
+            )
+        return items
+
     async def fetch_highlights(self, username: str) -> list[StoryItem]:
         """Return all story items across every highlight reel for a public account."""
         pk = await self._get_user_pk(username)
@@ -72,20 +109,11 @@ class StoriesClient:
 
         items: list[StoryItem] = []
         for h in highlights:
-            hid = h.get("id", "")
-            title = h.get("title", "")
-            try:
-                resp = await self._session.get(f"{_API}/highlightStories/{hid}")
-                if resp.status_code != 200:
-                    continue
-                for item in self._parse_content(resp.json(), source="highlight"):
-                    item.highlight_id = hid
-                    item.highlight_title = title
-                    items.append(item)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to fetch highlight {} for @{}: {}", hid, username, exc
-                )
+            hid = str(h.get("id", ""))
+            title = str(h.get("title") or "")
+            if not hid:
+                continue
+            items.extend(await self.fetch_highlight_items(username, hid, title))
         return items
 
     async def download(self, item: StoryItem, username: str) -> Optional[Path]:
@@ -113,6 +141,10 @@ class StoriesClient:
                 "Failed to download story {} for @{}: {}", item.pk, username, exc
             )
             return None
+
+    async def resolve_user_id(self, username: str) -> Optional[str]:
+        """Return Instagram numeric user id (pk) for a username, if the account is public."""
+        return await self._get_user_pk(username)
 
     async def _get_user_pk(self, username: str) -> Optional[str]:
         try:

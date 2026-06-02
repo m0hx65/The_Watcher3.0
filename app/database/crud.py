@@ -15,6 +15,7 @@ from app.database.models import (
     NotificationLog,
     ProfileMediaHash,
     SeenStory,
+    StoredHighlight,
 )
 
 
@@ -271,7 +272,71 @@ async def export_all(session: AsyncSession) -> Iterable[NotificationLog]:
     return result.scalars().all()
 
 
+# ---------- StoredHighlight (highlight reel catalog per account) ----------
+
+async def get_highlight_catalog(
+    session: AsyncSession, account_id: int
+) -> dict[str, str]:
+    """Return highlight_id -> title for an account."""
+    result = await session.execute(
+        select(StoredHighlight).where(StoredHighlight.account_id == account_id)
+    )
+    return {row.highlight_id: row.title for row in result.scalars().all()}
+
+
+async def replace_highlight_catalog(
+    session: AsyncSession,
+    account_id: int,
+    catalog: dict[str, str],
+) -> None:
+    """Replace the stored highlight catalog with the current Instagram list."""
+    await session.execute(
+        delete(StoredHighlight).where(StoredHighlight.account_id == account_id)
+    )
+    for highlight_id, title in catalog.items():
+        session.add(
+            StoredHighlight(
+                account_id=account_id,
+                highlight_id=highlight_id,
+                title=title or "",
+            )
+        )
+    await session.flush()
+
+
 # ---------- SeenStory (deduplication for stories & highlights) ----------
+
+async def mark_story_items_seen(
+    session: AsyncSession,
+    account_id: int,
+    items: Iterable[Any],
+) -> None:
+    """Mark multiple story/highlight items as seen (skips duplicates)."""
+    seen = await get_seen_story_pks(session, account_id)
+    for item in items:
+        pk = getattr(item, "pk", None) or (item.get("pk") if isinstance(item, dict) else None)
+        if not pk or str(pk) in seen:
+            continue
+        source = getattr(item, "source", None) or (item.get("source") if isinstance(item, dict) else "story")
+        await mark_story_seen(
+            session,
+            account_id=account_id,
+            story_pk=str(pk),
+            source=str(source),
+            highlight_id=getattr(item, "highlight_id", None)
+            or (item.get("highlight_id") if isinstance(item, dict) else None),
+            highlight_title=getattr(item, "highlight_title", None)
+            or (item.get("highlight_title") if isinstance(item, dict) else None),
+            media_type=str(
+                getattr(item, "media_type", None)
+                or (item.get("media_type") if isinstance(item, dict) else "image")
+            ),
+            taken_at=int(
+                getattr(item, "taken_at", None)
+                or (item.get("taken_at") if isinstance(item, dict) else 0)
+            ),
+        )
+        seen.add(str(pk))
 
 async def get_seen_story_pks(session: AsyncSession, account_id: int) -> set[str]:
     """Return the set of story PKs already delivered for this account."""
@@ -403,6 +468,7 @@ async def clear_history(session: AsyncSession) -> dict[str, int]:
         "snapshots_deleted": 0,
         "notifications_deleted": 0,
         "stories_deleted": 0,
+        "highlights_deleted": 0,
     }
 
     # Keep only the most-recent snapshot per account (needed as change-detection baseline)
@@ -421,5 +487,8 @@ async def clear_history(session: AsyncSession) -> dict[str, int]:
 
     result = await session.execute(delete(SeenStory))
     totals["stories_deleted"] = result.rowcount
+
+    result = await session.execute(delete(StoredHighlight))
+    totals["highlights_deleted"] = result.rowcount
 
     return totals

@@ -18,8 +18,11 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
 from app.monitor.instagram import (  # noqa: E402
     FORCED_IG_APP_ID,
+    PROFILE_REEL_QUERY_ID,
+    PROFILE_REEL_QUERY_URL,
     PROFILE_URL,
     InstagramClient,
+    extract_instagram_id,
 )
 
 
@@ -39,6 +42,27 @@ def _payload() -> dict:
                 "id": "7880052534",
             }
         }
+    }
+
+
+def _reel_payload() -> dict:
+    return {
+        "data": {
+            "viewer": None,
+            "user": {
+                "reel": {
+                    "user": {
+                        "id": "7880052534",
+                        "username": "65xim_new",
+                    },
+                    "owner": {
+                        "id": "7880052534",
+                        "username": "65xim_new",
+                    },
+                }
+            },
+        },
+        "status": "ok",
     }
 
 
@@ -95,9 +119,46 @@ async def test_401_retries_then_succeeds() -> None:
     assert calls["n"] == 2
 
 
+async def test_extract_instagram_id_from_reel_query() -> None:
+    assert extract_instagram_id(_reel_payload()) == "7880052534"
+    assert extract_instagram_id(_payload()) == "7880052534"
+
+
+async def test_fetch_reel_user_parses_id_and_username() -> None:
+    session = _MockSession(lambda url, params, headers: _MockResponse(200, _reel_payload()))
+
+    async with InstagramClient(max_retries=1, session=session) as client:
+        parsed = await client.fetch_reel_user("7880052534")
+
+    assert parsed is not None
+    assert parsed["instagram_id"] == "7880052534"
+    assert parsed["username"] == "65xim_new"
+    assert parsed["highlights"] == {}
+
+
+async def test_username_lookup_by_id_request_shape() -> None:
+    session = _MockSession(lambda url, params, headers: _MockResponse(200, _reel_payload()))
+
+    async with InstagramClient(max_retries=1, session=session) as client:
+        username = await client.fetch_username_by_id("7880052534")
+
+    assert username == "65xim_new"
+    assert len(session.requests) == 1
+    req = session.requests[0]
+    assert req["url"] == PROFILE_REEL_QUERY_URL
+    assert req["params"].get("query_id") == PROFILE_REEL_QUERY_ID
+    assert req["params"].get("user_id") == "7880052534"
+    assert req["params"].get("include_reel") == "true"
+    assert req["params"].get("include_highlight_reels") == "true"
+    assert req["headers"].get("x-ig-app-id") == FORCED_IG_APP_ID
+
+
 async def main() -> int:
     await test_profile_request_shape()
     await test_401_retries_then_succeeds()
+    await test_extract_instagram_id_from_reel_query()
+    await test_fetch_reel_user_parses_id_and_username()
+    await test_username_lookup_by_id_request_shape()
     print("OK")
     return 0
 

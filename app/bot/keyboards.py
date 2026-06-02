@@ -165,7 +165,7 @@ def status_actions() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔄 Sweep Now", callback_data="menu:sweep"),
+                InlineKeyboardButton("🔄 Sweep Now", callback_data="menu:sweep:ids"),
             ],
             [
                 InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),

@@ -135,10 +135,10 @@ class WatcherScheduler:
         job = self.scheduler.get_job(SWEEP_JOB_ID)
         return job.next_run_time if job else None
 
-    async def trigger_now(self) -> None:
+    async def trigger_now(self, *, backfill_ids: bool = False) -> None:
         """Run a sweep immediately, on top of the scheduled cadence."""
-        logger.info("Manual sweep triggered")
-        await self._sweep_wrapper()
+        logger.info("Manual sweep triggered (backfill_ids={})", backfill_ids)
+        await self._sweep_wrapper(backfill_ids=backfill_ids)
 
     async def set_interval(self, seconds: int) -> int:
         """Persist a new interval and reschedule the live job. Returns clamped value."""
@@ -156,7 +156,7 @@ class WatcherScheduler:
             self._emit_state("running")
         return seconds
 
-    async def _sweep_wrapper(self) -> None:
+    async def _sweep_wrapper(self, *, backfill_ids: bool = False) -> None:
         if self._sweep_in_flight:
             logger.info("Sweep skipped — another sweep is already in progress")
             return
@@ -171,7 +171,10 @@ class WatcherScheduler:
             # Hard cap: if check_all() never returns (hung HTTP connection, etc.)
             # _sweep_in_flight would stay True and block every subsequent scheduled
             # run indefinitely. 10 minutes is generous for any realistic account count.
-            await asyncio.wait_for(self.service.check_all(), timeout=600)
+            await asyncio.wait_for(
+                self.service.check_all(backfill_ids=backfill_ids),
+                timeout=600,
+            )
         except asyncio.TimeoutError:
             logger.error("Sweep timed out after 10 minutes — forcing flag reset")
         except Exception as exc:

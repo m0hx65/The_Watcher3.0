@@ -26,6 +26,8 @@ from app.utils.logger import logger
 INSTAGRAM_HOST = "www.instagram.com"
 PROFILE_PATH = "/api/v1/users/web_profile_info/"
 PROFILE_URL = f"https://{INSTAGRAM_HOST}{PROFILE_PATH}"
+PROFILE_REEL_QUERY_ID = "9957820854288654"
+PROFILE_REEL_QUERY_URL = f"https://{INSTAGRAM_HOST}/graphql/query/"
 MOBILE_HOST = "i.instagram.com"
 MOBILE_USER_INFO_PATH = "/api/v1/users/{user_id}/info/"
 FORCED_IG_APP_ID = "936619743392459"
@@ -73,6 +75,92 @@ def _build_headers() -> dict[str, str]:
     if settings.ig_session_cookie:
         headers["cookie"] = settings.ig_session_cookie
     return headers
+
+
+def extract_instagram_id(payload: Optional[dict[str, Any]]) -> Optional[str]:
+    """Read a numeric user id from web_profile_info or graphql reel query JSON."""
+    if not isinstance(payload, dict):
+        return None
+    try:
+        user = payload["data"]["user"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(user, dict):
+        return None
+
+    direct = user.get("id")
+    if direct:
+        return str(direct)
+
+    reel = user.get("reel")
+    if not isinstance(reel, dict):
+        return None
+    if reel.get("id"):
+        return str(reel["id"])
+    for key in ("user", "owner"):
+        node = reel.get(key)
+        if isinstance(node, dict) and node.get("id"):
+            return str(node["id"])
+    return None
+
+
+def parse_highlight_catalog(payload: dict[str, Any]) -> dict[str, str]:
+    """Parse highlight reel id -> title from graphql reel query JSON."""
+    try:
+        user = payload["data"]["user"]
+    except (KeyError, TypeError):
+        return {}
+    if not isinstance(user, dict):
+        return {}
+    edges = user.get("edge_highlight_reels", {}).get("edges")
+    if not isinstance(edges, list):
+        return {}
+    catalog: dict[str, str] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        node = edge.get("node")
+        if not isinstance(node, dict):
+            continue
+        highlight_id = node.get("id")
+        if highlight_id:
+            catalog[str(highlight_id)] = str(node.get("title") or "")
+    return catalog
+
+
+def _parse_reel_query_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Parse graphql reel query (query_id=9957820854288654&user_id=…)."""
+    try:
+        user = payload["data"]["user"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(user, dict):
+        return None
+
+    instagram_id = extract_instagram_id(payload)
+    username: Optional[str] = None
+    reel = user.get("reel")
+    if isinstance(reel, dict):
+        for key in ("user", "owner"):
+            node = reel.get(key)
+            if isinstance(node, dict):
+                candidate = node.get("username")
+                if isinstance(candidate, str) and candidate.strip():
+                    username = candidate.strip().lstrip("@").lower()
+                    break
+    if username is None:
+        raw = user.get("username")
+        if isinstance(raw, str) and raw.strip():
+            username = raw.strip().lstrip("@").lower()
+
+    if not instagram_id and not username:
+        return None
+    return {
+        "instagram_id": instagram_id,
+        "username": username,
+        "highlights": parse_highlight_catalog(payload),
+        "has_public_story": bool(user.get("has_public_story")),
+    }
 
 
 def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -188,6 +276,47 @@ class InstagramClient:
         except Exception as exc:
             logger.debug("fetch_hd_pic_url failed for user_id={}: {}", user_id, exc)
         return None
+
+    async def fetch_reel_user(self, user_id: str) -> Optional[dict[str, Any]]:
+        """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654)."""
+        if not user_id:
+            return None
+        headers = _build_headers()
+        params = {
+            "query_id": PROFILE_REEL_QUERY_ID,
+            "user_id": str(user_id),
+            "include_chaining": "false",
+            "include_reel": "true",
+            "include_suggested_users": "false",
+            "include_logged_out_extras": "true",
+            "include_live_status": "false",
+            "include_highlight_reels": "true",
+        }
+        try:
+            response = await self._session.get(
+                PROFILE_REEL_QUERY_URL,
+                params=params,
+                headers=headers,
+            )
+            if response.status_code != 200:
+                logger.debug(
+                    "Reel query for id={} returned HTTP {}",
+                    user_id,
+                    response.status_code,
+                )
+                return None
+            payload = response.json()
+        except Exception as exc:
+            logger.debug("Reel query for id={} failed: {}", user_id, exc)
+            return None
+        return _parse_reel_query_user(payload)
+
+    async def fetch_username_by_id(self, user_id: str) -> Optional[str]:
+        """Resolve the current username for a stable Instagram numeric user ID."""
+        parsed = await self.fetch_reel_user(user_id)
+        if parsed is None:
+            return None
+        return parsed.get("username")
 
     async def fetch_profile(self, username: str) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff."""

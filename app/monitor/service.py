@@ -10,13 +10,15 @@ from app.bot.notifications import (
     NotificationDispatcher,
     render_changes_message,
     render_failure_message,
+    render_highlight_catalog_changes,
+    render_new_stories_alert,
 )
 from app.config import settings
 from app.database import crud
 from app.database.models import AccountSnapshot, MonitoredAccount, ProfileMediaHash
 from app.database.session import get_session
 from app.monitor.change_detector import ChangeSet, detect_changes
-from app.monitor.instagram import InstagramClient, ProfileFetchResult
+from app.monitor.instagram import InstagramClient, ProfileFetchResult, extract_instagram_id
 from app.monitor.media_hasher import HashedMedia, MediaHasher
 from app.monitor.stories import StoriesClient
 from app.utils.formatting import esc, fmt_timestamp
@@ -52,20 +54,152 @@ class MonitorService:
 
         return await self._run_check(account_id, username, notify_unchanged=notify_unchanged)
 
-    async def check_all(self) -> dict:
+    async def backfill_instagram_ids(self) -> dict:
+        """Resolve and store instagram_id for accounts that do not have one yet."""
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=True)
+            missing = [a for a in accounts if not a.instagram_id]
+
+        if not missing:
+            return {
+                "attempted": 0,
+                "resolved": 0,
+                "from_snapshot": 0,
+                "from_reel_query": 0,
+                "from_stories_api": 0,
+                "from_fetch": 0,
+                "failed": 0,
+            }
+
+        resolved = 0
+        from_snapshot = 0
+        from_reel_query = 0
+        from_stories_api = 0
+        from_fetch = 0
+        failed = 0
+
+        for account in missing:
+            instagram_id: Optional[str] = None
+            resolved_username: Optional[str] = None
+
+            async with get_session() as session:
+                current = await session.get(MonitoredAccount, account.id)
+                if current is None or current.instagram_id:
+                    continue
+                snapshot = await crud.get_latest_snapshot(
+                    session, account.id, successful_only=False
+                )
+                instagram_id = self._extract_instagram_id(
+                    snapshot.raw_response if snapshot else None
+                )
+                if instagram_id:
+                    current.instagram_id = instagram_id
+                    from_snapshot += 1
+                    resolved += 1
+                    logger.info(
+                        "Backfilled Instagram ID for @{} from snapshot: {}",
+                        current.username,
+                        instagram_id,
+                    )
+                    continue
+
+            if self.stories is not None:
+                async with self._semaphore:
+                    pk = await self.stories.resolve_user_id(account.username)
+                if pk:
+                    async with self._semaphore:
+                        reel_user = await self.instagram.fetch_reel_user(str(pk))
+                    if reel_user:
+                        instagram_id = reel_user.get("instagram_id") or str(pk)
+                        resolved_username = reel_user.get("username")
+                    else:
+                        instagram_id = str(pk)
+                    async with get_session() as session:
+                        current = await session.get(MonitoredAccount, account.id)
+                        if current is not None and not current.instagram_id:
+                            current.instagram_id = instagram_id
+                            if resolved_username and resolved_username != current.username:
+                                existing = await crud.get_account(
+                                    session, resolved_username
+                                )
+                                if existing is None or existing.id == current.id:
+                                    current.username = resolved_username
+                            from_stories_api += 1
+                            if reel_user:
+                                from_reel_query += 1
+                            resolved += 1
+                            logger.info(
+                                "Backfilled Instagram ID for @{} via stories/reel query: {}",
+                                current.username,
+                                instagram_id,
+                            )
+                    continue
+
+            async with self._semaphore:
+                fetch = await self.instagram.fetch_profile(account.username)
+
+            if fetch.success and fetch.parsed:
+                instagram_id = fetch.parsed.get("instagram_id")
+            if not instagram_id:
+                instagram_id = self._extract_instagram_id(fetch.raw_response)
+
+            if instagram_id:
+                async with get_session() as session:
+                    current = await session.get(MonitoredAccount, account.id)
+                    if current is not None and not current.instagram_id:
+                        current.instagram_id = str(instagram_id)
+                        from_fetch += 1
+                        resolved += 1
+                        logger.info(
+                            "Backfilled Instagram ID for @{} from profile fetch: {}",
+                            current.username,
+                            instagram_id,
+                        )
+                continue
+
+            failed += 1
+            logger.warning(
+                "Could not backfill Instagram ID for @{}", account.username
+            )
+
+        return {
+            "attempted": len(missing),
+            "resolved": resolved,
+            "from_snapshot": from_snapshot,
+            "from_reel_query": from_reel_query,
+            "from_stories_api": from_stories_api,
+            "from_fetch": from_fetch,
+            "failed": failed,
+        }
+
+    async def check_all(self, *, backfill_ids: bool = False) -> dict:
         """Fan out checks across all active accounts."""
+        id_backfill: Optional[dict] = None
+        if backfill_ids:
+            id_backfill = await self.backfill_instagram_ids()
+            if id_backfill["resolved"]:
+                logger.info(
+                    "Instagram ID backfill before sweep: resolved={} (snapshot={}, fetch={})",
+                    id_backfill["resolved"],
+                    id_backfill["from_snapshot"],
+                    id_backfill["from_fetch"],
+                )
+
         async with get_session() as session:
             accounts = await crud.list_accounts(session, only_active=True)
             targets = [(a.id, a.username) for a in accounts]
 
         if not targets:
             logger.info("No active accounts to check.")
-            return {"checked": 0, "changed": 0, "failed": 0}
+            result: dict = {"checked": 0, "changed": 0, "failed": 0}
+            if id_backfill is not None:
+                result["id_backfill"] = id_backfill
+            return result
 
         logger.info("Starting scheduled sweep across {} accounts", len(targets))
         noun = "profile" if len(targets) == 1 else "profiles"
         await self.notifier.send_text(
-            f"ðŸ‘ Sweep started â€” {len(targets)} {noun} queued."
+            f"👁 Sweep started — {len(targets)} {noun} queued."
         )
         results = await asyncio.gather(
             *(self._run_check(aid, uname) for aid, uname in targets),
@@ -76,7 +210,7 @@ class MonitorService:
         changed = 0
         failed = 0
         failed_usernames: list[str] = []
-        story_targets: list[tuple[int, str]] = []
+        story_targets: list[tuple[int, str, Optional[str]]] = []
         for (target_account_id, uname), r in zip(targets, results):
             if isinstance(r, Exception):
                 failed += 1
@@ -85,7 +219,17 @@ class MonitorService:
                 continue
             checked += 1
             result_username = r.get("username", uname)
-            story_targets.append((target_account_id, result_username))
+            meta = await self._load_account_story_meta(target_account_id)
+            is_private = r.get("is_private")
+            if is_private is None:
+                is_private = meta["is_private"]
+            else:
+                is_private = bool(is_private)
+            instagram_id = r.get("instagram_id") or meta["instagram_id"]
+            if not is_private:
+                story_targets.append(
+                    (target_account_id, result_username, instagram_id)
+                )
             if r.get("changed"):
                 changed += 1
             if not r.get("ok"):
@@ -96,23 +240,43 @@ class MonitorService:
             "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
         )
 
-        if self.stories is not None:
+        if self.stories is not None and story_targets:
             await asyncio.gather(
                 *(
-                    self._check_stories_and_highlights(aid, uname)
-                    for aid, uname in story_targets
+                    self._check_stories_and_highlights(
+                        aid, uname, instagram_id=ig_id
+                    )
+                    for aid, uname, ig_id in story_targets
                 ),
                 return_exceptions=True,
             )
 
         noun = "profile" if checked == 1 else "profiles"
-        summary = f"ðŸ‘ Sweep complete â€” {checked} {noun} checked."
+        summary = f"👁 Sweep complete — {checked} {noun} checked."
         if failed:
             names = ", ".join(f"@{u}" for u in failed_usernames)
             summary += f" {failed} failed: {names}"
+        if backfill_ids:
+            async with get_session() as session:
+                accounts_after = await crud.list_accounts(session, only_active=True)
+                still_missing = sum(1 for a in accounts_after if not a.instagram_id)
+            pre_resolved = id_backfill["resolved"] if id_backfill else 0
+            if pre_resolved:
+                summary += (
+                    f"\n{pre_resolved} Instagram ID"
+                    f"{'s' if pre_resolved != 1 else ''} backfilled before sweep"
+                )
+            if still_missing:
+                summary += (
+                    f"\n{still_missing} account"
+                    f"{'s' if still_missing != 1 else ''} still missing an ID"
+                )
         await self.notifier.send_text(summary)
 
-        return {"checked": checked, "changed": changed, "failed": failed}
+        result = {"checked": checked, "changed": changed, "failed": failed}
+        if id_backfill is not None:
+            result["id_backfill"] = id_backfill
+        return result
 
     async def _run_check(
         self, account_id: int, username: str, *, notify_unchanged: bool = False
@@ -212,16 +376,7 @@ class MonitorService:
 
     @staticmethod
     def _extract_instagram_id(raw_response: Optional[dict]) -> Optional[str]:
-        if not isinstance(raw_response, dict):
-            return None
-        try:
-            user = raw_response["data"]["user"]
-        except (KeyError, TypeError):
-            return None
-        if not isinstance(user, dict):
-            return None
-        instagram_id = user.get("id")
-        return str(instagram_id) if instagram_id else None
+        return extract_instagram_id(raw_response)
 
     async def _handle_failure(
         self, account_id: int, username: str, fetch: ProfileFetchResult
@@ -242,7 +397,7 @@ class MonitorService:
 
             # Only store a failure snapshot when transitioning from success
             # (i.e. the previous snapshot was OK). Repeated identical failures
-            # are not stored â€” they add no information.
+            # are not stored — they add no information.
             previous = await crud.get_latest_snapshot(session, account_id, successful_only=False)
             is_new_failure = previous is None or previous.http_status == 200
             if is_new_failure:
@@ -371,7 +526,9 @@ class MonitorService:
             account = await session.get(MonitoredAccount, account_id)
             if account is not None:
                 parsed_username = (parsed.get("username") or username).lower()
-                parsed_instagram_id = parsed.get("instagram_id")
+                parsed_instagram_id = parsed.get("instagram_id") or self._extract_instagram_id(
+                    fetch.raw_response
+                )
                 # Store Instagram ID if account doesn't have one yet
                 if parsed_instagram_id and not account.instagram_id:
                     account.instagram_id = str(parsed_instagram_id)
@@ -408,6 +565,12 @@ class MonitorService:
             notify_unchanged=notify_unchanged,
         )
 
+        stored_id = None
+        async with get_session() as session:
+            account_row = await session.get(MonitoredAccount, account_id)
+            if account_row is not None:
+                stored_id = account_row.instagram_id
+
         return {
             "ok": True,
             "username": username,
@@ -415,6 +578,8 @@ class MonitorService:
             "changed": changeset.has_changes,
             "change_count": len(changeset.changes) + (1 if changeset.profile_pic_changed else 0),
             "first_seen": previous is None,
+            "is_private": bool(parsed.get("is_private")),
+            "instagram_id": stored_id or parsed.get("instagram_id"),
         }
 
     async def _dispatch_changes(
@@ -473,78 +638,185 @@ class MonitorService:
                     delivered=ok,
                 )
 
+    async def _load_account_story_meta(self, account_id: int) -> dict:
+        async with get_session() as session:
+            account = await session.get(MonitoredAccount, account_id)
+            snapshot = await crud.get_latest_snapshot(
+                session, account_id, successful_only=True
+            )
+        is_private = True
+        if snapshot is not None and snapshot.is_private is not None:
+            is_private = bool(snapshot.is_private)
+        return {
+            "is_private": is_private,
+            "instagram_id": account.instagram_id if account else None,
+        }
+
+    async def _fetch_highlight_catalog(
+        self, username: str, instagram_id: Optional[str]
+    ) -> dict[str, str]:
+        if instagram_id:
+            reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
+            if reel_user is not None and "highlights" in reel_user:
+                return dict(reel_user["highlights"])
+        assert self.stories is not None
+        return await self.stories.fetch_highlight_catalog(username)
+
+    @staticmethod
+    def _diff_highlight_catalog(
+        previous: dict[str, str], current: dict[str, str]
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str, str]]]:
+        prev_ids = set(previous)
+        curr_ids = set(current)
+        added = [(hid, current[hid]) for hid in sorted(curr_ids - prev_ids)]
+        removed = [(hid, previous[hid]) for hid in sorted(prev_ids - curr_ids)]
+        renamed = [
+            (hid, previous[hid], current[hid])
+            for hid in sorted(prev_ids & curr_ids)
+            if previous[hid] != current[hid]
+        ]
+        return added, removed, renamed
+
     async def _check_stories_and_highlights(
-        self, account_id: int, username: str
+        self,
+        account_id: int,
+        username: str,
+        *,
+        instagram_id: Optional[str] = None,
     ) -> None:
-        """Fetch new story/highlight items for one account and deliver them."""
+        """Stories, highlight catalog changes, and new highlight media for public accounts."""
         assert self.stories is not None
         async with self._semaphore:
             try:
-                stories, highlights = await asyncio.gather(
-                    self.stories.fetch_stories(username),
-                    self.stories.fetch_highlights(username),
-                )
-                all_items = stories + highlights
-                if not all_items:
-                    return
-
                 async with get_session() as session:
+                    previous_catalog = await crud.get_highlight_catalog(
+                        session, account_id
+                    )
                     seen_pks = await crud.get_seen_story_pks(session, account_id)
 
-                new_items = [i for i in all_items if i.pk and i.pk not in seen_pks]
-                if not new_items:
+                catalog = await self._fetch_highlight_catalog(username, instagram_id)
+                establishing_baseline = not previous_catalog and bool(catalog)
+
+                added, removed, renamed = self._diff_highlight_catalog(
+                    previous_catalog, catalog
+                )
+                if previous_catalog and (added or removed or renamed):
+                    msg = render_highlight_catalog_changes(
+                        username,
+                        added=added,
+                        removed=removed,
+                        renamed=renamed,
+                        total=len(catalog),
+                    )
+                    delivered = await self.notifier.send_text(msg)
+                    async with get_session() as session:
+                        await crud.log_notification(
+                            session,
+                            account_id=account_id,
+                            change_type="highlight_catalog",
+                            payload={
+                                "added": added,
+                                "removed": removed,
+                                "renamed": renamed,
+                                "total": len(catalog),
+                            },
+                            message=msg,
+                            delivered=delivered,
+                        )
+
+                async with get_session() as session:
+                    await crud.replace_highlight_catalog(session, account_id, catalog)
+
+                stories = await self.stories.fetch_stories(username)
+                new_stories = [s for s in stories if s.pk and s.pk not in seen_pks]
+
+                if establishing_baseline:
+                    highlight_items = await self.stories.fetch_highlights(username)
+                    async with get_session() as session:
+                        await crud.mark_story_items_seen(
+                            session, account_id, stories + highlight_items
+                        )
+                    logger.info(
+                        "Established story/highlight baseline for @{} ({} reels, {} items)",
+                        username,
+                        len(catalog),
+                        len(stories) + len(highlight_items),
+                    )
                     return
 
-                logger.info(
-                    "Found {} new story item(s) for @{}", len(new_items), username
-                )
+                if new_stories:
+                    alert = render_new_stories_alert(username, len(new_stories))
+                    await self.notifier.send_text(alert)
+                    await self._deliver_story_items(
+                        account_id, username, new_stories, seen_pks
+                    )
 
-                for item in new_items:
-                    path = await self.stories.download(item, username)
-                    if path is None:
-                        logger.warning(
-                            "Could not download story {} for @{}", item.pk, username
-                        )
-                        # Mark seen anyway so expired items don't loop forever.
-                        async with get_session() as session:
-                            await crud.mark_story_seen(
-                                session,
-                                account_id=account_id,
-                                story_pk=item.pk,
-                                source=item.source,
-                                highlight_id=item.highlight_id,
-                                highlight_title=item.highlight_title,
-                                media_type=item.media_type,
-                                taken_at=item.taken_at,
-                            )
-                        continue
-
-                    if item.source == "highlight":
-                        caption = (
-                            f"âœ¨ <b>@{esc(username)}</b> â€” highlight: "
-                            f"<b>{esc(item.highlight_title or '')}</b>"
-                        )
-                    else:
-                        caption = f"ðŸ“– <b>@{esc(username)}</b> â€” new story"
-
-                    if item.media_type == "video":
-                        ok = await self.notifier.send_video(path, caption=caption)
-                    else:
-                        ok = await self.notifier.send_photo(path, caption=caption)
-
-                    if ok:
-                        async with get_session() as session:
-                            await crud.mark_story_seen(
-                                session,
-                                account_id=account_id,
-                                story_pk=item.pk,
-                                source=item.source,
-                                highlight_id=item.highlight_id,
-                                highlight_title=item.highlight_title,
-                                media_type=item.media_type,
-                                taken_at=item.taken_at,
-                            )
+                highlight_items = await self.stories.fetch_highlights(username)
+                new_highlight_items = [
+                    i for i in highlight_items if i.pk and i.pk not in seen_pks
+                ]
+                if new_highlight_items:
+                    await self._deliver_story_items(
+                        account_id, username, new_highlight_items, seen_pks
+                    )
             except Exception as exc:
                 logger.exception(
                     "Story check failed for @{}: {}", username, exc
                 )
+
+    async def _deliver_story_items(
+        self,
+        account_id: int,
+        username: str,
+        items: list,
+        seen_pks: set[str],
+    ) -> None:
+        assert self.stories is not None
+        for item in items:
+            if not item.pk or item.pk in seen_pks:
+                continue
+            path = await self.stories.download(item, username)
+            if path is None:
+                logger.warning(
+                    "Could not download story {} for @{}", item.pk, username
+                )
+                async with get_session() as session:
+                    await crud.mark_story_seen(
+                        session,
+                        account_id=account_id,
+                        story_pk=item.pk,
+                        source=item.source,
+                        highlight_id=item.highlight_id,
+                        highlight_title=item.highlight_title,
+                        media_type=item.media_type,
+                        taken_at=item.taken_at,
+                    )
+                seen_pks.add(item.pk)
+                continue
+
+            if item.source == "highlight":
+                caption = (
+                    f"✨ <b>@{esc(username)}</b> — highlight: "
+                    f"<b>{esc(item.highlight_title or '')}</b>"
+                )
+            else:
+                caption = f"📖 <b>@{esc(username)}</b> — new story"
+
+            if item.media_type == "video":
+                ok = await self.notifier.send_video(path, caption=caption)
+            else:
+                ok = await self.notifier.send_photo(path, caption=caption)
+
+            if ok:
+                async with get_session() as session:
+                    await crud.mark_story_seen(
+                        session,
+                        account_id=account_id,
+                        story_pk=item.pk,
+                        source=item.source,
+                        highlight_id=item.highlight_id,
+                        highlight_title=item.highlight_title,
+                        media_type=item.media_type,
+                        taken_at=item.taken_at,
+                    )
+                seen_pks.add(item.pk)

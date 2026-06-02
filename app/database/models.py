@@ -157,6 +157,31 @@ class NotificationLog(Base):
     account: Mapped["MonitoredAccount"] = relationship(back_populates="notifications")
 
 
+class StoredHighlight(Base):
+    """Latest known highlight reels for a public account (id + title)."""
+
+    __tablename__ = "stored_highlights"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("monitored_accounts.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    highlight_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_stored_highlights_account_reel", "account_id", "highlight_id", unique=True),
+    )
+
+
 class SeenStory(Base):
     """Tracks every story/highlight item that has been delivered to Telegram."""
 

@@ -210,6 +210,41 @@ def _render_change_block(change) -> str:
     return f"<b>{esc(label)}:</b> <code>{esc(str(old))}</code> → <code>{esc(str(new))}</code>"
 
 
+def render_new_stories_alert(username: str, count: int) -> str:
+    noun = "item" if count == 1 else "items"
+    return f"📖 <b>@{esc(username)}</b> posted {count} new story {noun}"
+
+
+def render_highlight_catalog_changes(
+    username: str,
+    *,
+    added: list[tuple[str, str]],
+    removed: list[tuple[str, str]],
+    renamed: list[tuple[str, str, str]],
+    total: int,
+) -> str:
+    lines = [f"✨ <b>@{esc(username)}</b> highlights updated", ""]
+    if added:
+        lines.append(f"<b>Added ({len(added)}):</b>")
+        for _hid, title in added:
+            lines.append(f"  • {esc(title) or '(untitled)'}")
+        lines.append("")
+    if removed:
+        lines.append(f"<b>Removed ({len(removed)}):</b>")
+        for _hid, title in removed:
+            lines.append(f"  • {esc(title) or '(untitled)'}")
+        lines.append("")
+    if renamed:
+        lines.append(f"<b>Renamed ({len(renamed)}):</b>")
+        for _hid, old_title, new_title in renamed:
+            lines.append(
+                f"  • {esc(old_title) or '(untitled)'} → {esc(new_title) or '(untitled)'}"
+            )
+        lines.append("")
+    lines.append(f"Total highlight reels: <b>{total}</b>")
+    return "\n".join(lines).rstrip()
+
+
 def render_failure_message(username: str, fetch: ProfileFetchResult) -> str:
     return (
         f"<b>Instagram monitor failed for @{esc(username)}</b>\n"
