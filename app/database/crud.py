@@ -29,6 +29,7 @@ async def add_account(
     session: AsyncSession,
     username: str,
     added_by: Optional[int] = None,
+    instagram_id: Optional[str] = None,
 ) -> tuple[MonitoredAccount, bool]:
     """Insert or reactivate an account. Returns (account, created)."""
     username = normalize_username(username)
@@ -41,9 +42,16 @@ async def add_account(
         if not account.active:
             account.active = True
             created = True
+        if instagram_id and not account.instagram_id:
+            account.instagram_id = instagram_id
         return account, created
 
-    account = MonitoredAccount(username=username, added_by=added_by, active=True)
+    account = MonitoredAccount(
+        username=username,
+        added_by=added_by,
+        active=True,
+        instagram_id=instagram_id,
+    )
     session.add(account)
     await session.flush()
     return account, True

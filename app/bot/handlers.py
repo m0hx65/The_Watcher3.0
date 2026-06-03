@@ -38,7 +38,7 @@ from app.workers.scheduler import MAX_INTERVAL, MIN_INTERVAL, WatcherScheduler
 WELCOME_TEXT = (
     "<b>👁 The Watcher</b>\n"
     "<i>Silent Instagram profile monitoring</i>\n\n"
-    "Use the buttons below, or type <code>/add @username</code> to start."
+    "Use the buttons below, or type <code>/add @username</code>, <code>/add https://instagram.com/username</code>, or <code>/add 1234567890</code> to start."
 )
 
 HELP_TEXT = (
@@ -47,7 +47,7 @@ HELP_TEXT = (
     "Tap any account in the list to open its card. From there: "
     "Recheck · History · Photo · Remove. 🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
-    "<code>/add @user</code> — start monitoring\n"
+    "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
     "<code>/remove @user</code> — stop monitoring\n"
     "<code>/list</code> — all accounts\n"
     "<code>/recheck @user</code> — force a check now\n"
@@ -86,6 +86,11 @@ PANEL_MSG_ID = "panel_msg_id"
 PANEL_CHAT_ID = "panel_chat_id"
 # Instagram usernames: 1–30 chars, ASCII letters/digits/dots/underscores.
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+_INSTAGRAM_ID_RE = re.compile(r"^\d{1,64}$")
+_INSTAGRAM_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9._]{1,30})(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
 # "30m", "1h", "1800s", "1h30m", or a bare integer (seconds).
 _INTERVAL_RE = re.compile(
     r"^\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$",
@@ -131,6 +136,34 @@ def _normalize_username(raw: str) -> Optional[str]:
     if not raw or not _USERNAME_RE.match(raw):
         return None
     return raw.lower()
+
+
+def _parse_add_target(raw: str) -> tuple[Optional[str], Optional[str]]:
+    raw = raw.strip()
+    if not raw:
+        return None, None
+    if raw.lower().startswith("http://") or raw.lower().startswith("https://"):
+        match = _INSTAGRAM_URL_RE.match(raw)
+        if not match:
+            return None, None
+        path = match.group(1)
+        if _INSTAGRAM_ID_RE.match(path):
+            return None, path
+        return _normalize_username(path), None
+    if "instagram.com/" in raw.lower():
+        match = _INSTAGRAM_URL_RE.match(raw)
+        if not match:
+            return None, None
+        path = match.group(1)
+        if _INSTAGRAM_ID_RE.match(path):
+            return None, path
+        return _normalize_username(path), None
+    raw = raw.lstrip("@")
+    if not raw:
+        return None, None
+    if _INSTAGRAM_ID_RE.match(raw):
+        return None, raw
+    return _normalize_username(raw), None
 
 
 def _parse_interval(raw: str) -> Optional[int]:
@@ -539,12 +572,18 @@ async def _do_add(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     username: str,
+    instagram_id: Optional[str] = None,
 ) -> None:
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = _chat_id(update)
 
     async with get_session() as session:
-        account, created = await crud.add_account(session, username, added_by=user_id)
+        account, created = await crud.add_account(
+            session,
+            username,
+            added_by=user_id,
+            instagram_id=instagram_id,
+        )
 
     if not created:
         await _reply_or_edit(
@@ -674,17 +713,40 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _resolve_username_for_instagram_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    instagram_id: str,
+) -> Optional[str]:
+    service: MonitorService = context.application.bot_data["monitor"]
+    return await service.instagram.fetch_username_by_id(instagram_id)
+
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
     if context.args:
-        username = _normalize_username(context.args[0])
-        if not username:
+        username, instagram_id = _parse_add_target(context.args[0])
+        if not username and not instagram_id:
             await update.message.reply_text(
-                "That doesn't look like a valid Instagram username. "
+                "That doesn't look like a valid Instagram username or numeric user ID. "
                 "Letters, numbers, dots, and underscores only (max 30 chars).",
+                parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.back_to_menu(),
             )
+            return
+        if instagram_id:
+            username = await _resolve_username_for_instagram_id(
+                context, instagram_id
+            )
+            if not username:
+                await update.message.reply_text(
+                    "Could not resolve that Instagram ID to a username. "
+                    "Try a current numeric user ID or use @username instead.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboards.back_to_menu(),
+                )
+                return
+            await _do_add(update, context, username, instagram_id=instagram_id)
             return
         await _do_add(update, context, username)
         return
@@ -693,8 +755,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _consume_prompt_message(update, context)
     context.user_data[_AWAITING_USERNAME] = True
     prompt = await update.message.reply_text(
-        "Send the Instagram <b>username</b> you want to monitor "
-        "(with or without <code>@</code>).",
+        "Send the Instagram <b>username</b>, <b>profile URL</b>, or <b>numeric user ID</b> you want to monitor.",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboards.cancel_only(),
     )
@@ -1002,13 +1063,26 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _consume_prompt_message(update, context)
 
     raw = (update.message.text or "").strip()
-    username = _normalize_username(raw)
-    if not username:
+    username, instagram_id = _parse_add_target(raw)
+    if not username and not instagram_id:
         await update.message.reply_text(
-            "That doesn't look like a valid Instagram username. "
+            "That doesn't look like a valid Instagram username or numeric user ID. "
             "Letters, numbers, dots, and underscores only (max 30 chars).",
+            parse_mode=ParseMode.HTML,
             reply_markup=keyboards.main_menu(),
         )
+        return
+    if instagram_id:
+        username = await _resolve_username_for_instagram_id(context, instagram_id)
+        if not username:
+            await update.message.reply_text(
+                "Could not resolve that Instagram ID to a username. "
+                "Try a current numeric user ID or use @username instead.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.main_menu(),
+            )
+            return
+        await _do_add(update, context, username, instagram_id=instagram_id)
         return
     await _do_add(update, context, username)
 
@@ -1169,8 +1243,7 @@ async def _handle_menu(
             context.user_data[_PROMPT_MSG_ID] = query.message.message_id
         await _safe_edit_text(
             query,
-            "Send the Instagram <b>username</b> you want to monitor "
-            "(with or without <code>@</code>).",
+            "Send the Instagram <b>username</b>, <b>profile URL</b>, or <b>numeric user ID</b> you want to monitor.",
             reply_markup=keyboards.cancel_only(),
         )
         return
