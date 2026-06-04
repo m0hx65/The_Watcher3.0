@@ -554,6 +554,37 @@ class MonitorService:
                             parsed_username,
                             existing.id,
                         )
+            
+            # For public accounts with instagram_id, also fetch reel data (stories/highlights/live status)
+            # This is used for detecting story posts, live status, and highlight changes
+            if (
+                not parsed.get("is_private")
+                and parsed_instagram_id
+                and snapshot.http_status == 200
+            ):
+                try:
+                    reel_data = await self.instagram.fetch_reel_user(str(parsed_instagram_id))
+                    if reel_data:
+                        # Store reel data in raw_response for story check to reference
+                        if snapshot.raw_response is None:
+                            snapshot.raw_response = {}
+                        snapshot.raw_response["reel_data"] = {
+                            "has_public_story": reel_data.get("has_public_story", False),
+                            "is_live": reel_data.get("is_live", False),
+                            "highlights": reel_data.get("highlights", {}),
+                        }
+                        logger.debug(
+                            "Fetched reel data for @{} during profile check: story={}, live={}",
+                            username,
+                            reel_data.get("has_public_story"),
+                            reel_data.get("is_live"),
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not fetch reel data for @{} during profile check: {}",
+                        username, exc
+                    )
+            
             await crud.mark_checked(session, account_id, 200, success=True)
 
         await self._dispatch_changes(
@@ -684,7 +715,14 @@ class MonitorService:
         *,
         instagram_id: Optional[str] = None,
     ) -> None:
-        """Stories, highlight catalog changes, and new highlight media for public accounts."""
+        """Stories, highlight catalog changes, and new highlight media for public accounts.
+        
+        Supports two methods for checking public accounts:
+        1. User_id API (reel query) - preferred for public accounts with known instagram_id
+           Returns: has_public_story, is_live, highlight catalog
+           Fetched during profile check and stored in snapshot's raw_response["reel_data"]
+        2. Fallback to stories API - when reel data is unavailable
+        """
         assert self.stories is not None
         async with self._semaphore:
             try:
@@ -692,9 +730,37 @@ class MonitorService:
                     previous_catalog = await crud.get_highlight_catalog(
                         session, account_id
                     )
+                    previous_snapshot = await crud.get_latest_snapshot(
+                        session, account_id, successful_only=True
+                    )
                     seen_pks = await crud.get_seen_story_pks(session, account_id)
 
-                catalog = await self._fetch_highlight_catalog(username, instagram_id)
+                # Extract reel data from the latest snapshot (fetched during profile check)
+                # or fetch it now if unavailable
+                reel_data = None
+                if previous_snapshot and previous_snapshot.raw_response:
+                    reel_data = previous_snapshot.raw_response.get("reel_data")
+                
+                # If reel_data is not in snapshot, try to fetch it now
+                if not reel_data and instagram_id:
+                    reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
+                    if reel_user:
+                        reel_data = {
+                            "has_public_story": reel_user.get("has_public_story", False),
+                            "is_live": reel_user.get("is_live", False),
+                            "highlights": reel_user.get("highlights", {}),
+                        }
+                        logger.debug(
+                            "Fetched reel data for @{} during story check (not in snapshot)",
+                            username
+                        )
+
+                # Extract highlight catalog from reel data or stories API
+                if reel_data and "highlights" in reel_data:
+                    catalog = dict(reel_data["highlights"])
+                else:
+                    catalog = await self.stories.fetch_highlight_catalog(username)
+                    
                 establishing_baseline = not previous_catalog and bool(catalog)
 
                 added, removed, renamed = self._diff_highlight_catalog(
@@ -727,6 +793,63 @@ class MonitorService:
                 async with get_session() as session:
                     await crud.replace_highlight_catalog(session, account_id, catalog)
 
+                # Check for story/live status changes using reel data (user_id API)
+                # Only notify if we're not establishing baseline (to avoid false positives on first run)
+                if reel_data and not establishing_baseline:
+                    has_public_story = reel_data.get("has_public_story", False)
+                    is_live = reel_data.get("is_live", False)
+                    
+                    # Extract previous story/live status from the previous snapshot
+                    # (the snapshot before the latest one we just fetched)
+                    prev_has_story = False
+                    prev_is_live = False
+                    if previous_snapshot and previous_snapshot.id:
+                        # Get the snapshot before the current one
+                        async with get_session() as session:
+                            from sqlalchemy import select, desc
+                            prev_snapshot_query = select(AccountSnapshot).where(
+                                AccountSnapshot.account_id == account_id,
+                                AccountSnapshot.id != previous_snapshot.id
+                            ).order_by(desc(AccountSnapshot.created_at)).limit(1)
+                            prev_snapshot_result = await session.execute(prev_snapshot_query)
+                            prev_snapshot = prev_snapshot_result.scalar()
+                            if prev_snapshot and prev_snapshot.raw_response:
+                                prev_reel = prev_snapshot.raw_response.get("reel_data", {})
+                                prev_has_story = prev_reel.get("has_public_story", False)
+                                prev_is_live = prev_reel.get("is_live", False)
+                    
+                    # Notify if story status changed
+                    if has_public_story and not prev_has_story:
+                        msg = f"🎬 <b>@{esc(username)}</b> posted a new story!"
+                        delivered = await self.notifier.send_text(msg)
+                        async with get_session() as session:
+                            await crud.log_notification(
+                                session,
+                                account_id=account_id,
+                                change_type="story_posted",
+                                payload={"has_public_story": has_public_story},
+                                message=msg,
+                                delivered=delivered,
+                            )
+                    elif not has_public_story and prev_has_story:
+                        logger.info("Story expired for @{}", username)
+                    
+                    # Notify if live status changed
+                    if is_live and not prev_is_live:
+                        msg = f"🔴 <b>@{esc(username)}</b> is now live!"
+                        delivered = await self.notifier.send_text(msg)
+                        async with get_session() as session:
+                            await crud.log_notification(
+                                session,
+                                account_id=account_id,
+                                change_type="going_live",
+                                payload={"is_live": is_live},
+                                message=msg,
+                                delivered=delivered,
+                            )
+
+                # Try to fetch stories using the stories API
+                # This is still useful for getting the actual story items to download
                 stories = await self.stories.fetch_stories(username)
                 new_stories = [s for s in stories if s.pk and s.pk not in seen_pks]
 

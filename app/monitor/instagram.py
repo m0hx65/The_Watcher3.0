@@ -160,6 +160,7 @@ def _parse_reel_query_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         "username": username,
         "highlights": parse_highlight_catalog(payload),
         "has_public_story": bool(user.get("has_public_story")),
+        "is_live": bool(user.get("is_live")),
     }
 
 
