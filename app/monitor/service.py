@@ -467,6 +467,35 @@ class MonitorService:
 
         new_pic_hash = hashed.sha256 if hashed else None
 
+        # For public accounts with instagram_id, fetch reel data (stories/highlights/live status)
+        # This will be stored in the snapshot for future reference
+        reel_data_response = None
+        if not parsed.get("is_private") and instagram_id:
+            try:
+                reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
+                if reel_user:
+                    reel_data_response = {
+                        "has_public_story": reel_user.get("has_public_story", False),
+                        "is_live": reel_user.get("is_live", False),
+                        "highlights": reel_user.get("highlights", {}),
+                    }
+                    logger.debug(
+                        "Fetched reel data for @{} during profile check: story={}, live={}",
+                        username,
+                        reel_user.get("has_public_story"),
+                        reel_user.get("is_live"),
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Could not fetch reel data for @{} during profile check: {}",
+                    username, exc
+                )
+
+        # Build the raw_response with reel_data if available
+        raw_response_with_reel = fetch.raw_response.copy() if fetch.raw_response else {}
+        if reel_data_response:
+            raw_response_with_reel["reel_data"] = reel_data_response
+
         async with get_session() as session:
             previous = await crud.get_latest_snapshot(session, account_id)
 
@@ -487,7 +516,7 @@ class MonitorService:
                 profile_pic_hash=new_pic_hash,
                 external_url=parsed.get("external_url"),
                 http_status=200,
-                raw_response=fetch.raw_response,
+                raw_response=raw_response_with_reel,
             )
 
             # Diff first, persist only when something actually changed.
@@ -554,36 +583,6 @@ class MonitorService:
                             parsed_username,
                             existing.id,
                         )
-            
-            # For public accounts with instagram_id, also fetch reel data (stories/highlights/live status)
-            # This is used for detecting story posts, live status, and highlight changes
-            if (
-                not parsed.get("is_private")
-                and parsed_instagram_id
-                and snapshot.http_status == 200
-            ):
-                try:
-                    reel_data = await self.instagram.fetch_reel_user(str(parsed_instagram_id))
-                    if reel_data:
-                        # Store reel data in raw_response for story check to reference
-                        if snapshot.raw_response is None:
-                            snapshot.raw_response = {}
-                        snapshot.raw_response["reel_data"] = {
-                            "has_public_story": reel_data.get("has_public_story", False),
-                            "is_live": reel_data.get("is_live", False),
-                            "highlights": reel_data.get("highlights", {}),
-                        }
-                        logger.debug(
-                            "Fetched reel data for @{} during profile check: story={}, live={}",
-                            username,
-                            reel_data.get("has_public_story"),
-                            reel_data.get("is_live"),
-                        )
-                except Exception as exc:
-                    logger.debug(
-                        "Could not fetch reel data for @{} during profile check: {}",
-                        username, exc
-                    )
             
             await crud.mark_checked(session, account_id, 200, success=True)
 
