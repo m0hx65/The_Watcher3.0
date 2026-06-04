@@ -736,30 +736,27 @@ class MonitorService:
                     seen_pks = await crud.get_seen_story_pks(session, account_id)
 
                 # Extract reel data from the latest snapshot (fetched during profile check)
-                # or fetch it now if unavailable
+                # Reel data is used ONLY for story/live status detection, not for highlight catalog
                 reel_data = None
                 if previous_snapshot and previous_snapshot.raw_response:
                     reel_data = previous_snapshot.raw_response.get("reel_data")
                 
-                # If reel_data is not in snapshot, try to fetch it now
+                # If reel_data is not in snapshot, try to fetch it now for story/live status
                 if not reel_data and instagram_id:
                     reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
                     if reel_user:
                         reel_data = {
                             "has_public_story": reel_user.get("has_public_story", False),
                             "is_live": reel_user.get("is_live", False),
-                            "highlights": reel_user.get("highlights", {}),
                         }
                         logger.debug(
                             "Fetched reel data for @{} during story check (not in snapshot)",
                             username
                         )
 
-                # Extract highlight catalog from reel data or stories API
-                if reel_data and "highlights" in reel_data:
-                    catalog = dict(reel_data["highlights"])
-                else:
-                    catalog = await self.stories.fetch_highlight_catalog(username)
+                # Always use stories API for highlight catalog (more reliable than reel_data)
+                # Reel data highlights may be incomplete or improperly formatted
+                catalog = await self._fetch_highlight_catalog(username, instagram_id)
                     
                 establishing_baseline = not previous_catalog and bool(catalog)
 
