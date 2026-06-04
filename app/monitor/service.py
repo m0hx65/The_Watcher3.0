@@ -790,14 +790,13 @@ class MonitorService:
                 async with get_session() as session:
                     await crud.replace_highlight_catalog(session, account_id, catalog)
 
-                # Check for story/live status changes using reel data (user_id API)
-                # Only notify if we're not establishing baseline (to avoid false positives on first run)
-                if reel_data and not establishing_baseline:
+                # Check story/live status using reel data (user_id API)
+                # Always report current status every time sweep runs
+                if reel_data:
                     has_public_story = reel_data.get("has_public_story", False)
                     is_live = reel_data.get("is_live", False)
                     
                     # Extract previous story/live status from the previous snapshot
-                    # (the snapshot before the latest one we just fetched)
                     prev_has_story = False
                     prev_is_live = False
                     if previous_snapshot and previous_snapshot.id:
@@ -809,41 +808,66 @@ class MonitorService:
                                 AccountSnapshot.id != previous_snapshot.id
                             ).order_by(desc(AccountSnapshot.created_at)).limit(1)
                             prev_snapshot_result = await session.execute(prev_snapshot_query)
-                            prev_snapshot = prev_snapshot_result.scalar()
-                            if prev_snapshot and prev_snapshot.raw_response:
-                                prev_reel = prev_snapshot.raw_response.get("reel_data", {})
+                            prev_snapshot_older = prev_snapshot_result.scalar()
+                            if prev_snapshot_older and prev_snapshot_older.raw_response:
+                                prev_reel = prev_snapshot_older.raw_response.get("reel_data", {})
                                 prev_has_story = prev_reel.get("has_public_story", False)
                                 prev_is_live = prev_reel.get("is_live", False)
                     
-                    # Notify if story status changed
-                    if has_public_story and not prev_has_story:
-                        msg = f"🎬 <b>@{esc(username)}</b> posted a new story!"
-                        delivered = await self.notifier.send_text(msg)
-                        async with get_session() as session:
-                            await crud.log_notification(
-                                session,
-                                account_id=account_id,
-                                change_type="story_posted",
-                                payload={"has_public_story": has_public_story},
-                                message=msg,
-                                delivered=delivered,
-                            )
-                    elif not has_public_story and prev_has_story:
-                        logger.info("Story expired for @{}", username)
+                    # Always notify about current story/live status
+                    status_parts = []
                     
-                    # Notify if live status changed
-                    if is_live and not prev_is_live:
-                        msg = f"🔴 <b>@{esc(username)}</b> is now live!"
-                        delivered = await self.notifier.send_text(msg)
-                        async with get_session() as session:
-                            await crud.log_notification(
-                                session,
-                                account_id=account_id,
-                                change_type="going_live",
-                                payload={"is_live": is_live},
-                                message=msg,
-                                delivered=delivered,
-                            )
+                    if is_live:
+                        status_parts.append("🔴 LIVE NOW")
+                    elif has_public_story:
+                        status_parts.append("🎬 HAS STORY")
+                    else:
+                        status_parts.append("⭕ NO STORY")
+                    
+                    msg = f"<b>@{esc(username)}</b> — {' • '.join(status_parts)}"
+                    delivered = await self.notifier.send_text(msg)
+                    async with get_session() as session:
+                        await crud.log_notification(
+                            session,
+                            account_id=account_id,
+                            change_type="story_status",
+                            payload={
+                                "has_public_story": has_public_story,
+                                "is_live": is_live,
+                            },
+                            message=msg,
+                            delivered=delivered,
+                        )
+                    
+                    # Also notify on changes (when not establishing baseline)
+                    if not establishing_baseline:
+                        # Notify if just went live
+                        if is_live and not prev_is_live:
+                            msg = f"🔴 <b>@{esc(username)}</b> just went live!"
+                            delivered = await self.notifier.send_text(msg)
+                            async with get_session() as session:
+                                await crud.log_notification(
+                                    session,
+                                    account_id=account_id,
+                                    change_type="going_live",
+                                    payload={"is_live": is_live},
+                                    message=msg,
+                                    delivered=delivered,
+                                )
+                        
+                        # Notify if just posted a story
+                        if has_public_story and not prev_has_story:
+                            msg = f"🎬 <b>@{esc(username)}</b> just posted a story!"
+                            delivered = await self.notifier.send_text(msg)
+                            async with get_session() as session:
+                                await crud.log_notification(
+                                    session,
+                                    account_id=account_id,
+                                    change_type="story_posted",
+                                    payload={"has_public_story": has_public_story},
+                                    message=msg,
+                                    delivered=delivered,
+                                )
 
                 # Try to fetch stories using the stories API
                 # This is still useful for getting the actual story items to download
