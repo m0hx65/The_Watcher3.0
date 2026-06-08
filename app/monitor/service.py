@@ -764,41 +764,57 @@ class MonitorService:
                             username
                         )
 
-                # Always use stories API for highlight catalog (more reliable than reel_data)
-                # Reel data highlights may be incomplete or improperly formatted
+                # Fetch the current highlight catalog (graphql reel query, anonymous).
                 catalog = await self._fetch_highlight_catalog(username, instagram_id)
-                    
+
                 establishing_baseline = not previous_catalog and bool(catalog)
 
-                added, removed, renamed = self._diff_highlight_catalog(
-                    previous_catalog, catalog
-                )
-                if previous_catalog and (added or removed or renamed):
-                    msg = render_highlight_catalog_changes(
-                        username,
-                        added=added,
-                        removed=removed,
-                        renamed=renamed,
-                        total=len(catalog),
+                # An EMPTY result almost always means the anonymous fetch failed or
+                # was rate-limited (the reel query intermittently omits highlight
+                # edges) — NOT that the user deleted every reel. Diffing empty
+                # against a stored catalog would wrongly report all reels as
+                # "removed" and then overwrite the stored catalog with nothing.
+                # So only diff/notify/persist when we actually got a catalog back;
+                # otherwise keep the last known-good catalog untouched.
+                if catalog:
+                    added, removed, renamed = self._diff_highlight_catalog(
+                        previous_catalog, catalog
                     )
-                    delivered = await self.notifier.send_text(msg)
-                    async with get_session() as session:
-                        await crud.log_notification(
-                            session,
-                            account_id=account_id,
-                            change_type="highlight_catalog",
-                            payload={
-                                "added": added,
-                                "removed": removed,
-                                "renamed": renamed,
-                                "total": len(catalog),
-                            },
-                            message=msg,
-                            delivered=delivered,
+                    if previous_catalog and (added or removed or renamed):
+                        msg = render_highlight_catalog_changes(
+                            username,
+                            added=added,
+                            removed=removed,
+                            renamed=renamed,
+                            total=len(catalog),
                         )
+                        delivered = await self.notifier.send_text(msg)
+                        async with get_session() as session:
+                            await crud.log_notification(
+                                session,
+                                account_id=account_id,
+                                change_type="highlight_catalog",
+                                payload={
+                                    "added": added,
+                                    "removed": removed,
+                                    "renamed": renamed,
+                                    "total": len(catalog),
+                                },
+                                message=msg,
+                                delivered=delivered,
+                            )
 
-                async with get_session() as session:
-                    await crud.replace_highlight_catalog(session, account_id, catalog)
+                    async with get_session() as session:
+                        await crud.replace_highlight_catalog(
+                            session, account_id, catalog
+                        )
+                elif previous_catalog:
+                    logger.debug(
+                        "Empty highlight catalog for @{} — keeping {} previously "
+                        "stored reel(s) (likely a transient/rate-limited fetch)",
+                        username,
+                        len(previous_catalog),
+                    )
 
                 # Check story/live status using reel data (user_id API)
                 # Always report current status every time sweep runs
