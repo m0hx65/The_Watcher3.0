@@ -696,12 +696,21 @@ class MonitorService:
     async def _fetch_highlight_catalog(
         self, username: str, instagram_id: Optional[str]
     ) -> dict[str, str]:
+        """Highlight reel id -> title via Instagram's graphql reel query (anonymous).
+
+        The reel query needs the numeric user id, so resolve it from the username
+        when it isn't stored yet — otherwise we'd skip the working path entirely.
+        The old storiesig fallback is gone (that API was discontinued).
+        """
+        if not instagram_id:
+            fetch = await self.instagram.fetch_profile(username)
+            if fetch.success and fetch.parsed:
+                instagram_id = fetch.parsed.get("instagram_id")
         if instagram_id:
             reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
             if reel_user is not None and "highlights" in reel_user:
                 return dict(reel_user["highlights"])
-        assert self.stories is not None
-        return await self.stories.fetch_highlight_catalog(username)
+        return {}
 
     @staticmethod
     def _diff_highlight_catalog(
