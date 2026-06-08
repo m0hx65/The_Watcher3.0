@@ -45,7 +45,9 @@ HELP_TEXT = (
     "<b>👁 The Watcher</b>\n\n"
     "<b>Navigation</b>\n"
     "Tap any account in the list to open its card. From there: "
-    "Recheck · History · Photo · Remove. 🏠 Home always returns here.\n\n"
+    "Recheck · History · Photo · Story · Highlights · Remove. "
+    "📖 Story downloads the current story now; ✨ Highlights lists every reel "
+    "by name so you can download any of them. 🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
     "<code>/remove @user</code> — stop monitoring\n"
@@ -355,6 +357,7 @@ async def _render_account_card(username: str) -> Optional[str]:
             session, account.id, successful_only=True
         )
         media = await crud.latest_media_hash(session, account.id)
+        highlight_catalog = await crud.get_highlight_catalog(session, account.id)
 
     marker = "🟢 active" if account.active else "⏸ paused"
     last = fmt_timestamp(account.last_checked_at) if account.last_checked_at else "never"
@@ -389,6 +392,24 @@ async def _render_account_card(username: str) -> Optional[str]:
             flags.append("💼 business")
         if flags:
             lines.append(" · ".join(flags))
+
+        # Live story / highlight summary for public accounts.
+        reel_data = (snapshot.raw_response or {}).get("reel_data") or {}
+        if not snapshot.is_private:
+            if reel_data.get("is_live"):
+                story_state = "🔴 live now"
+            elif reel_data.get("has_public_story"):
+                story_state = "🎬 has story (tap 📖 Story to fetch)"
+            else:
+                story_state = "⭕ no active story"
+            lines.append(f"Story: {story_state}")
+
+    if highlight_catalog:
+        lines.append("")
+        lines.append(f"<b>✨ Highlights ({len(highlight_catalog)})</b>")
+        for title in sorted(highlight_catalog.values()):
+            lines.append(f"  • {esc(title) or '(untitled)'}")
+        lines.append("<i>Tap ✨ Highlights to download any reel.</i>")
 
     if media:
         lines.append("")
@@ -648,6 +669,112 @@ async def _send_profile_photo(
         )
     # Photo successfully sent — drop the now-redundant card that hosted the button.
     await _delete_callback_message(update)
+
+
+async def _send_story_on_demand(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+) -> None:
+    """Fetch the account's current story right now, download it, and send it."""
+    query = update.callback_query
+    await _safe_answer(query, "Fetching story…")
+    await _safe_edit_text(
+        query, f"⏳ Fetching current story for <b>@{esc(username)}</b>…"
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.fetch_and_send_stories(username)
+    if not result.get("ok"):
+        await _safe_edit_text(
+            query,
+            f"Couldn't fetch story for <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            reply_markup=keyboards.account_actions(username),
+        )
+        return
+    count = result.get("count", 0)
+    if count == 0:
+        text = (
+            f"<b>@{esc(username)}</b> has no active story right now "
+            "(or the account is private)."
+        )
+    else:
+        noun = "item" if count == 1 else "items"
+        text = f"📖 Sent {count} story {noun} for <b>@{esc(username)}</b>."
+    await _safe_edit_text(
+        query, text, reply_markup=keyboards.account_actions(username)
+    )
+
+
+async def _show_highlights(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+) -> None:
+    """List the account's highlight reel names, each tappable to download."""
+    query = update.callback_query
+    await _safe_answer(query, "Loading highlights…")
+    await _safe_edit_text(
+        query, f"⏳ Loading highlights for <b>@{esc(username)}</b>…"
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.list_highlights(username)
+    if not result.get("ok"):
+        await _safe_edit_text(
+            query,
+            f"Couldn't load highlights for <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            reply_markup=keyboards.account_actions(username),
+        )
+        return
+    items = result.get("items", [])
+    if not items:
+        await _safe_edit_text(
+            query,
+            f"<b>@{esc(username)}</b> has no highlight reels.",
+            reply_markup=keyboards.account_actions(username),
+        )
+        return
+    lines = [f"<b>✨ Highlights for @{esc(username)}</b> ({len(items)})", ""]
+    for i, (_hid, title) in enumerate(items, start=1):
+        lines.append(f"{i}. {esc(title) or '(untitled)'}")
+    lines.append("")
+    lines.append("Tap a reel below to download and send it.")
+    await _safe_edit_text(
+        query,
+        "\n".join(lines),
+        reply_markup=keyboards.highlights_view(username, items),
+    )
+
+
+async def _download_highlight(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    index_raw: str,
+) -> None:
+    """Download one highlight reel (by its list index) and send its items."""
+    query = update.callback_query
+    if not index_raw.lstrip("-").isdigit():
+        await _safe_answer(query, "Invalid highlight.")
+        return
+    await _safe_answer(query, "Downloading…")
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.download_highlight(username, int(index_raw))
+    title = result.get("title") or "(untitled)"
+    if not result.get("ok"):
+        await _safe_answer(
+            query,
+            str(result.get("error") or "Download failed."),
+            show_alert=True,
+        )
+        return
+    count = result.get("count", 0)
+    if count == 0:
+        await _safe_answer(query, f"No items in “{title}”.", show_alert=True)
+    else:
+        noun = "item" if count == 1 else "items"
+        await _safe_answer(query, f"Sent {count} {noun} from “{title}”.")
 
 
 async def _send_csv_export(
@@ -1324,7 +1451,25 @@ async def _handle_account(
         await _safe_answer(query)
         return
     action = parts[0]
+
+    if action == "hldl":
+        # acc:hldl:<index>:<username> — index references the highlights list.
+        if len(parts) < 3:
+            await _safe_answer(query)
+            return
+        hl_username = _normalize_username(parts[2]) or parts[2].lower()
+        await _download_highlight(update, context, hl_username, parts[1])
+        return
+
     username = _normalize_username(parts[1]) or parts[1].lower()
+
+    if action == "story":
+        await _send_story_on_demand(update, context, username)
+        return
+
+    if action == "highlights":
+        await _show_highlights(update, context, username)
+        return
 
     if action == "open":
         await _safe_answer(query)

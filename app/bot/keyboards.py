@@ -14,6 +14,9 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:recheck:<username>   — force a re-check
   acc:history:<username>   — recent change log for account
   acc:photo:<username>     — send latest stored profile picture
+  acc:story:<username>     — download & send the current story now
+  acc:highlights:<u>       — list highlight reel names
+  acc:hldl:<idx>:<u>       — download highlight reel at list index <idx>
   acc:remove:<username>    — show remove confirmation
   acc:remove_yes:<u>       — confirmed remove
   menu:cleardb             — show clear-history confirmation
@@ -117,11 +120,53 @@ def account_actions(username: str) -> InlineKeyboardMarkup:
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    "📖 Story", callback_data=f"acc:story:{username}"
+                ),
+                InlineKeyboardButton(
+                    "✨ Highlights", callback_data=f"acc:highlights:{username}"
+                ),
+            ],
+            [
                 InlineKeyboardButton("◀️ List", callback_data="menu:list:0"),
                 InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ],
         ]
     )
+
+
+def highlights_view(
+    username: str, items: Sequence[tuple[str, str]]
+) -> InlineKeyboardMarkup:
+    """List one download button per highlight reel, referenced by list index.
+
+    `items` is the ordered (highlight_id, title) list shown to the user; the
+    index in the callback maps back to the same ordering on the download side.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, (_hid, title) in enumerate(items):
+        label = title.strip() or "(untitled)"
+        if len(label) > 28:
+            label = label[:27] + "…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"⬇️ {label}",
+                    callback_data=f"acc:hldl:{idx}:{username}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh", callback_data=f"acc:highlights:{username}"
+            ),
+            InlineKeyboardButton(
+                "◀️ Back", callback_data=f"acc:open:{username}"
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def confirm_remove(username: str) -> InlineKeyboardMarkup:

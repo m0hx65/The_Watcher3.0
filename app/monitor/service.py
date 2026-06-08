@@ -913,8 +913,10 @@ class MonitorService:
         username: str,
         items: list,
         seen_pks: set[str],
-    ) -> None:
+    ) -> int:
+        """Download and send each item; record it as seen. Returns the number sent."""
         assert self.stories is not None
+        sent = 0
         for item in items:
             if not item.pk or item.pk in seen_pks:
                 continue
@@ -951,6 +953,7 @@ class MonitorService:
                 ok = await self.notifier.send_photo(path, caption=caption)
 
             if ok:
+                sent += 1
                 async with get_session() as session:
                     await crud.mark_story_seen(
                         session,
@@ -963,3 +966,116 @@ class MonitorService:
                         taken_at=item.taken_at,
                     )
                 seen_pks.add(item.pk)
+        return sent
+
+    # ---------- On-demand actions (triggered from the account card) ----------
+
+    async def fetch_and_send_stories(self, username: str) -> dict:
+        """Download every current story item for a public account and send them now.
+
+        Unlike the sweep path, this ignores the seen-deduplication set so the user
+        always receives whatever is live at the moment they tap the button. Items
+        are still recorded as seen afterwards so the next sweep won't re-send them.
+        Returns {"ok": bool, "count": int, "error": Optional[str]}.
+        """
+        if self.stories is None:
+            return {"ok": False, "count": 0, "error": "Stories client unavailable"}
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+            if account is None:
+                return {"ok": False, "count": 0, "error": f"@{username} is not monitored"}
+            account_id = account.id
+
+        try:
+            stories = await self.stories.fetch_stories(username)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning("On-demand story fetch failed for @{}: {}", username, exc)
+            return {"ok": False, "count": 0, "error": repr(exc)}
+
+        if not stories:
+            return {"ok": True, "count": 0, "error": None}
+
+        sent = await self._deliver_story_items(account_id, username, stories, set())
+        return {"ok": True, "count": sent, "error": None}
+
+    async def list_highlights(self, username: str) -> dict:
+        """Return the current highlight reels (id + title) for an account.
+
+        Prefers the live storiesig catalog (its ids are the ones the download
+        endpoint accepts) and refreshes the stored catalog; falls back to the
+        last stored catalog if the live fetch yields nothing.
+        Returns {"ok": bool, "items": list[(id, title)], "error": Optional[str]}.
+        """
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+            if account is None:
+                return {"ok": False, "items": [], "error": f"@{username} is not monitored"}
+            account_id = account.id
+
+        catalog: dict[str, str] = {}
+        if self.stories is not None:
+            try:
+                catalog = await self.stories.fetch_highlight_catalog(username)
+            except Exception as exc:  # pragma: no cover - network failure path
+                logger.warning(
+                    "On-demand highlight fetch failed for @{}: {}", username, exc
+                )
+                catalog = {}
+
+        if catalog:
+            async with get_session() as session:
+                await crud.replace_highlight_catalog(session, account_id, catalog)
+        else:
+            async with get_session() as session:
+                catalog = await crud.get_highlight_catalog(session, account_id)
+
+        items = sorted(catalog.items(), key=lambda kv: kv[0])
+        return {"ok": True, "items": items, "error": None}
+
+    async def download_highlight(self, username: str, index: int) -> dict:
+        """Download and send one highlight reel, identified by its list index.
+
+        The index refers to the ordering returned by `list_highlights`, which is
+        recomputed here so the bot doesn't have to pack a (colon-containing)
+        highlight id into Telegram's 64-byte callback budget.
+        Returns {"ok": bool, "count": int, "title": Optional[str], "error": Optional[str]}.
+        """
+        if self.stories is None:
+            return {"ok": False, "count": 0, "title": None, "error": "Stories client unavailable"}
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+            if account is None:
+                return {
+                    "ok": False, "count": 0, "title": None,
+                    "error": f"@{username} is not monitored",
+                }
+            account_id = account.id
+
+        listing = await self.list_highlights(username)
+        items = listing["items"]
+        if index < 0 or index >= len(items):
+            return {
+                "ok": False, "count": 0, "title": None,
+                "error": "That highlight is no longer available — refresh the list.",
+            }
+
+        highlight_id, title = items[index]
+        try:
+            story_items = await self.stories.fetch_highlight_items(
+                username, highlight_id, title
+            )
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning(
+                "On-demand highlight download failed for @{} ({}): {}",
+                username, highlight_id, exc,
+            )
+            return {"ok": False, "count": 0, "title": title, "error": repr(exc)}
+
+        if not story_items:
+            return {"ok": True, "count": 0, "title": title, "error": None}
+
+        sent = await self._deliver_story_items(account_id, username, story_items, set())
+        return {"ok": True, "count": sent, "title": title, "error": None}
