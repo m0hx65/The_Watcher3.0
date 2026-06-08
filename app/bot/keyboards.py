@@ -15,8 +15,8 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:history:<username>   — recent change log for account
   acc:photo:<username>     — send latest stored profile picture
   acc:story:<username>     — download & send the current story now
-  acc:highlights:<u>       — list highlight reel names
-  acc:hldl:<idx>:<u>       — download highlight reel at list index <idx>
+  acc:highlights:<u>       — list highlight names
+  acc:hldl:<idx>:<u>       — download highlight at list index <idx>
   acc:remove:<username>    — show remove confirmation
   acc:remove_yes:<u>       — confirmed remove
   menu:cleardb             — show clear-history confirmation
@@ -138,7 +138,7 @@ def account_actions(username: str) -> InlineKeyboardMarkup:
 def highlights_view(
     username: str, items: Sequence[tuple[str, str]]
 ) -> InlineKeyboardMarkup:
-    """List one download button per highlight reel, referenced by list index.
+    """List one download button per highlight, referenced by list index.
 
     `items` is the ordered (highlight_id, title) list shown to the user; the
     index in the callback maps back to the same ordering on the download side.

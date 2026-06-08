@@ -46,7 +46,7 @@ HELP_TEXT = (
     "<b>Navigation</b>\n"
     "Tap any account in the list to open its card. From there: "
     "Recheck · History · Photo · Story · Highlights · Remove. "
-    "✨ Highlights lists every reel by name; story/live status shows on the card. "
+    "✨ Highlights lists every highlight by name; story/live status shows on the card. "
     "🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
@@ -409,7 +409,7 @@ async def _render_account_card(username: str) -> Optional[str]:
         lines.append(f"<b>✨ Highlights ({len(highlight_catalog)})</b>")
         for title in sorted(highlight_catalog.values()):
             lines.append(f"  • {esc(title) or '(untitled)'}")
-        lines.append("<i>Tap ✨ Highlights to see all reel names.</i>")
+        lines.append("<i>Tap ✨ Highlights to see all highlight names.</i>")
 
     if media:
         lines.append("")
@@ -711,7 +711,7 @@ async def _show_highlights(
     context: ContextTypes.DEFAULT_TYPE,
     username: str,
 ) -> None:
-    """List the account's highlight reel names, each tappable to download."""
+    """List the account's highlight names, each tappable to download."""
     query = update.callback_query
     await _safe_answer(query, "Loading highlights…")
     await _safe_edit_text(
@@ -731,7 +731,7 @@ async def _show_highlights(
     if not items:
         await _safe_edit_text(
             query,
-            f"<b>@{esc(username)}</b> has no highlight reels.",
+            f"<b>@{esc(username)}</b> has no highlights.",
             reply_markup=keyboards.account_actions(username),
         )
         return
@@ -739,7 +739,7 @@ async def _show_highlights(
     for i, (_hid, title) in enumerate(items, start=1):
         lines.append(f"{i}. {esc(title) or '(untitled)'}")
     lines.append("")
-    lines.append("Tap a reel below to download and send it.")
+    lines.append("Tap a highlight below to download and send it.")
     await _safe_edit_text(
         query,
         "\n".join(lines),
@@ -753,7 +753,7 @@ async def _download_highlight(
     username: str,
     index_raw: str,
 ) -> None:
-    """Download one highlight reel (by its list index) and send its items."""
+    """Download one highlight (by its list index) and send its items."""
     query = update.callback_query
     if not index_raw.lstrip("-").isdigit():
         await _safe_answer(query, "Invalid highlight.")

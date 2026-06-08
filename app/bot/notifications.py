@@ -241,7 +241,7 @@ def render_highlight_catalog_changes(
                 f"  • {esc(old_title) or '(untitled)'} → {esc(new_title) or '(untitled)'}"
             )
         lines.append("")
-    lines.append(f"Total highlight reels: <b>{total}</b>")
+    lines.append(f"Total highlights: <b>{total}</b>")
     return "\n".join(lines).rstrip()
 
 
