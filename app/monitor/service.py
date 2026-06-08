@@ -24,6 +24,17 @@ from app.monitor.stories import StoriesClient
 from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
 
+# Shown when a story/highlight MEDIA download is requested but no anonymous
+# source can currently serve it. The free anonymous API this used to rely on
+# (storiesig.info) was shut down by Instagram's anti-scraping changes, and the
+# bot is intentionally login-free, so media download is unavailable for now.
+# Highlight names and story/live status still work anonymously via graphql.
+_DOWNLOAD_UNAVAILABLE_MSG = (
+    "Media download is currently unavailable — the anonymous source it relied on "
+    "was shut down, and this bot stays 100% login-free. Highlight names and story "
+    "status still work."
+)
+
 
 class MonitorService:
     """Coordinates a single account check or a fan-out across all accounts."""
@@ -868,8 +879,8 @@ class MonitorService:
                                     delivered=delivered,
                                 )
 
-                # Try to fetch stories using the stories API
-                # This is still useful for getting the actual story items to download
+                # Try to fetch the actual story items to download (anonymous, no
+                # login). The legacy source is down, so this may yield nothing.
                 stories = await self.stories.fetch_stories(username)
                 new_stories = [s for s in stories if s.pk and s.pk not in seen_pks]
 
@@ -986,18 +997,38 @@ class MonitorService:
             if account is None:
                 return {"ok": False, "count": 0, "error": f"@{username} is not monitored"}
             account_id = account.id
+            instagram_id = account.instagram_id
 
+        # Distinguish "no active story" (a real, anonymous-knowable state) from
+        # "there is a story but we can't fetch the media anonymously". The reel
+        # query tells us has_public_story without any login.
+        has_story: Optional[bool] = None
+        if instagram_id:
+            try:
+                reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
+                if reel_user is not None:
+                    has_story = bool(reel_user.get("has_public_story"))
+            except Exception:  # pragma: no cover - network failure path
+                has_story = None
+
+        # Best-effort anonymous media fetch (no login). The legacy source is down,
+        # so this typically yields nothing today, but we still try in case an
+        # anonymous source is reachable.
         try:
             stories = await self.stories.fetch_stories(username)
         except Exception as exc:  # pragma: no cover - network failure path
             logger.warning("On-demand story fetch failed for @{}: {}", username, exc)
-            return {"ok": False, "count": 0, "error": repr(exc)}
+            stories = []
 
-        if not stories:
+        if stories:
+            sent = await self._deliver_story_items(account_id, username, stories, set())
+            return {"ok": True, "count": sent, "error": None}
+
+        if has_story is False:
+            # Genuinely no active story right now.
             return {"ok": True, "count": 0, "error": None}
-
-        sent = await self._deliver_story_items(account_id, username, stories, set())
-        return {"ok": True, "count": sent, "error": None}
+        # Either there IS a story we can't fetch anonymously, or status unknown.
+        return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
 
     async def list_highlights(self, username: str) -> dict:
         """Return the current highlight reels (id + title) for an account.
@@ -1013,16 +1044,17 @@ class MonitorService:
             if account is None:
                 return {"ok": False, "items": [], "error": f"@{username} is not monitored"}
             account_id = account.id
+            instagram_id = account.instagram_id
 
+        # The highlight catalog (names + ids) comes from Instagram's own graphql
+        # reel query, which still works anonymously. Only the media download needs
+        # a cookie, so names are always available.
         catalog: dict[str, str] = {}
-        if self.stories is not None:
-            try:
-                catalog = await self.stories.fetch_highlight_catalog(username)
-            except Exception as exc:  # pragma: no cover - network failure path
-                logger.warning(
-                    "On-demand highlight fetch failed for @{}: {}", username, exc
-                )
-                catalog = {}
+        try:
+            catalog = await self._fetch_highlight_catalog(username, instagram_id)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning("On-demand highlight catalog failed for @{}: {}", username, exc)
+            catalog = {}
 
         if catalog:
             async with get_session() as session:
@@ -1063,6 +1095,8 @@ class MonitorService:
             }
 
         highlight_id, title = items[index]
+        # Best-effort anonymous media fetch (no login). The legacy source is down,
+        # so this typically yields nothing today.
         try:
             story_items = await self.stories.fetch_highlight_items(
                 username, highlight_id, title
@@ -1072,10 +1106,10 @@ class MonitorService:
                 "On-demand highlight download failed for @{} ({}): {}",
                 username, highlight_id, exc,
             )
-            return {"ok": False, "count": 0, "title": title, "error": repr(exc)}
+            story_items = []
 
         if not story_items:
-            return {"ok": True, "count": 0, "title": title, "error": None}
+            return {"ok": False, "count": 0, "title": title, "error": _DOWNLOAD_UNAVAILABLE_MSG}
 
         sent = await self._deliver_story_items(account_id, username, story_items, set())
         return {"ok": True, "count": sent, "title": title, "error": None}

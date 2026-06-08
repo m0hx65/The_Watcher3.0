@@ -46,8 +46,8 @@ HELP_TEXT = (
     "<b>Navigation</b>\n"
     "Tap any account in the list to open its card. From there: "
     "Recheck · History · Photo · Story · Highlights · Remove. "
-    "📖 Story downloads the current story now; ✨ Highlights lists every reel "
-    "by name so you can download any of them. 🏠 Home always returns here.\n\n"
+    "✨ Highlights lists every reel by name; story/live status shows on the card. "
+    "🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
     "<code>/remove @user</code> — stop monitoring\n"
@@ -399,7 +399,7 @@ async def _render_account_card(username: str) -> Optional[str]:
             if reel_data.get("is_live"):
                 story_state = "🔴 live now"
             elif reel_data.get("has_public_story"):
-                story_state = "🎬 has story (tap 📖 Story to fetch)"
+                story_state = "🎬 has an active story"
             else:
                 story_state = "⭕ no active story"
             lines.append(f"Story: {story_state}")
@@ -409,7 +409,7 @@ async def _render_account_card(username: str) -> Optional[str]:
         lines.append(f"<b>✨ Highlights ({len(highlight_catalog)})</b>")
         for title in sorted(highlight_catalog.values()):
             lines.append(f"  • {esc(title) or '(untitled)'}")
-        lines.append("<i>Tap ✨ Highlights to download any reel.</i>")
+        lines.append("<i>Tap ✨ Highlights to see all reel names.</i>")
 
     if media:
         lines.append("")
