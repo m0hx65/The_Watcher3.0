@@ -21,6 +21,8 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:hlall:<u>            — download every highlight reel at once
   acc:remove:<username>    — show remove confirmation
   acc:remove_yes:<u>       — confirmed remove
+  acc:pause:<username>     — pause monitoring (keep history)
+  acc:resume:<username>    — resume monitoring
   menu:cleardb             — show clear-history confirmation
   menu:cleardb_yes         — execute clear-history
   noop                     — non-actionable button (e.g. page indicator)
@@ -124,7 +126,15 @@ def accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def account_actions(username: str) -> InlineKeyboardMarkup:
+def account_actions(username: str, active: bool = True) -> InlineKeyboardMarkup:
+    if active:
+        toggle = InlineKeyboardButton(
+            "⏸ Pause", callback_data=f"acc:pause:{username}"
+        )
+    else:
+        toggle = InlineKeyboardButton(
+            "▶️ Resume", callback_data=f"acc:resume:{username}"
+        )
     return InlineKeyboardMarkup(
         [
             [
@@ -151,6 +161,7 @@ def account_actions(username: str) -> InlineKeyboardMarkup:
                     "✨ Highlights", callback_data=f"acc:highlights:{username}"
                 ),
             ],
+            [toggle],
             [
                 InlineKeyboardButton("◀️ List", callback_data="menu:list:0"),
                 InlineKeyboardButton("🏠 Home", callback_data="menu:main"),

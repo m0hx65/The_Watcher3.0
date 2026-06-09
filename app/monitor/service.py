@@ -605,6 +605,14 @@ class MonitorService:
             notify_unchanged=notify_unchanged,
         )
 
+        # New post/reel auto-download for public accounts (login-free via
+        # saveinsta). On the first observation we just baseline what's already
+        # there; afterwards a rise in the post/reel count delivers the new media.
+        if self.stories is not None and not parsed.get("is_private"):
+            await self._handle_new_posts(
+                account_id, username, changeset, first_seen=previous is None
+            )
+
         stored_id = None
         async with get_session() as session:
             account_row = await session.get(MonitoredAccount, account_id)
@@ -1004,6 +1012,8 @@ class MonitorService:
                     f"✨ <b>@{esc(username)}</b> — highlight: "
                     f"<b>{esc(item.highlight_title or '')}</b>"
                 )
+            elif item.source == "post":
+                caption = f"🖼 <b>@{esc(username)}</b> — new post"
             else:
                 caption = f"📖 <b>@{esc(username)}</b> — new story"
 
@@ -1028,6 +1038,62 @@ class MonitorService:
                         )
                 seen_pks.add(item.pk)
         return sent
+
+    async def _handle_new_posts(
+        self,
+        account_id: int,
+        username: str,
+        changeset: ChangeSet,
+        *,
+        first_seen: bool,
+    ) -> None:
+        """Download and send new feed posts/reels when the post/reel count rises.
+
+        On the first observation we baseline the current grid (mark seen, don't
+        send) so we don't dump a backlog; afterwards each increase delivers the
+        new media. Login-free via saveinsta; degrades to nothing on failure.
+        """
+        if self.stories is None:
+            return
+        posts_change = changeset.find("posts_count")
+        reels_change = changeset.find("reels_count")
+        increased = bool(
+            (posts_change and posts_change.new is not None
+             and posts_change.old is not None and posts_change.new > posts_change.old)
+            or (reels_change and reels_change.new is not None
+                and reels_change.old is not None and reels_change.new > reels_change.old)
+        )
+        if not first_seen and not increased:
+            return
+
+        try:
+            posts = await self.stories.fetch_posts(username)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning("Post fetch failed for @{}: {}", username, exc)
+            return
+        if not posts:
+            return
+
+        if first_seen:
+            async with get_session() as session:
+                await crud.mark_story_items_seen(session, account_id, posts)
+            logger.info(
+                "Baselined {} post(s) for @{} (first observation)",
+                len(posts), username,
+            )
+            return
+
+        async with get_session() as session:
+            seen_pks = await crud.get_seen_story_pks(session, account_id)
+        new_posts = [p for p in posts if p.pk and p.pk not in seen_pks]
+        if not new_posts:
+            return
+        new_posts = new_posts[:5]  # cap so a big jump never floods the chat
+        noun = "post" if len(new_posts) == 1 else "posts"
+        await self.notifier.send_text(
+            f"🖼 <b>@{esc(username)}</b> shared {len(new_posts)} new {noun}"
+        )
+        await self._deliver_story_items(account_id, username, new_posts, seen_pks)
 
     # ---------- On-demand actions ----------
     # These work for ANY public username, monitored or not. When the account is

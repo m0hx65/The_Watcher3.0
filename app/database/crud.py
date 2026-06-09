@@ -93,6 +93,22 @@ async def deactivate_account(session: AsyncSession, username: str) -> bool:
     return result.rowcount > 0
 
 
+async def set_account_active(
+    session: AsyncSession, username: str, active: bool
+) -> bool:
+    """Pause (active=False) or resume (active=True) monitoring for an account.
+
+    Paused accounts are skipped by the sweep (list_accounts(only_active=True))
+    but kept in the DB with their history intact."""
+    username = normalize_username(username)
+    result = await session.execute(
+        update(MonitoredAccount)
+        .where(MonitoredAccount.username == username)
+        .values(active=active)
+    )
+    return result.rowcount > 0
+
+
 async def mark_checked(
     session: AsyncSession,
     account_id: int,

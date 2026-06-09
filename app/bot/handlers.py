@@ -51,6 +51,7 @@ HELP_TEXT = (
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
     "<code>/remove @user</code> — stop monitoring\n"
+    "<code>/pause @user</code> · <code>/resume @user</code> — pause/resume a target\n"
     "<code>/list</code> — all accounts\n"
     "<code>/recheck @user</code> — force a check now\n"
     "<code>/status</code> — monitoring stats\n"
@@ -69,6 +70,8 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("menu", "Open the main menu"),
     BotCommand("add", "Start monitoring an account"),
     BotCommand("remove", "Stop monitoring an account"),
+    BotCommand("pause", "Pause monitoring an account"),
+    BotCommand("resume", "Resume monitoring an account"),
     BotCommand("list", "List monitored accounts"),
     BotCommand("status", "Show monitoring statistics"),
     BotCommand("interval", "Show or change the recheck interval"),
@@ -712,7 +715,7 @@ async def _actions_keyboard(username: str):
     async with get_session() as session:
         account = await crud.get_account(session, username)
     return (
-        keyboards.account_actions(username)
+        keyboards.account_actions(username, account.active)
         if account is not None
         else keyboards.fetch_actions(username)
     )
@@ -999,6 +1002,44 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+async def _cmd_set_active(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, active: bool
+) -> None:
+    verb = "resume" if active else "pause"
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            f"Usage: <code>/{verb} &lt;username&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    async with get_session() as session:
+        ok = await crud.set_account_active(session, username, active)
+    if ok:
+        msg = (
+            f"▶️ Resumed monitoring <b>@{esc(username)}</b>."
+            if active
+            else f"⏸ Paused <b>@{esc(username)}</b> — it's skipped on sweeps until you resume."
+        )
+    else:
+        msg = f"<b>@{esc(username)}</b> isn't monitored."
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.HTML, reply_markup=keyboards.back_to_menu()
+    )
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    await _cmd_set_active(update, context, active=False)
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_unauthorized(update):
+        return
+    await _cmd_set_active(update, context, active=True)
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -1056,7 +1097,7 @@ async def cmd_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         msg,
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.account_actions(username),
+        reply_markup=await _actions_keyboard(username),
     )
 
 
@@ -1085,7 +1126,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.account_actions(username),
+        reply_markup=await _actions_keyboard(username),
         disable_web_page_preview=True,
     )
 
@@ -1634,7 +1675,7 @@ async def _handle_account(
             )
             return
         await _safe_edit_text(
-            query, text, reply_markup=keyboards.account_actions(username)
+            query, text, reply_markup=await _actions_keyboard(username)
         )
         return
 
@@ -1650,7 +1691,7 @@ async def _handle_account(
                 query,
                 f"Check for <b>@{esc(username)}</b> failed: "
                 f"<code>{esc(str(result.get('error')))}</code>",
-                reply_markup=keyboards.account_actions(username),
+                reply_markup=await _actions_keyboard(username),
             )
             return
         username = result.get("username", username)
@@ -1669,7 +1710,7 @@ async def _handle_account(
             )
             return
         await _safe_edit_text(
-            query, text + suffix, reply_markup=keyboards.account_actions(username)
+            query, text + suffix, reply_markup=await _actions_keyboard(username)
         )
         return
 
@@ -1677,7 +1718,24 @@ async def _handle_account(
         await _safe_answer(query)
         text = await _render_history_message(username)
         await _safe_edit_text(
-            query, text, reply_markup=keyboards.account_actions(username)
+            query, text, reply_markup=await _actions_keyboard(username)
+        )
+        return
+
+    if action in ("pause", "resume"):
+        new_active = action == "resume"
+        async with get_session() as session:
+            ok = await crud.set_account_active(session, username, new_active)
+        if not ok:
+            await _safe_answer(query, "Account not found.", show_alert=True)
+            return
+        await _safe_answer(query, "▶️ Resumed" if new_active else "⏸ Paused")
+        service: MonitorService = context.application.bot_data["monitor"]
+        text = await _render_account_card(username, service)
+        await _safe_edit_text(
+            query,
+            text or f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
+            reply_markup=await _actions_keyboard(username),
         )
         return
 
@@ -1739,6 +1797,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("rm", cmd_remove))
+    app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("recheck", cmd_recheck))
     app.add_handler(CommandHandler("status", cmd_status))

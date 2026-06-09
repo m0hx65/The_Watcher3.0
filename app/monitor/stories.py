@@ -116,6 +116,44 @@ class StoriesClient:
             item.highlight_title = title
         return items
 
+    async def fetch_posts(self, username: str, limit: int = 12) -> list[StoryItem]:
+        """Return recent feed posts/reels for a public account (newest first).
+
+        saveinsta's profile listing is the post grid at full resolution. The
+        avatar (t51.*-19 namespace) is skipped; each remaining item is one post's
+        main media. Returned as StoryItems with source="post".
+        """
+        data = await self._fetch_media_html(f"https://www.instagram.com/{username}/")
+        items: list[StoryItem] = []
+        seen: set[str] = set()
+        if not data:
+            return items
+        for li in _LI_RE.findall(data):
+            is_video = "icon-dlvideo" in li
+            href = self._pick_download_href(li, is_video)
+            if not href:
+                continue
+            href = href.replace("&amp;", "&")
+            cdn_url = self._decode_jwt_url(href)
+            if cdn_url and _PROFILE_PIC_RE.search(cdn_url):
+                continue  # skip the profile avatar
+            pk = self._derive_pk(cdn_url, href)
+            if pk in seen:
+                continue
+            seen.add(pk)
+            items.append(
+                StoryItem(
+                    pk=pk,
+                    taken_at=0,
+                    media_type="video" if is_video else "image",
+                    url=href,
+                    source="post",
+                )
+            )
+            if len(items) >= limit:
+                break
+        return items
+
     async def fetch_profile_pic_url(self, username: str) -> Optional[str]:
         """Return a login-free HD (up to 1080px) profile-picture download URL.
 
