@@ -874,23 +874,42 @@ class MonitorService:
                                 prev_has_story = prev_reel.get("has_public_story", False)
                                 prev_is_live = prev_reel.get("is_live", False)
                     
-                    # Always notify about current story/live status
-                    status_parts = []
-                    
-                    if is_live:
-                        status_parts.append("🔴 LIVE NOW")
+                    # One status message per sweep, upgraded to a "just went
+                    # live" / "just posted a story" alert only when the status
+                    # actually changed since the previous sweep. While
+                    # establishing the baseline there is no real prior state,
+                    # so the "just …" wording is never used then.
+                    just_live = (
+                        is_live and not prev_is_live and not establishing_baseline
+                    )
+                    just_story = (
+                        has_public_story
+                        and not prev_has_story
+                        and not establishing_baseline
+                    )
+
+                    if just_live:
+                        msg = f"🔴 <b>@{esc(username)}</b> just went live!"
+                        change_type = "going_live"
+                    elif is_live:
+                        msg = f"<b>@{esc(username)}</b> — 🔴 LIVE NOW"
+                        change_type = "story_status"
+                    elif just_story:
+                        msg = f"🎬 <b>@{esc(username)}</b> just posted a story!"
+                        change_type = "story_posted"
                     elif has_public_story:
-                        status_parts.append("🎬 HAS STORY")
+                        msg = f"<b>@{esc(username)}</b> — 🎬 HAS STORY"
+                        change_type = "story_status"
                     else:
-                        status_parts.append("⭕ NO STORY")
-                    
-                    msg = f"<b>@{esc(username)}</b> — {' • '.join(status_parts)}"
+                        msg = f"<b>@{esc(username)}</b> — ⭕ NO STORY"
+                        change_type = "story_status"
+
                     delivered = await self.notifier.send_text(msg)
                     async with get_session() as session:
                         await crud.log_notification(
                             session,
                             account_id=account_id,
-                            change_type="story_status",
+                            change_type=change_type,
                             payload={
                                 "has_public_story": has_public_story,
                                 "is_live": is_live,
@@ -898,36 +917,6 @@ class MonitorService:
                             message=msg,
                             delivered=delivered,
                         )
-                    
-                    # Also notify on changes (when not establishing baseline)
-                    if not establishing_baseline:
-                        # Notify if just went live
-                        if is_live and not prev_is_live:
-                            msg = f"🔴 <b>@{esc(username)}</b> just went live!"
-                            delivered = await self.notifier.send_text(msg)
-                            async with get_session() as session:
-                                await crud.log_notification(
-                                    session,
-                                    account_id=account_id,
-                                    change_type="going_live",
-                                    payload={"is_live": is_live},
-                                    message=msg,
-                                    delivered=delivered,
-                                )
-                        
-                        # Notify if just posted a story
-                        if has_public_story and not prev_has_story:
-                            msg = f"🎬 <b>@{esc(username)}</b> just posted a story!"
-                            delivered = await self.notifier.send_text(msg)
-                            async with get_session() as session:
-                                await crud.log_notification(
-                                    session,
-                                    account_id=account_id,
-                                    change_type="story_posted",
-                                    payload={"has_public_story": has_public_story},
-                                    message=msg,
-                                    delivered=delivered,
-                                )
 
                 # Fetch the actual story items to download (anonymous, no login,
                 # via saveinsta.to). A dead/rate-limited source just yields [].
