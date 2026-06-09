@@ -410,6 +410,7 @@ async def _render_account_card(
             reel_data = (snapshot.raw_response or {}).get("reel_data") or {}
             has_story = bool(reel_data.get("has_public_story"))
             is_live = bool(reel_data.get("is_live"))
+            live = None
             if service is not None and account.instagram_id:
                 try:
                     live = await service.instagram.fetch_reel_user(
@@ -417,15 +418,20 @@ async def _render_account_card(
                     )
                 except Exception:  # pragma: no cover - network failure path
                     live = None
-                logger.info(
-                    "Card live story @{} (id={}): fetched={} has_story={} is_live={} (stored had_story={})",
-                    account.username, account.instagram_id, live is not None,
-                    None if live is None else live.get("has_public_story"),
-                    None if live is None else live.get("is_live"), has_story,
-                )
                 if live is not None:
                     has_story = bool(live.get("has_public_story"))
                     is_live = bool(live.get("is_live"))
+            # Instagram's graphql reel query is 401-blocked from datacenter IPs
+            # (e.g. Render), so `live` is often None in production. saveinsta is a
+            # third-party host and isn't IP-blocked, so use it as the story oracle
+            # when graphql is unavailable: any items back means an active story.
+            if live is None and not has_story and service is not None and service.stories:
+                try:
+                    items = await service.stories.fetch_stories(account.username)
+                    if items:
+                        has_story = True
+                except Exception:  # pragma: no cover - network failure path
+                    pass
             if is_live:
                 story_state = "🔴 live now"
             elif has_story:

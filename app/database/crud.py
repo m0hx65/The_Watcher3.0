@@ -364,6 +364,17 @@ async def mark_story_seen(
     media_type: str,
     taken_at: int,
 ) -> None:
+    # Idempotent: the on-demand Story/Highlights buttons re-send items the user
+    # has already seen (they pass an empty seen-set), so this can be called for a
+    # (account_id, story_pk) that already exists — a plain INSERT would hit the
+    # unique constraint and crash the handler.
+    existing = await session.execute(
+        select(SeenStory.id)
+        .where(SeenStory.account_id == account_id, SeenStory.story_pk == story_pk)
+        .limit(1)
+    )
+    if existing.scalar_one_or_none() is not None:
+        return
     session.add(SeenStory(
         account_id=account_id,
         story_pk=story_pk,
