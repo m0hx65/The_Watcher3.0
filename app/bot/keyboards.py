@@ -5,6 +5,7 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   menu:list:<page>         — show accounts list, page index (0-based)
   menu:status              — show monitoring stats
   menu:add                 — prompt user for a username to add
+  menu:fetch               — prompt for any username to grab its story/highlights
   menu:export              — send CSV export
   menu:help                — show help
   menu:interval            — show interval preset chooser
@@ -49,7 +50,29 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("ℹ️ Help", callback_data="menu:help"),
             ],
             [
+                InlineKeyboardButton("🔎 Any user", callback_data="menu:fetch"),
+            ],
+            [
                 InlineKeyboardButton("🔄 Sweep All", callback_data="menu:sweep"),
+            ],
+        ]
+    )
+
+
+def fetch_actions(username: str) -> InlineKeyboardMarkup:
+    """Story/Highlights actions for an arbitrary (possibly non-monitored) user."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📖 Story", callback_data=f"acc:story:{username}"
+                ),
+                InlineKeyboardButton(
+                    "✨ Highlights", callback_data=f"acc:highlights:{username}"
+                ),
+            ],
+            [
+                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ],
         ]
     )

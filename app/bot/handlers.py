@@ -58,7 +58,11 @@ HELP_TEXT = (
     "<code>/history @user</code> — recent changes\n"
     "<code>/photo @user</code> — stored profile picture\n"
     "<code>/fetchphoto @user</code> — download current profile picture on demand\n"
-    "<code>/export</code> — download CSV"
+    "<code>/story @user</code> — download any user's current story (no monitoring needed)\n"
+    "<code>/highlights @user</code> — list any user's highlights to download\n"
+    "<code>/export</code> — download CSV\n\n"
+    "<b>🔎 Any user</b> on the menu does the same as /story and /highlights for "
+    "any public account, without adding it to monitoring."
 )
 
 BOT_COMMANDS: list[BotCommand] = [
@@ -72,11 +76,14 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("history", "Recent changes for a username"),
     BotCommand("photo", "Current profile picture"),
     BotCommand("fetchphoto", "Download current profile picture on demand"),
+    BotCommand("story", "Download any user's current story"),
+    BotCommand("highlights", "List any user's highlights to download"),
     BotCommand("export", "Export change history as CSV"),
     BotCommand("help", "Show help"),
 ]
 
 _AWAITING_USERNAME = "awaiting_username"
+_AWAITING_FETCH_USERNAME = "awaiting_fetch_username"
 _AWAITING_INTERVAL = "awaiting_interval"
 # Message id of the bot's most recent prompt (the message that displays
 # a Cancel button while we wait for typed input). Used so we can clean it
@@ -671,6 +678,18 @@ async def _send_profile_photo(
     await _delete_callback_message(update)
 
 
+async def _actions_keyboard(username: str):
+    """Account-card actions when the user is monitored; lightweight story/
+    highlights actions when it's an ad-hoc (non-monitored) lookup."""
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+    return (
+        keyboards.account_actions(username)
+        if account is not None
+        else keyboards.fetch_actions(username)
+    )
+
+
 async def _send_story_on_demand(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -684,12 +703,13 @@ async def _send_story_on_demand(
     )
     service: MonitorService = context.application.bot_data["monitor"]
     result = await service.fetch_and_send_stories(username)
+    keyboard = await _actions_keyboard(username)
     if not result.get("ok"):
         await _safe_edit_text(
             query,
             f"Couldn't fetch story for <b>@{esc(username)}</b>: "
             f"<code>{esc(str(result.get('error')))}</code>",
-            reply_markup=keyboards.account_actions(username),
+            reply_markup=keyboard,
         )
         return
     count = result.get("count", 0)
@@ -701,9 +721,7 @@ async def _send_story_on_demand(
     else:
         noun = "item" if count == 1 else "items"
         text = f"📖 Sent {count} story {noun} for <b>@{esc(username)}</b>."
-    await _safe_edit_text(
-        query, text, reply_markup=keyboards.account_actions(username)
-    )
+    await _safe_edit_text(query, text, reply_markup=keyboard)
 
 
 async def _show_highlights(
@@ -724,7 +742,7 @@ async def _show_highlights(
             query,
             f"Couldn't load highlights for <b>@{esc(username)}</b>: "
             f"<code>{esc(str(result.get('error')))}</code>",
-            reply_markup=keyboards.account_actions(username),
+            reply_markup=await _actions_keyboard(username),
         )
         return
     items = result.get("items", [])
@@ -732,7 +750,7 @@ async def _show_highlights(
         await _safe_edit_text(
             query,
             f"<b>@{esc(username)}</b> has no highlights.",
-            reply_markup=keyboards.account_actions(username),
+            reply_markup=await _actions_keyboard(username),
         )
         return
     lines = [f"<b>✨ Highlights for @{esc(username)}</b> ({len(items)})", ""]
@@ -1101,6 +1119,95 @@ async def cmd_fetchphoto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Download and send the current story for any public username, monitored or not."""
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/story &lt;username&gt;</code>\n"
+            "Downloads the account's current story now — works for any public "
+            "account, monitored or not.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    status_msg = await update.message.reply_text(
+        f"⏳ Fetching current story for <b>@{esc(username)}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.fetch_and_send_stories(username)
+    if not result.get("ok"):
+        await status_msg.edit_text(
+            f"Couldn't fetch story for <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.fetch_actions(username),
+        )
+        return
+    count = result.get("count", 0)
+    if count == 0:
+        text = (
+            f"<b>@{esc(username)}</b> has no active story right now "
+            "(or the account is private)."
+        )
+    else:
+        noun = "item" if count == 1 else "items"
+        text = f"📖 Sent {count} story {noun} for <b>@{esc(username)}</b>."
+    await status_msg.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=keyboards.fetch_actions(username)
+    )
+
+
+async def cmd_highlights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List highlights (each tappable to download) for any public username."""
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/highlights &lt;username&gt;</code>\n"
+            "Lists an account's highlights to download — works for any public account.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+    status_msg = await update.message.reply_text(
+        f"⏳ Loading highlights for <b>@{esc(username)}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.list_highlights(username)
+    if not result.get("ok"):
+        await status_msg.edit_text(
+            f"Couldn't load highlights for <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.fetch_actions(username),
+        )
+        return
+    items = result.get("items", [])
+    if not items:
+        await status_msg.edit_text(
+            f"<b>@{esc(username)}</b> has no highlights.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.fetch_actions(username),
+        )
+        return
+    lines = [f"<b>✨ Highlights for @{esc(username)}</b> ({len(items)})", ""]
+    for i, (_hid, title) in enumerate(items, start=1):
+        lines.append(f"{i}. {esc(title) or '(untitled)'}")
+    lines.append("")
+    lines.append("Tap a highlight below to download and send it.")
+    await status_msg.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboards.highlights_view(username, items),
+    )
+
+
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -1184,6 +1291,25 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _apply_interval(update, context, seconds)
         return
 
+    if context.user_data.get(_AWAITING_FETCH_USERNAME):
+        context.user_data.pop(_AWAITING_FETCH_USERNAME, None)
+        await _consume_prompt_message(update, context)
+        username = _normalize_username((update.message.text or "").strip())
+        if not username:
+            await update.message.reply_text(
+                "That doesn't look like a valid Instagram username. "
+                "Letters, numbers, dots, and underscores only.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.main_menu(),
+            )
+            return
+        await update.message.reply_text(
+            f"<b>@{esc(username)}</b> — grab its public story or highlights:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.fetch_actions(username),
+        )
+        return
+
     if not context.user_data.get(_AWAITING_USERNAME):
         return  # Ignore typed text unless we're waiting for input.
     context.user_data.pop(_AWAITING_USERNAME, None)
@@ -1227,10 +1353,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # awaiting flag alive if this same press is the one that opens that prompt.
     keep_interval_prompt = (data == "menu:setinterval:custom")
     keep_username_prompt = (data == "menu:add")
+    keep_fetch_prompt = (data == "menu:fetch")
     if not keep_interval_prompt:
         context.user_data.pop(_AWAITING_INTERVAL, None)
     if not keep_username_prompt:
         context.user_data.pop(_AWAITING_USERNAME, None)
+    if not keep_fetch_prompt:
+        context.user_data.pop(_AWAITING_FETCH_USERNAME, None)
 
     # If the user has a Cancel-button prompt left over on a different message
     # than the one they're now interacting with, remove the orphaned prompt
@@ -1375,6 +1504,20 @@ async def _handle_menu(
         )
         return
 
+    if action == "fetch":
+        await _safe_answer(query)
+        context.user_data[_AWAITING_FETCH_USERNAME] = True
+        if query.message:
+            context.user_data[_PROMPT_MSG_ID] = query.message.message_id
+        await _safe_edit_text(
+            query,
+            "Send any public Instagram <b>username</b> to grab its current "
+            "<b>story</b> or <b>highlights</b>.\n\n"
+            "<i>It won't be added to monitoring.</i>",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+
     if action == "export":
         await _safe_answer(query, "Building CSV…")
         await _send_csv_export(update, context)
@@ -1475,10 +1618,12 @@ async def _handle_account(
         await _safe_answer(query)
         text = await _render_account_card(username)
         if text is None:
+            # Not monitored — still let the user grab its public story/highlights.
             await _safe_edit_text(
                 query,
-                f"<b>@{esc(username)}</b> is not monitored.",
-                reply_markup=keyboards.back_to_list(),
+                f"<b>@{esc(username)}</b> isn't monitored, but you can still grab "
+                "its public story or highlights:",
+                reply_markup=keyboards.fetch_actions(username),
             )
             return
         await _safe_edit_text(
@@ -1594,6 +1739,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("fetchphoto", cmd_fetchphoto))
+    app.add_handler(CommandHandler("story", cmd_story))
+    app.add_handler(CommandHandler("highlights", cmd_highlights))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(on_callback))
     # Plain text — used to capture usernames after the Add prompt.

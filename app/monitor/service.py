@@ -963,12 +963,17 @@ class MonitorService:
 
     async def _deliver_story_items(
         self,
-        account_id: int,
+        account_id: Optional[int],
         username: str,
         items: list,
         seen_pks: set[str],
     ) -> int:
-        """Download and send each item; record it as seen. Returns the number sent."""
+        """Download and send each item; record it as seen. Returns the number sent.
+
+        `account_id` is None for ad-hoc fetches of accounts that aren't monitored
+        (e.g. /story for any username) — in that case nothing is persisted as
+        seen, since there's no account row to dedup against on later sweeps.
+        """
         assert self.stories is not None
         sent = 0
         for item in items:
@@ -979,17 +984,18 @@ class MonitorService:
                 logger.warning(
                     "Could not download story {} for @{}", item.pk, username
                 )
-                async with get_session() as session:
-                    await crud.mark_story_seen(
-                        session,
-                        account_id=account_id,
-                        story_pk=item.pk,
-                        source=item.source,
-                        highlight_id=item.highlight_id,
-                        highlight_title=item.highlight_title,
-                        media_type=item.media_type,
-                        taken_at=item.taken_at,
-                    )
+                if account_id is not None:
+                    async with get_session() as session:
+                        await crud.mark_story_seen(
+                            session,
+                            account_id=account_id,
+                            story_pk=item.pk,
+                            source=item.source,
+                            highlight_id=item.highlight_id,
+                            highlight_title=item.highlight_title,
+                            media_type=item.media_type,
+                            taken_at=item.taken_at,
+                        )
                 seen_pks.add(item.pk)
                 continue
 
@@ -1008,28 +1014,33 @@ class MonitorService:
 
             if ok:
                 sent += 1
-                async with get_session() as session:
-                    await crud.mark_story_seen(
-                        session,
-                        account_id=account_id,
-                        story_pk=item.pk,
-                        source=item.source,
-                        highlight_id=item.highlight_id,
-                        highlight_title=item.highlight_title,
-                        media_type=item.media_type,
-                        taken_at=item.taken_at,
-                    )
+                if account_id is not None:
+                    async with get_session() as session:
+                        await crud.mark_story_seen(
+                            session,
+                            account_id=account_id,
+                            story_pk=item.pk,
+                            source=item.source,
+                            highlight_id=item.highlight_id,
+                            highlight_title=item.highlight_title,
+                            media_type=item.media_type,
+                            taken_at=item.taken_at,
+                        )
                 seen_pks.add(item.pk)
         return sent
 
-    # ---------- On-demand actions (triggered from the account card) ----------
+    # ---------- On-demand actions ----------
+    # These work for ANY public username, monitored or not. When the account is
+    # not monitored, account_id is None: media is still fetched and sent, but
+    # nothing is persisted (no snapshot, no seen-dedup row).
 
     async def fetch_and_send_stories(self, username: str) -> dict:
         """Download every current story item for a public account and send them now.
 
-        Unlike the sweep path, this ignores the seen-deduplication set so the user
-        always receives whatever is live at the moment they tap the button. Items
-        are still recorded as seen afterwards so the next sweep won't re-send them.
+        Works for any public username. Unlike the sweep path this ignores the
+        seen-deduplication set so the user always receives whatever is live at
+        the moment they ask. For monitored accounts the items are recorded as
+        seen afterwards so the next sweep won't re-send them.
         Returns {"ok": bool, "count": int, "error": Optional[str]}.
         """
         if self.stories is None:
@@ -1037,14 +1048,17 @@ class MonitorService:
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
             account = await crud.get_account(session, username)
-            if account is None:
-                return {"ok": False, "count": 0, "error": f"@{username} is not monitored"}
-            account_id = account.id
-            instagram_id = account.instagram_id
+        account_id = account.id if account else None
+        instagram_id = account.instagram_id if account else None
 
         # Distinguish "no active story" (a real, anonymous-knowable state) from
-        # "there is a story but we can't fetch the media anonymously". The reel
-        # query tells us has_public_story without any login.
+        # "there is a story but we can't fetch the media". The reel query tells us
+        # has_public_story without any login; resolve the id on the fly for
+        # non-monitored usernames that don't have one stored.
+        if not instagram_id:
+            fetch = await self.instagram.fetch_profile(username)
+            if fetch.success and fetch.parsed:
+                instagram_id = fetch.parsed.get("instagram_id")
         has_story: Optional[bool] = None
         if instagram_id:
             try:
@@ -1054,9 +1068,7 @@ class MonitorService:
             except Exception:  # pragma: no cover - network failure path
                 has_story = None
 
-        # Best-effort anonymous media fetch (no login). The legacy source is down,
-        # so this typically yields nothing today, but we still try in case an
-        # anonymous source is reachable.
+        # Anonymous media fetch (no login) via saveinsta.to.
         try:
             stories = await self.stories.fetch_stories(username)
         except Exception as exc:  # pragma: no cover - network failure path
@@ -1074,24 +1086,22 @@ class MonitorService:
         return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
 
     async def list_highlights(self, username: str) -> dict:
-        """Return the current highlight reels (id + title) for an account.
+        """Return the current highlight reels (id + title) for any public account.
 
-        Pulls the live catalog from Instagram's anonymous graphql reel query and
-        refreshes the stored catalog; falls back to the last stored catalog if
-        the live fetch yields nothing.
+        Pulls the live catalog from Instagram's anonymous graphql reel query. For
+        monitored accounts it also refreshes the stored catalog and falls back to
+        the last stored catalog if the live fetch yields nothing.
         Returns {"ok": bool, "items": list[(id, title)], "error": Optional[str]}.
         """
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
             account = await crud.get_account(session, username)
-            if account is None:
-                return {"ok": False, "items": [], "error": f"@{username} is not monitored"}
-            account_id = account.id
-            instagram_id = account.instagram_id
+        account_id = account.id if account else None
+        instagram_id = account.instagram_id if account else None
 
         # The highlight catalog (names + ids) comes from Instagram's own graphql
-        # reel query, which still works anonymously. Only the media download needs
-        # a cookie, so names are always available.
+        # reel query, which works anonymously (the id is resolved from the
+        # username inside _fetch_highlight_catalog when not already known).
         catalog: dict[str, str] = {}
         try:
             catalog = await self._fetch_highlight_catalog(username, instagram_id)
@@ -1099,10 +1109,11 @@ class MonitorService:
             logger.warning("On-demand highlight catalog failed for @{}: {}", username, exc)
             catalog = {}
 
-        if catalog:
+        # Persist/fallback only makes sense for monitored accounts.
+        if catalog and account_id is not None:
             async with get_session() as session:
                 await crud.replace_highlight_catalog(session, account_id, catalog)
-        else:
+        elif not catalog and account_id is not None:
             async with get_session() as session:
                 catalog = await crud.get_highlight_catalog(session, account_id)
 
@@ -1122,12 +1133,7 @@ class MonitorService:
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
             account = await crud.get_account(session, username)
-            if account is None:
-                return {
-                    "ok": False, "count": 0, "title": None,
-                    "error": f"@{username} is not monitored",
-                }
-            account_id = account.id
+        account_id = account.id if account else None
 
         listing = await self.list_highlights(username)
         items = listing["items"]
@@ -1138,8 +1144,7 @@ class MonitorService:
             }
 
         highlight_id, title = items[index]
-        # Best-effort anonymous media fetch (no login). The legacy source is down,
-        # so this typically yields nothing today.
+        # Anonymous media fetch (no login) via saveinsta.to.
         try:
             story_items = await self.stories.fetch_highlight_items(
                 username, highlight_id, title
