@@ -1622,6 +1622,7 @@ async def _handle_account(
     if action == "open":
         await _safe_answer(query)
         service: MonitorService = context.application.bot_data["monitor"]
+        await _safe_edit_text(query, f"⏳ Opening <b>@{esc(username)}</b>…")
         text = await _render_account_card(username, service)
         if text is None:
             # Not monitored — still let the user grab its public story/highlights.

@@ -27,6 +27,7 @@ import binascii
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -76,12 +77,16 @@ class StoriesClient:
     def __init__(self) -> None:
         kwargs: dict = {
             "impersonate": _CHROME,
-            "timeout": 60,
+            "timeout": 30,
             "allow_redirects": True,
         }
         if settings.proxy:
             kwargs["proxy"] = settings.proxy
         self._session = AsyncSession(**kwargs)
+        # Cached (k_exp, k_token) from the token page + the monotonic time they
+        # stop being reused. Lets repeat fetches skip one of three round-trips.
+        self._tokens: Optional[tuple[str, str]] = None
+        self._tokens_until: float = 0.0
 
     async def close(self) -> None:
         await self._session.close()
@@ -167,22 +172,35 @@ class StoriesClient:
 
     # --------------------------------------------------------------- internal
 
+    async def _get_tokens(self) -> Optional[tuple[str, str]]:
+        """Return cached (k_exp, k_token), refreshing from the token page when
+        the cache has expired. Cached for up to 5 minutes (or k_exp, whichever is
+        sooner) — saves one HTTP round-trip on every fetch after the first."""
+        if self._tokens and time.monotonic() < self._tokens_until:
+            return self._tokens
+        page = await self._session.get(_TOKEN_PAGE)
+        if page.status_code != 200:
+            logger.debug("saveinsta token page HTTP {}", page.status_code)
+            return None
+        ke = _K_EXP_RE.search(page.text)
+        kt = _K_TOKEN_RE.search(page.text)
+        if not ke or not kt:
+            logger.debug("saveinsta token block not found")
+            return None
+        self._tokens = (ke.group(1), kt.group(1))
+        self._tokens_until = time.monotonic() + 300.0
+        return self._tokens
+
     async def _fetch_media_html(self, target_url: str) -> str:
         """Run the saveinsta token flow for an Instagram URL; return media HTML.
 
         Returns "" on any failure so callers degrade to an empty result set.
         """
         try:
-            page = await self._session.get(_TOKEN_PAGE)
-            if page.status_code != 200:
-                logger.debug("saveinsta token page HTTP {}", page.status_code)
+            tokens = await self._get_tokens()
+            if tokens is None:
                 return ""
-            k_exp_match = _K_EXP_RE.search(page.text)
-            k_token_match = _K_TOKEN_RE.search(page.text)
-            if not k_exp_match or not k_token_match:
-                logger.debug("saveinsta token block not found")
-                return ""
-            k_exp, k_token = k_exp_match.group(1), k_token_match.group(1)
+            k_exp, k_token = tokens
 
             verify = await self._session.post(
                 _VERIFY_URL,
@@ -219,6 +237,7 @@ class StoriesClient:
             )
             if search.status_code != 200:
                 logger.debug("saveinsta ajaxSearch HTTP {}", search.status_code)
+                self._tokens = None  # tokens may be stale — force refresh next time
                 return ""
             payload = search.json()
             if payload.get("status") != "ok":

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
@@ -216,6 +217,11 @@ class InstagramClient:
         session: _SessionLike | None = None,
     ):
         self.max_retries = max_retries
+        # Circuit breaker for the graphql reel query: datacenter IPs (Render) get
+        # a hard 401 on /graphql/query, and retrying it wastes seconds on every
+        # call. Once we see a hard block we skip the endpoint for a short while
+        # and let callers use their fallback (saveinsta / stored data).
+        self._reel_blocked_until: float = 0.0
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -278,17 +284,23 @@ class InstagramClient:
             logger.debug("fetch_hd_pic_url failed for user_id={}: {}", user_id, exc)
         return None
 
+    # How long to skip the reel query after a hard block (401/403) before probing
+    # again. Keeps card opens and sweeps fast where the graphql endpoint is
+    # IP-blocked, while still recovering automatically if access returns.
+    _REEL_BLOCK_TTL = 180.0
+
     async def fetch_reel_user(self, user_id: str) -> Optional[dict[str, Any]]:
         """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654).
 
-        Retries transient blocks (401/403/429/5xx) like fetch_profile — datacenter
-        IPs (e.g. Render) get throttled on the graphql endpoint far more than
-        residential ones, and a single attempt was silently returning None, which
-        made story/live status read as "none". Logs non-200s at WARNING so the
-        failure mode is visible in production.
+        Fast-fails: a hard 401/403 (typical on datacenter IPs) trips a short-lived
+        circuit breaker so we don't burn seconds retrying a blocked endpoint on
+        every call — callers fall back to saveinsta / stored data. Transient
+        429/5xx still get one quick retry.
         """
         if not user_id:
             return None
+        if time.monotonic() < self._reel_blocked_until:
+            return None  # endpoint recently hard-blocked — skip, use fallback
         headers = _build_headers()
         params = {
             "query_id": PROFILE_REEL_QUERY_ID,
@@ -300,52 +312,41 @@ class InstagramClient:
             "include_live_status": "true",
             "include_highlight_reels": "true",
         }
-        attempts = max(1, min(self.max_retries, 4))
-        last_status = 0
-        for attempt in range(1, attempts + 1):
+        for attempt in range(1, 3):  # at most 2 attempts — fail fast
             try:
                 response = await self._session.get(
                     PROFILE_REEL_QUERY_URL,
                     params=params,
                     headers=headers,
                 )
-                last_status = response.status_code
                 if response.status_code == 200:
+                    self._reel_blocked_until = 0.0  # access works — clear breaker
                     try:
                         payload = response.json()
                     except Exception:
-                        logger.warning("Reel query id={} returned non-JSON 200", user_id)
+                        logger.debug("Reel query id={} returned non-JSON 200", user_id)
                         return None
                     return _parse_reel_query_user(payload)
-                retryable = response.status_code in (401, 403, 429) or (
-                    500 <= response.status_code < 600
-                )
-                if retryable and attempt < attempts:
-                    delay = min(8.0, 1.5 * attempt + random.uniform(0.0, 1.0))
-                    logger.warning(
-                        "Reel query id={} HTTP {} (attempt {}/{}), retrying in {:.1f}s",
-                        user_id, response.status_code, attempt, attempts, delay,
+                if response.status_code in (401, 403):
+                    # Hard block (IP/auth) — don't retry, trip the breaker.
+                    self._reel_blocked_until = time.monotonic() + self._REEL_BLOCK_TTL
+                    logger.debug(
+                        "Reel query id={} HTTP {} — blocking endpoint for {:.0f}s",
+                        user_id, response.status_code, self._REEL_BLOCK_TTL,
                     )
-                    await asyncio.sleep(delay)
+                    return None
+                # 429/5xx — transient, one quick retry.
+                if (response.status_code == 429 or 500 <= response.status_code < 600) and attempt < 2:
+                    await asyncio.sleep(random.uniform(0.3, 0.7))
                     continue
-                logger.warning(
-                    "Reel query id={} returned HTTP {} — giving up",
-                    user_id, response.status_code,
-                )
+                logger.debug("Reel query id={} HTTP {} — giving up", user_id, response.status_code)
                 return None
             except Exception as exc:
-                logger.warning(
-                    "Reel query id={} failed (attempt {}/{}): {}",
-                    user_id, attempt, attempts, exc,
-                )
-                if attempt < attempts:
-                    await asyncio.sleep(1.0 + random.uniform(0.0, 1.0))
+                if attempt < 2:
+                    await asyncio.sleep(random.uniform(0.3, 0.7))
                     continue
+                logger.debug("Reel query id={} failed: {}", user_id, exc)
                 return None
-        logger.warning(
-            "Reel query id={} failed after {} attempts (last HTTP {})",
-            user_id, attempts, last_status,
-        )
         return None
 
     async def fetch_username_by_id(self, user_id: str) -> Optional[str]:
