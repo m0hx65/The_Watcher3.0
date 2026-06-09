@@ -54,6 +54,9 @@ _ANCHOR_RE = re.compile(
 _FALLBACK_DL_RE = re.compile(r'href="(https://dl\.snapcdn\.app[^"]+)"')
 # scontent filenames embed a stable numeric media id: /<mediaid>_<ownerid>_…
 _MEDIA_ID_RE = re.compile(r"/(\d{6,})_\d{6,}_")
+# Instagram serves profile pictures from the t51.*-19 CDN namespace (feed media
+# is -15). Used to pick the avatar out of a profile's media listing.
+_PROFILE_PIC_RE = re.compile(r"t51\.\d+-19")
 
 
 @dataclass
@@ -107,6 +110,27 @@ class StoriesClient:
             item.highlight_id = highlight_id
             item.highlight_title = title
         return items
+
+    async def fetch_profile_pic_url(self, username: str) -> Optional[str]:
+        """Return a login-free HD (up to 1080px) profile-picture download URL.
+
+        saveinsta's profile listing includes the avatar from the t51.*-19 CDN
+        namespace at full resolution. Works for public accounts; private accounts
+        yield nothing here (their HD avatar needs login), so the caller falls back
+        to the web profile_pic_url_hd (320px), which is the anonymous ceiling.
+        """
+        data = await self._fetch_media_html(f"https://www.instagram.com/{username}/")
+        if not data:
+            return None
+        for li in _LI_RE.findall(data):
+            href = self._pick_download_href(li, "icon-dlvideo" in li)
+            if not href:
+                continue
+            href = href.replace("&amp;", "&")
+            cdn_url = self._decode_jwt_url(href)
+            if cdn_url and _PROFILE_PIC_RE.search(cdn_url):
+                return href
+        return None
 
     async def download(self, item: StoryItem, username: str) -> Optional[Path]:
         """Download a story item to disk. Returns the local path on success."""

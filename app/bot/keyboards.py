@@ -18,6 +18,7 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:story:<username>     — download & send the current story now
   acc:highlights:<u>       — list highlight names
   acc:hldl:<idx>:<u>       — download highlight at list index <idx>
+  acc:hlall:<u>            — download every highlight reel at once
   acc:remove:<username>    — show remove confirmation
   acc:remove_yes:<u>       — confirmed remove
   menu:cleardb             — show clear-history confirmation
@@ -167,6 +168,15 @@ def highlights_view(
     index in the callback maps back to the same ordering on the download side.
     """
     rows: list[list[InlineKeyboardButton]] = []
+    if items:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"⬇️ Download all ({len(items)})",
+                    callback_data=f"acc:hlall:{username}",
+                )
+            ]
+        )
     for idx, (_hid, title) in enumerate(items):
         label = title.strip() or "(untitled)"
         if len(label) > 28:

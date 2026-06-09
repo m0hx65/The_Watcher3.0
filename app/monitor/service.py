@@ -1161,3 +1161,77 @@ class MonitorService:
 
         sent = await self._deliver_story_items(account_id, username, story_items, set())
         return {"ok": True, "count": sent, "title": title, "error": None}
+
+    async def download_all_highlights(self, username: str) -> dict:
+        """Download and send every highlight reel for any public account at once.
+
+        Returns {"ok": bool, "count": int, "reels": int, "error": Optional[str]}
+        where count is the total media items sent and reels the number of reels.
+        """
+        if self.stories is None:
+            return {"ok": False, "count": 0, "reels": 0, "error": "Stories client unavailable"}
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        account_id = account.id if account else None
+
+        listing = await self.list_highlights(username)
+        items = listing.get("items", [])
+        if not items:
+            return {"ok": True, "count": 0, "reels": 0, "error": None}
+
+        catalog = {hid: title for hid, title in items}
+        story_items = await self._gather_highlight_items(username, catalog)
+        if not story_items:
+            return {
+                "ok": False, "count": 0, "reels": len(items),
+                "error": _DOWNLOAD_UNAVAILABLE_MSG,
+            }
+
+        sent = await self._deliver_story_items(account_id, username, story_items, set())
+        return {"ok": True, "count": sent, "reels": len(items), "error": None}
+
+    async def fetch_profile_picture(self, username: str) -> dict:
+        """Download the CURRENT profile picture at the best available quality.
+
+        Login-free, works for any username. Prefers the HD (up to 1080px) avatar
+        from saveinsta; falls back to the web profile_pic_url_hd (320px, the
+        anonymous ceiling for accounts saveinsta can't reach, e.g. private ones).
+        Returns {"ok", "path", "sha256", "byte_size", "hd", "error"}.
+        """
+        username = username.strip().lstrip("@").lower()
+        fetch = await self.instagram.fetch_profile(username)
+        if not fetch.success or not fetch.parsed:
+            return {
+                "ok": False, "path": None,
+                "error": fetch.error or f"HTTP {fetch.http_status}",
+            }
+        web_url = fetch.parsed.get("profile_pic_url")  # already hd(320) or 150
+
+        hd_url: Optional[str] = None
+        if self.stories is not None:
+            try:
+                hd_url = await self.stories.fetch_profile_pic_url(username)
+            except Exception as exc:  # pragma: no cover - network failure path
+                logger.debug("HD profile pic fetch failed for @{}: {}", username, exc)
+                hd_url = None
+
+        chosen = hd_url or web_url
+        if not chosen:
+            return {"ok": False, "path": None, "error": "No profile picture available"}
+
+        hashed = await self.hasher.hash_url(chosen, username)
+        # If the HD source failed mid-download, fall back to the web URL.
+        if hashed is None and hd_url and web_url and web_url != chosen:
+            hashed = await self.hasher.hash_url(web_url, username)
+        if hashed is None:
+            return {"ok": False, "path": None, "error": "Failed to download profile picture"}
+
+        return {
+            "ok": True,
+            "path": hashed.local_path,
+            "sha256": hashed.sha256,
+            "byte_size": hashed.byte_size,
+            "hd": bool(hd_url),
+            "error": None,
+        }

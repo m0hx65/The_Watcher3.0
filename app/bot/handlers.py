@@ -531,30 +531,6 @@ async def _render_history_message(username: str) -> str:
     return "\n".join(lines)
 
 
-async def _resolve_profile_photo(
-    username: str,
-) -> tuple[Optional[Path], str]:
-    """Return (path, caption_or_error_text). When path is None, the caption is an error message."""
-    async with get_session() as session:
-        account = await crud.get_account(session, username)
-        if not account:
-            return None, f"<b>@{esc(username)}</b> is not monitored."
-        media = await crud.latest_media_hash(session, account.id)
-
-    if not media or not media.local_path:
-        return None, f"No stored profile picture for <b>@{esc(username)}</b> yet."
-    path = Path(media.local_path)
-    if not path.exists():
-        return None, "Stored profile picture file is missing on disk."
-
-    caption = (
-        f"<b>@{esc(username)}</b>\n"
-        f"SHA256: <code>{esc(media.sha256)}</code>\n"
-        f"Captured: <code>{fmt_timestamp(media.created_at)}</code>"
-    )
-    return path, caption
-
-
 async def _build_csv_export() -> tuple[bytes, int]:
     async with get_session() as session:
         records = await crud.export_all(session)
@@ -654,25 +630,48 @@ async def _send_profile_photo(
     context: ContextTypes.DEFAULT_TYPE,
     username: str,
 ) -> None:
+    """Download the CURRENT profile picture at best quality and send it.
+
+    Fetches fresh every time (the bot's media dir is ephemeral on Render, so a
+    previously stored file may be gone) and works for any username, monitored
+    or not.
+    """
     chat_id = _chat_id(update)
-    path, caption_or_err = await _resolve_profile_photo(username)
-    if path is None:
-        await _reply_or_edit(
-            update,
-            caption_or_err,
-            reply_markup=keyboards.account_actions(username),
-        )
-        return
     if chat_id is None:
         return
-    with open(path, "rb") as f:
+    query = update.callback_query
+    if query is not None:
+        await _safe_edit_text(
+            query, f"⏳ Fetching profile picture for <b>@{esc(username)}</b>…"
+        )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.fetch_profile_picture(username)
+    keyboard = await _actions_keyboard(username)
+    if not result.get("ok"):
+        await _reply_or_edit(
+            update,
+            f"Couldn't fetch profile picture for <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            reply_markup=keyboard,
+        )
+        return
+    quality = (
+        "HD" if result.get("hd")
+        else "standard (320px — anonymous max for this account)"
+    )
+    caption = (
+        f"<b>@{esc(username)}</b>\n"
+        f"SHA256: <code>{esc(result['sha256'])}</code>\n"
+        f"Size: {result['byte_size'] // 1024} KB · {quality}"
+    )
+    with open(result["path"], "rb") as f:
         await context.bot.send_document(
             chat_id=chat_id,
             document=f,
             filename=f"{username}_profile.jpg",
-            caption=caption_or_err,
+            caption=caption,
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboards.account_actions(username),
+            reply_markup=keyboard,
         )
     # Photo successfully sent — drop the now-redundant card that hosted the button.
     await _delete_callback_message(update)
@@ -793,6 +792,44 @@ async def _download_highlight(
     else:
         noun = "item" if count == 1 else "items"
         await _safe_answer(query, f"Sent {count} {noun} from “{title}”.")
+
+
+async def _download_all_highlights(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+) -> None:
+    """Download and send every highlight reel for an account at once."""
+    query = update.callback_query
+    await _safe_answer(query, "Downloading all highlights…")
+    await _safe_edit_text(
+        query,
+        f"⏳ Downloading <b>all</b> highlights for <b>@{esc(username)}</b>… "
+        "this can take a while.",
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.download_all_highlights(username)
+    keyboard = await _actions_keyboard(username)
+    if not result.get("ok"):
+        await _safe_edit_text(
+            query,
+            f"Couldn't download highlights for <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            reply_markup=keyboard,
+        )
+        return
+    count = result.get("count", 0)
+    reels = result.get("reels", 0)
+    if count == 0:
+        text = f"<b>@{esc(username)}</b> has no highlights to download."
+    else:
+        item_noun = "item" if count == 1 else "items"
+        reel_noun = "highlight" if reels == 1 else "highlights"
+        text = (
+            f"✨ Sent {count} {item_noun} from {reels} {reel_noun} "
+            f"for <b>@{esc(username)}</b>."
+        )
+    await _safe_edit_text(query, text, reply_markup=keyboard)
 
 
 async def _send_csv_export(
@@ -1038,85 +1075,20 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_fetchphoto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetch and send the current profile picture for any username, monitored or not."""
+    """Fetch and send the current profile picture (max quality) for any username."""
     if await _reject_if_unauthorized(update):
         return
     username = _username_arg(context)
     if not username:
         await update.message.reply_text(
             "Usage: <code>/fetchphoto &lt;username&gt;</code>\n"
-            "Downloads the current Instagram profile picture without adding the account to monitoring.",
+            "Downloads the current Instagram profile picture at best quality, "
+            "without adding the account to monitoring.",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboards.back_to_menu(),
         )
         return
-
-    chat_id = _chat_id(update)
-    if chat_id is None:
-        return
-
-    status_msg = await update.message.reply_text(
-        f"⏳ Fetching profile picture for <b>@{esc(username)}</b>…",
-        parse_mode=ParseMode.HTML,
-    )
-
-    service: MonitorService = context.application.bot_data["monitor"]
-    fetch = await service.instagram.fetch_profile(username)
-
-    if not fetch.success:
-        await status_msg.edit_text(
-            f"Failed to fetch <b>@{esc(username)}</b>: "
-            f"<code>{esc(fetch.error or str(fetch.http_status))}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboards.back_to_menu(),
-        )
-        return
-
-    parsed = fetch.parsed or {}
-    pic_url = parsed.get("profile_pic_url")
-    # Try mobile API for full-resolution image (hd_profile_pic_url_info)
-    instagram_id = parsed.get("instagram_id")
-    if instagram_id:
-        hd_url = await service.instagram.fetch_hd_pic_url(str(instagram_id))
-        if hd_url:
-            pic_url = hd_url
-
-    if not pic_url:
-        await status_msg.edit_text(
-            f"<b>@{esc(username)}</b> has no profile picture.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboards.back_to_menu(),
-        )
-        return
-
-    hashed = await service.hasher.hash_url(pic_url, username)
-    if hashed is None:
-        await status_msg.edit_text(
-            f"Failed to download profile picture for <b>@{esc(username)}</b>.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboards.back_to_menu(),
-        )
-        return
-
-    caption = (
-        f"<b>@{esc(username)}</b>\n"
-        f"SHA256: <code>{esc(hashed.sha256)}</code>\n"
-        f"Size: {hashed.byte_size // 1024} KB"
-    )
-    try:
-        await status_msg.delete()
-    except (BadRequest, TelegramError):
-        pass
-
-    with open(hashed.local_path, "rb") as f:
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=f,
-            filename=f"{username}_profile.jpg",
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboards.back_to_menu(),
-        )
+    await _send_profile_photo(update, context, username)
 
 
 async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1612,6 +1584,10 @@ async def _handle_account(
 
     if action == "highlights":
         await _show_highlights(update, context, username)
+        return
+
+    if action == "hlall":
+        await _download_all_highlights(update, context, username)
         return
 
     if action == "open":
