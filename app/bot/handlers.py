@@ -355,7 +355,9 @@ async def _reply_or_edit(
 
 # ---------- View renderers ----------
 
-async def _render_account_card(username: str) -> Optional[str]:
+async def _render_account_card(
+    username: str, service: Optional[MonitorService] = None
+) -> Optional[str]:
     async with get_session() as session:
         account = await crud.get_account(session, username)
         if not account:
@@ -400,12 +402,27 @@ async def _render_account_card(username: str) -> Optional[str]:
         if flags:
             lines.append(" · ".join(flags))
 
-        # Live story / highlight summary for public accounts.
-        reel_data = (snapshot.raw_response or {}).get("reel_data") or {}
+        # Story / live status for public accounts. Fetch it LIVE so a story
+        # posted since the last check shows immediately — the stored snapshot's
+        # reel_data is only as fresh as the last sweep/recheck. Fall back to the
+        # stored value if the live fetch is unavailable or fails.
         if not snapshot.is_private:
-            if reel_data.get("is_live"):
+            reel_data = (snapshot.raw_response or {}).get("reel_data") or {}
+            has_story = bool(reel_data.get("has_public_story"))
+            is_live = bool(reel_data.get("is_live"))
+            if service is not None and account.instagram_id:
+                try:
+                    live = await service.instagram.fetch_reel_user(
+                        str(account.instagram_id)
+                    )
+                except Exception:  # pragma: no cover - network failure path
+                    live = None
+                if live is not None:
+                    has_story = bool(live.get("has_public_story"))
+                    is_live = bool(live.get("is_live"))
+            if is_live:
                 story_state = "🔴 live now"
-            elif reel_data.get("has_public_story"):
+            elif has_story:
                 story_state = "🎬 has an active story"
             else:
                 story_state = "⭕ no active story"
@@ -1592,7 +1609,8 @@ async def _handle_account(
 
     if action == "open":
         await _safe_answer(query)
-        text = await _render_account_card(username)
+        service: MonitorService = context.application.bot_data["monitor"]
+        text = await _render_account_card(username, service)
         if text is None:
             # Not monitored — still let the user grab its public story/highlights.
             await _safe_edit_text(
@@ -1623,7 +1641,7 @@ async def _handle_account(
             )
             return
         username = result.get("username", username)
-        text = await _render_account_card(username)
+        text = await _render_account_card(username, service)
         suffix = (
             "\n\n<i>Changes detected ✓</i>"
             if result.get("changed")
