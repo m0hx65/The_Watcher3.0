@@ -279,7 +279,14 @@ class InstagramClient:
         return None
 
     async def fetch_reel_user(self, user_id: str) -> Optional[dict[str, Any]]:
-        """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654)."""
+        """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654).
+
+        Retries transient blocks (401/403/429/5xx) like fetch_profile — datacenter
+        IPs (e.g. Render) get throttled on the graphql endpoint far more than
+        residential ones, and a single attempt was silently returning None, which
+        made story/live status read as "none". Logs non-200s at WARNING so the
+        failure mode is visible in production.
+        """
         if not user_id:
             return None
         headers = _build_headers()
@@ -290,27 +297,56 @@ class InstagramClient:
             "include_reel": "true",
             "include_suggested_users": "false",
             "include_logged_out_extras": "true",
-            "include_live_status": "false",
+            "include_live_status": "true",
             "include_highlight_reels": "true",
         }
-        try:
-            response = await self._session.get(
-                PROFILE_REEL_QUERY_URL,
-                params=params,
-                headers=headers,
-            )
-            if response.status_code != 200:
-                logger.debug(
-                    "Reel query for id={} returned HTTP {}",
-                    user_id,
-                    response.status_code,
+        attempts = max(1, min(self.max_retries, 4))
+        last_status = 0
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self._session.get(
+                    PROFILE_REEL_QUERY_URL,
+                    params=params,
+                    headers=headers,
+                )
+                last_status = response.status_code
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        logger.warning("Reel query id={} returned non-JSON 200", user_id)
+                        return None
+                    return _parse_reel_query_user(payload)
+                retryable = response.status_code in (401, 403, 429) or (
+                    500 <= response.status_code < 600
+                )
+                if retryable and attempt < attempts:
+                    delay = min(8.0, 1.5 * attempt + random.uniform(0.0, 1.0))
+                    logger.warning(
+                        "Reel query id={} HTTP {} (attempt {}/{}), retrying in {:.1f}s",
+                        user_id, response.status_code, attempt, attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(
+                    "Reel query id={} returned HTTP {} — giving up",
+                    user_id, response.status_code,
                 )
                 return None
-            payload = response.json()
-        except Exception as exc:
-            logger.debug("Reel query for id={} failed: {}", user_id, exc)
-            return None
-        return _parse_reel_query_user(payload)
+            except Exception as exc:
+                logger.warning(
+                    "Reel query id={} failed (attempt {}/{}): {}",
+                    user_id, attempt, attempts, exc,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(1.0 + random.uniform(0.0, 1.0))
+                    continue
+                return None
+        logger.warning(
+            "Reel query id={} failed after {} attempts (last HTTP {})",
+            user_id, attempts, last_status,
+        )
+        return None
 
     async def fetch_username_by_id(self, user_id: str) -> Optional[str]:
         """Resolve the current username for a stable Instagram numeric user ID."""

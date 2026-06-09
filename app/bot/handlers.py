@@ -417,6 +417,12 @@ async def _render_account_card(
                     )
                 except Exception:  # pragma: no cover - network failure path
                     live = None
+                logger.info(
+                    "Card live story @{} (id={}): fetched={} has_story={} is_live={} (stored had_story={})",
+                    account.username, account.instagram_id, live is not None,
+                    None if live is None else live.get("has_public_story"),
+                    None if live is None else live.get("is_live"), has_story,
+                )
                 if live is not None:
                     has_story = bool(live.get("has_public_story"))
                     is_live = bool(live.get("is_live"))
