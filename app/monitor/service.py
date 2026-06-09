@@ -24,14 +24,13 @@ from app.monitor.stories import StoriesClient
 from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
 
-# Shown when a story/highlight MEDIA download is requested but no anonymous
-# source can currently serve it. The free anonymous API this used to rely on
-# (storiesig.info) was shut down by Instagram's anti-scraping changes, and the
-# bot is intentionally login-free, so media download is unavailable for now.
-# Highlight names and story/live status still work anonymously via graphql.
+# Shown when a story/highlight MEDIA download is requested but the anonymous
+# source couldn't serve it this time (it's a third-party site that can rate-limit
+# or briefly go down). The bot stays 100% login-free, so there's no cookie to
+# fall back on. Highlight names and story/live status still work via graphql.
 _DOWNLOAD_UNAVAILABLE_MSG = (
-    "Media download is currently unavailable — the anonymous source it relied on "
-    "was shut down, and this bot stays 100% login-free. Highlight names and story "
+    "Couldn't retrieve the media right now — the anonymous source may be rate-"
+    "limited or temporarily down. Try again shortly. Highlight names and story "
     "status still work."
 )
 
@@ -712,6 +711,32 @@ class MonitorService:
                 return dict(reel_user["highlights"])
         return {}
 
+    async def _gather_highlight_items(
+        self, username: str, catalog: dict[str, str]
+    ) -> list:
+        """Download story items across every highlight reel in the catalog.
+
+        The reel ids come from Instagram's graphql query (anonymous); the media
+        itself comes from saveinsta.to per reel. Failures on individual reels are
+        swallowed so one bad reel never sinks the rest.
+        """
+        if self.stories is None or not catalog:
+            return []
+        results = await asyncio.gather(
+            *(
+                self.stories.fetch_highlight_items(username, hid, title)
+                for hid, title in catalog.items()
+            ),
+            return_exceptions=True,
+        )
+        items: list = []
+        for r in results:
+            if isinstance(r, list):
+                items.extend(r)
+            elif isinstance(r, Exception):
+                logger.debug("Highlight item fetch failed for @{}: {}", username, r)
+        return items
+
     @staticmethod
     def _diff_highlight_catalog(
         previous: dict[str, str], current: dict[str, str]
@@ -904,13 +929,15 @@ class MonitorService:
                                     delivered=delivered,
                                 )
 
-                # Try to fetch the actual story items to download (anonymous, no
-                # login). The legacy source is down, so this may yield nothing.
+                # Fetch the actual story items to download (anonymous, no login,
+                # via saveinsta.to). A dead/rate-limited source just yields [].
                 stories = await self.stories.fetch_stories(username)
                 new_stories = [s for s in stories if s.pk and s.pk not in seen_pks]
 
                 if establishing_baseline:
-                    highlight_items = await self.stories.fetch_highlights(username)
+                    highlight_items = await self._gather_highlight_items(
+                        username, catalog
+                    )
                     async with get_session() as session:
                         await crud.mark_story_items_seen(
                             session, account_id, stories + highlight_items
@@ -930,7 +957,9 @@ class MonitorService:
                         account_id, username, new_stories, seen_pks
                     )
 
-                highlight_items = await self.stories.fetch_highlights(username)
+                highlight_items = await self._gather_highlight_items(
+                    username, catalog
+                )
                 new_highlight_items = [
                     i for i in highlight_items if i.pk and i.pk not in seen_pks
                 ]
@@ -1058,9 +1087,9 @@ class MonitorService:
     async def list_highlights(self, username: str) -> dict:
         """Return the current highlight reels (id + title) for an account.
 
-        Prefers the live storiesig catalog (its ids are the ones the download
-        endpoint accepts) and refreshes the stored catalog; falls back to the
-        last stored catalog if the live fetch yields nothing.
+        Pulls the live catalog from Instagram's anonymous graphql reel query and
+        refreshes the stored catalog; falls back to the last stored catalog if
+        the live fetch yields nothing.
         Returns {"ok": bool, "items": list[(id, title)], "error": Optional[str]}.
         """
         username = username.strip().lstrip("@").lower()

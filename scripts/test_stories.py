@@ -1,4 +1,10 @@
-"""End-to-end smoke test for StoriesClient against a real public account."""
+"""End-to-end smoke test for StoriesClient against a real public account.
+
+Usage:  python scripts/test_stories.py [username]
+
+Hits the live, login-free saveinsta.to source for story/highlight media and
+Instagram's anonymous graphql reel query for the highlight catalog.
+"""
 
 from __future__ import annotations
 
@@ -16,50 +22,51 @@ os.environ.setdefault("TELEGRAM_CHAT_ID", "0")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("MEDIA_DIR", "./data/media_test")
 
+from app.monitor.instagram import InstagramClient  # noqa: E402
 from app.monitor.stories import StoriesClient  # noqa: E402
 
-USERNAME = sys.argv[1] if len(sys.argv) > 1 else "saudibox1"
+USERNAME = sys.argv[1] if len(sys.argv) > 1 else "nasa"
 
 
 async def main() -> int:
     print(f"=== Testing StoriesClient against @{USERNAME} ===\n")
     client = StoriesClient()
+    instagram = InstagramClient()
     failures = 0
 
     try:
-        # 1. Resolve user PK
-        print("[1] Resolving user PK via userInfoByUsername…")
-        pk = await client._get_user_pk(USERNAME)
-        if pk:
-            print(f"    OK -> pk = {pk}\n")
+        # 1. Resolve the highlight catalog (id -> title) via anonymous graphql.
+        print("[1] Resolving user id + highlight catalog via graphql…")
+        profile = await instagram.fetch_profile(USERNAME)
+        instagram_id = profile.parsed.get("instagram_id") if profile.parsed else None
+        catalog: dict[str, str] = {}
+        if instagram_id:
+            reel_user = await instagram.fetch_reel_user(str(instagram_id))
+            catalog = dict(reel_user.get("highlights", {})) if reel_user else {}
+            print(f"    OK -> id={instagram_id}, {len(catalog)} highlight reel(s)\n")
         else:
-            print("    FAIL: no PK returned (account may be private or API down)\n")
+            print("    FAIL: could not resolve user id (private or fetch failed)\n")
             failures += 1
 
-        # 2. Fetch active stories
+        # 2. Fetch active stories.
         print("[2] Fetching active stories…")
         stories = await client.fetch_stories(USERNAME)
         print(f"    Got {len(stories)} story item(s)")
         for s in stories[:3]:
-            print(f"      - pk={s.pk} type={s.media_type} taken_at={s.taken_at}")
+            print(f"      - pk={s.pk} type={s.media_type}")
             print(f"        url={s.url[:80]}…")
         print()
 
-        # 3. Fetch highlights (list + items per highlight)
-        print("[3] Fetching highlights (list + items)…")
-        highlights = await client.fetch_highlights(USERNAME)
-        print(f"    Got {len(highlights)} total highlight item(s)")
-        seen_titles = {h.highlight_title for h in highlights}
-        print(f"    Across {len(seen_titles)} distinct highlight reel(s):")
-        for title in list(seen_titles)[:10]:
-            count = sum(1 for h in highlights if h.highlight_title == title)
-            print(f"      - {title!r}: {count} item(s)")
-        for h in highlights[:3]:
-            print(f"      sample: pk={h.pk} type={h.media_type} title={h.highlight_title!r}")
-            print(f"              url={h.url[:80]}…")
-        print()
+        # 3. Fetch highlight items across every reel in the catalog.
+        print("[3] Fetching highlight items per reel…")
+        highlights: list = []
+        for hid, title in list(catalog.items())[:10]:
+            items = await client.fetch_highlight_items(USERNAME, hid, title)
+            print(f"      - {title!r} ({hid}): {len(items)} item(s)")
+            highlights.extend(items)
+        print(f"    Got {len(highlights)} total highlight item(s)\n")
 
-        # 4. Try downloading one story and one highlight item to verify the URL works
+        # 4. Try downloading one image and one video to verify the URL works.
         print("[4] Testing download…")
         sample_image = next(
             (s for s in stories + highlights if s.media_type == "image"), None
@@ -68,32 +75,20 @@ async def main() -> int:
             (s for s in stories + highlights if s.media_type == "video"), None
         )
 
-        if sample_image:
-            print(f"    Downloading image pk={sample_image.pk}…")
-            path = await client.download(sample_image, USERNAME)
+        for label, sample in (("image", sample_image), ("video", sample_video)):
+            if not sample:
+                print(f"    No {label} item available to test")
+                continue
+            print(f"    Downloading {label} pk={sample.pk}…")
+            path = await client.download(sample, USERNAME)
             if path and path.exists():
-                size = path.stat().st_size
-                print(f"    OK -> {path} ({size:,} bytes)")
+                print(f"    OK -> {path} ({path.stat().st_size:,} bytes)")
             else:
-                print("    FAIL: image download returned None")
+                print(f"    FAIL: {label} download returned None")
                 failures += 1
-        else:
-            print("    No image item available to test")
-
-        if sample_video:
-            print(f"    Downloading video pk={sample_video.pk}…")
-            path = await client.download(sample_video, USERNAME)
-            if path and path.exists():
-                size = path.stat().st_size
-                print(f"    OK -> {path} ({size:,} bytes)")
-            else:
-                print("    FAIL: video download returned None")
-                failures += 1
-        else:
-            print("    No video item available to test")
         print()
 
-        # 5. PK-based deduplication sanity check (re-fetch returns same PKs)
+        # 5. PK-based deduplication sanity check (re-fetch returns same PKs).
         print("[5] Re-fetching stories — PKs should be stable (dedup key)…")
         stories2 = await client.fetch_stories(USERNAME)
         pks_a = {s.pk for s in stories}
@@ -108,6 +103,7 @@ async def main() -> int:
 
     finally:
         await client.close()
+        await instagram.close()
 
     print()
     if failures == 0:

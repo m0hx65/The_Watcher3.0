@@ -1,7 +1,32 @@
-"""Instagram stories and highlights downloader via storiesig.info API."""
+"""Login-free Instagram story & highlight media downloader (saveinsta.to).
+
+The bot is intentionally 100% anonymous — no Instagram login, cookie, or session.
+Instagram's own endpoints return `login_required` for story media, and the old
+storiesig.info proxy this used to rely on was shut down. saveinsta.to is a
+third-party anonymous downloader (it runs its own session server-side, we never
+log in) that still serves public story/highlight media, so we drive its public
+token flow the same way its web UI does:
+
+    1. GET  https://saveinsta.to/en/highlights        -> page carries k_exp / k_token
+    2. POST https://saveinsta.to/api/userverify        -> issues a per-request cftoken
+    3. POST https://saveinsta.to/api/ajaxSearch         -> returns media HTML for the URL
+
+The HTML lists each item as a <li> with a dl.snapcdn.app download link (whose JWT
+encodes the real scontent.cdninstagram.com URL). curl_cffi's Chrome TLS
+impersonation is required — a plain Python TLS stack gets blocked.
+
+Like any third-party source this can break or rate-limit; every method degrades
+gracefully (returns [] / None) so a dead source never breaks the sweep, and the
+graphql story/live status + highlight-name detection stays the reliable signal.
+"""
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,28 +36,44 @@ from curl_cffi.requests import AsyncSession
 from app.config import settings
 from app.utils.logger import logger
 
-_API = "https://api-ig.storiesig.info/api"
+_BASE = "https://saveinsta.to"
+_TOKEN_PAGE = f"{_BASE}/en/highlights"
+_VERIFY_URL = f"{_BASE}/api/userverify"
+_SEARCH_URL = f"{_BASE}/api/ajaxSearch"
+_DL_HOST = "https://dl.snapcdn.app"
 _CHROME = "chrome120"
+
+# Page carries `k_exp = "..."` / `k_token = "..."` inline; ajaxSearch needs both.
+_K_EXP_RE = re.compile(r'k_exp\s*=\s*"([^"]+)"')
+_K_TOKEN_RE = re.compile(r'k_token\s*=\s*"([^"]+)"')
+# Each media item is one <li>…</li>; the video/image icon class tells the type.
+_LI_RE = re.compile(r"<li\b.*?</li>", re.S)
+_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*href="(https://dl\.snapcdn\.app[^"]+)"[^>]*title="([^"]*)"', re.S
+)
+_FALLBACK_DL_RE = re.compile(r'href="(https://dl\.snapcdn\.app[^"]+)"')
+# scontent filenames embed a stable numeric media id: /<mediaid>_<ownerid>_…
+_MEDIA_ID_RE = re.compile(r"/(\d{6,})_\d{6,}_")
 
 
 @dataclass
 class StoryItem:
     pk: str
-    taken_at: int           # unix timestamp
+    taken_at: int           # unix timestamp (0 when the source omits it)
     media_type: str         # "image" or "video"
-    url: str
+    url: str                # dl.snapcdn.app download link
     source: str             # "story" or "highlight"
     highlight_id: Optional[str] = None
     highlight_title: Optional[str] = None
 
 
 class StoriesClient:
-    """Async client wrapping the storiesig.info public API."""
+    """Async client wrapping the saveinsta.to anonymous downloader."""
 
     def __init__(self) -> None:
         kwargs: dict = {
             "impersonate": _CHROME,
-            "timeout": 30,
+            "timeout": 60,
             "allow_redirects": True,
         }
         if settings.proxy:
@@ -42,78 +83,29 @@ class StoriesClient:
     async def close(self) -> None:
         await self._session.close()
 
+    # ---------------------------------------------------------------- public
+
     async def fetch_stories(self, username: str) -> list[StoryItem]:
-        """Return all active story items for a public account."""
-        url = f"{_API}/story?url=https://www.instagram.com/stories/{username}"
-        try:
-            resp = await self._session.get(url)
-            if resp.status_code != 200:
-                logger.debug("Stories API {} for @{}", resp.status_code, username)
-                return []
-            return self._parse_content(resp.json(), source="story")
-        except Exception as exc:
-            logger.warning("Failed to fetch stories for @{}: {}", username, exc)
-            return []
+        """Return all active story items for a public account (login-free)."""
+        url = f"https://www.instagram.com/stories/{username}/"
+        data = await self._fetch_media_html(url)
+        return self._parse_items(data, source="story")
 
-    async def fetch_highlight_catalog(self, username: str) -> dict[str, str]:
-        """Return highlight reel id -> title without downloading every item."""
-        pk = await self._get_user_pk(username)
-        if not pk:
-            return {}
-        try:
-            resp = await self._session.get(f"{_API}/highlights/{pk}")
-            if resp.status_code != 200:
-                return {}
-            highlights = resp.json().get("result", [])
-        except Exception as exc:
-            logger.warning("Failed to fetch highlight catalog for @{}: {}", username, exc)
-            return {}
-        catalog: dict[str, str] = {}
-        for h in highlights:
-            hid = h.get("id")
-            if hid:
-                catalog[str(hid)] = str(h.get("title") or "")
-        return catalog
+    async def fetch_highlight_items(
+        self, username: str, highlight_id: str, title: str
+    ) -> list[StoryItem]:
+        """Return the story items for one highlight reel (login-free).
 
-    async def fetch_highlight_items(self, username: str, highlight_id: str, title: str) -> list[StoryItem]:
-        """Download story items for one highlight reel."""
-        items: list[StoryItem] = []
-        try:
-            resp = await self._session.get(f"{_API}/highlightStories/{highlight_id}")
-            if resp.status_code != 200:
-                return items
-            for item in self._parse_content(resp.json(), source="highlight"):
-                item.highlight_id = highlight_id
-                item.highlight_title = title
-                items.append(item)
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch highlight {} for @{}: {}", highlight_id, username, exc
-            )
-        return items
-
-    async def fetch_highlights(self, username: str) -> list[StoryItem]:
-        """Return all story items across every highlight reel for a public account."""
-        pk = await self._get_user_pk(username)
-        if not pk:
-            return []
-
-        try:
-            resp = await self._session.get(f"{_API}/highlights/{pk}")
-            if resp.status_code != 200:
-                return []
-            highlights = resp.json().get("result", [])
-        except Exception as exc:
-            logger.warning("Failed to fetch highlight list for @{}: {}", username, exc)
-            return []
-
-        items: list[StoryItem] = []
-        for h in highlights:
-            hid = str(h.get("id", ""))
-            title = str(h.get("title") or "")
-            if not hid:
-                continue
-            items.extend(await self.fetch_highlight_items(username, hid, title))
+        `highlight_id` is the numeric id from Instagram's graphql reel query; the
+        saveinsta endpoint expects it as /stories/highlights/<id>/.
+        """
+        numeric = str(highlight_id).split(":")[-1]
+        url = f"https://www.instagram.com/stories/highlights/{numeric}/"
+        data = await self._fetch_media_html(url)
+        items = self._parse_items(data, source="highlight")
+        for item in items:
+            item.highlight_id = highlight_id
+            item.highlight_title = title
         return items
 
     async def download(self, item: StoryItem, username: str) -> Optional[Path]:
@@ -143,37 +135,146 @@ class StoriesClient:
             return None
 
     async def resolve_user_id(self, username: str) -> Optional[str]:
-        """Return Instagram numeric user id (pk) for a username, if the account is public."""
-        return await self._get_user_pk(username)
+        """Deprecated PK lookup. saveinsta works off URLs, not numeric ids, and
+        the old storiesig PK API is gone, so this always returns None. The id
+        backfill path falls back to web_profile_info, which is the reliable
+        anonymous source for the numeric id."""
+        return None
 
-    async def _get_user_pk(self, username: str) -> Optional[str]:
+    # --------------------------------------------------------------- internal
+
+    async def _fetch_media_html(self, target_url: str) -> str:
+        """Run the saveinsta token flow for an Instagram URL; return media HTML.
+
+        Returns "" on any failure so callers degrade to an empty result set.
+        """
         try:
-            resp = await self._session.get(f"{_API}/userInfoByUsername/{username}")
-            if resp.status_code != 200:
-                return None
-            return resp.json().get("result", {}).get("user", {}).get("pk")
-        except Exception as exc:
-            logger.warning("Failed to get PK for @{}: {}", username, exc)
-            return None
+            page = await self._session.get(_TOKEN_PAGE)
+            if page.status_code != 200:
+                logger.debug("saveinsta token page HTTP {}", page.status_code)
+                return ""
+            k_exp_match = _K_EXP_RE.search(page.text)
+            k_token_match = _K_TOKEN_RE.search(page.text)
+            if not k_exp_match or not k_token_match:
+                logger.debug("saveinsta token block not found")
+                return ""
+            k_exp, k_token = k_exp_match.group(1), k_token_match.group(1)
 
-    def _parse_content(self, data: dict, *, source: str) -> list[StoryItem]:
+            verify = await self._session.post(
+                _VERIFY_URL,
+                data={"url": target_url},
+                headers={
+                    "Origin": _BASE,
+                    "Referer": f"{_BASE}/en/video",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            cftoken = ""
+            if verify.status_code == 200:
+                try:
+                    cftoken = verify.json().get("token", "") or ""
+                except Exception:
+                    cftoken = ""
+
+            search = await self._session.post(
+                _SEARCH_URL,
+                data={
+                    "k_exp": k_exp,
+                    "k_token": k_token,
+                    "q": target_url,
+                    "t": "media",
+                    "lang": "en",
+                    "v": "v2",
+                    "cftoken": cftoken,
+                },
+                headers={
+                    "Origin": _BASE,
+                    "Referer": _TOKEN_PAGE,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            if search.status_code != 200:
+                logger.debug("saveinsta ajaxSearch HTTP {}", search.status_code)
+                return ""
+            payload = search.json()
+            if payload.get("status") != "ok":
+                logger.debug("saveinsta ajaxSearch status={}", payload.get("status"))
+                return ""
+            return payload.get("data", "") or ""
+        except Exception as exc:
+            logger.warning("saveinsta fetch failed for {}: {}", target_url, exc)
+            return ""
+
+    def _parse_items(self, data: str, *, source: str) -> list[StoryItem]:
+        """Parse the media HTML into StoryItems, de-duplicated by media id."""
         items: list[StoryItem] = []
-        for raw in data.get("result", []):
-            pk = str(raw.get("pk", ""))
-            if not pk:
+        seen: set[str] = set()
+        if not data:
+            return items
+        for li in _LI_RE.findall(data):
+            is_video = "icon-dlvideo" in li
+            href = self._pick_download_href(li, is_video)
+            if not href:
                 continue
-            taken_at = int(raw.get("taken_at", 0))
-            videos = raw.get("video_versions", [])
-            if videos:
-                items.append(StoryItem(
-                    pk=pk, taken_at=taken_at, media_type="video",
-                    url=videos[0].get("url", ""), source=source,
-                ))
-            else:
-                candidates = raw.get("image_versions2", {}).get("candidates", [])
-                if candidates:
-                    items.append(StoryItem(
-                        pk=pk, taken_at=taken_at, media_type="image",
-                        url=candidates[0].get("url", ""), source=source,
-                    ))
+            href = href.replace("&amp;", "&")
+            cdn_url = self._decode_jwt_url(href)
+            pk = self._derive_pk(cdn_url, href)
+            if pk in seen:
+                continue
+            seen.add(pk)
+            items.append(
+                StoryItem(
+                    pk=pk,
+                    taken_at=0,
+                    media_type="video" if is_video else "image",
+                    url=href,
+                    source=source,
+                )
+            )
         return items
+
+    @staticmethod
+    def _pick_download_href(li: str, is_video: bool) -> Optional[str]:
+        """Choose the right download link inside a <li>.
+
+        Video items expose two links — "Download Thumbnail" (poster) and
+        "Download Video" (the mp4); pick the video. Image items have a single
+        download link. Falls back to the last dl.snapcdn link found.
+        """
+        anchors = _ANCHOR_RE.findall(li)
+        if is_video:
+            for url, title in anchors:
+                if "video" in title.lower():
+                    return url
+        else:
+            for url, title in anchors:
+                if "thumbnail" not in title.lower():
+                    return url
+        all_links = _FALLBACK_DL_RE.findall(li)
+        return all_links[-1] if all_links else None
+
+    @staticmethod
+    def _decode_jwt_url(href: str) -> Optional[str]:
+        """Decode the embedded JWT in a snapcdn link to the real cdn URL."""
+        token = href.split("token=")[-1]
+        for part in token.split("."):
+            padded = part + "=" * (-len(part) % 4)
+            try:
+                decoded = json.loads(base64.urlsafe_b64decode(padded))
+            except (binascii.Error, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(decoded, dict) and decoded.get("url"):
+                return str(decoded["url"])
+        return None
+
+    @staticmethod
+    def _derive_pk(cdn_url: Optional[str], href: str) -> str:
+        """Stable per-item id for dedup: the numeric media id when present,
+        otherwise a hash of the media path (query strings carry volatile signing
+        params, so they're stripped first)."""
+        base = cdn_url or href
+        path = base.split("?", 1)[0]
+        media_id = _MEDIA_ID_RE.search(path)
+        if media_id:
+            return media_id.group(1)
+        return hashlib.sha1(path.encode("utf-8")).hexdigest()[:24]
