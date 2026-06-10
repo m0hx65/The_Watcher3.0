@@ -4,7 +4,7 @@
 
 ### Instagram monitoring, delivered to your Telegram. 100% login-free.
 
-Track any public Instagram account — followers, bio, profile picture, stories, posts, reels — and get every change **plus the actual media** dropped straight into your chat. No Instagram account. No cookies. Nothing that can get banned.
+Track any Instagram account — **public or private** — followers, bio, profile picture, stories, posts, reels — and get every change **plus the actual media** dropped straight into your chat. No Instagram account. No cookies. Nothing that can get banned.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -26,6 +26,7 @@ Track any public Instagram account — followers, bio, profile picture, stories,
 ## Why The Watcher?
 
 - 🕵️ **Truly anonymous.** Works with zero Instagram credentials — no account, no session cookie, no device fingerprint tied to you. There is nothing for Instagram to ban.
+- 🔒 **Private accounts too.** Follower/following/post counts, bio, name, username, profile picture, and privacy flips are tracked even for private accounts — anonymously. (Media delivery applies to public accounts; private content is never accessed.)
 - 🎬 **It doesn't just notify — it delivers.** New stories, posts, reels, highlights, and profile pictures arrive in your chat as actual photos and videos, not links.
 - 📲 **Telegram is the entire UI.** Add targets, pause them, pull stories, tune the schedule, export history — all through inline buttons. You never touch a terminal after deploy.
 - ☁️ **Datacenter-proof.** Instagram blocks its GraphQL endpoints from cloud IPs; The Watcher detects the block, fast-fails, and reroutes through an anonymous downloader so everything keeps working on Render, Fly, or any VPS.
@@ -77,6 +78,7 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 
 ### Change Detection
 - Tracks 10+ profile fields: followers, following, posts, reels, highlights, biography, full name, username, external link, verification badge, business flag, public/private status
+- **Works on private accounts** — all profile-level fields above are tracked for private targets, including an alert the moment an account goes private or public
 - Profile-picture change detection — every avatar is SHA-256 hashed and archived to disk
 - Story & live status surfaced on every sweep and live-checked when you open an account card
 - Highlight catalog tracking — detects added, renamed, and removed highlights by name
@@ -365,7 +367,7 @@ requirements.txt
 
 ## ⚖️ Responsible Use
 
-- The Watcher reads only **public** data through undocumented, rate-limited endpoints.
+- The Watcher reads only what Instagram serves **anonymously** through undocumented, rate-limited endpoints. For private accounts that means profile metadata only — private stories, posts, and media are never accessed.
 - Only monitor accounts you have a legitimate reason to track: your own accounts, brand assets, or authorized OSINT research.
 - Increase `CHECK_INTERVAL` and reduce `MAX_CONCURRENT_FETCHES` for large target lists.
 - 401/403/429 responses are surfaced to you (debounced), so you know immediately if you're being throttled.
