@@ -1,4 +1,10 @@
-# The Watcher
+<div align="center">
+
+# 👁 The Watcher
+
+### Instagram monitoring, delivered to your Telegram. 100% login-free.
+
+Track any public Instagram account — followers, bio, profile picture, stories, posts, reels — and get every change **plus the actual media** dropped straight into your chat. No Instagram account. No cookies. Nothing that can get banned.
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -7,86 +13,108 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat&logo=docker&logoColor=white)](Dockerfile)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat)](LICENSE)
 
-**Instagram profile intelligence platform operated entirely through Telegram.**
+[Quick Start](#-quick-start-local) · [Features](#-features) · [Deploy to Render](#-deploy-to-render) · [Commands](#-telegram-commands--menus) · [HTTP API](#-http-api)
 
-Track public accounts in real time — followers, bios, profile pictures, verification status, and 10+ more fields. Get instant Telegram notifications the moment anything changes. Deploy to Render in under five minutes.
+<img src="docs/assets/account-card.svg" width="420" alt="The Watcher — live account card inside Telegram, with story status, highlights, and one-tap actions" />
+
+<sub>*An account card, live in Telegram. Every feature is one tap away.*</sub>
+
+</div>
+
+---
+
+## Why The Watcher?
+
+- 🕵️ **Truly anonymous.** Works with zero Instagram credentials — no account, no session cookie, no device fingerprint tied to you. There is nothing for Instagram to ban.
+- 🎬 **It doesn't just notify — it delivers.** New stories, posts, reels, highlights, and profile pictures arrive in your chat as actual photos and videos, not links.
+- 📲 **Telegram is the entire UI.** Add targets, pause them, pull stories, tune the schedule, export history — all through inline buttons. You never touch a terminal after deploy.
+- ☁️ **Datacenter-proof.** Instagram blocks its GraphQL endpoints from cloud IPs; The Watcher detects the block, fast-fails, and reroutes through an anonymous downloader so everything keeps working on Render, Fly, or any VPS.
+- 📦 **One container, five minutes.** A single Docker image with a `render.yaml` blueprint — database, persistent disk, and webhook included.
+
+---
+
+## ✨ Recently Shipped
+
+| | |
+|---|---|
+| 🖼 **Post & reel auto-delivery** | Every sweep detects new posts/reels and sends the actual media to your chat — capped at 5 per sweep so a posting spree never floods you. First sweep baselines silently (no backlog dump). |
+| ⏸ **Pause / resume targets** | Freeze monitoring with one tap or `/pause` — history, snapshots, and the resolved Instagram ID are all preserved. Resume picks up exactly where it left off. |
+| 🔎 **Any public account, on demand** | `/story @user` and `/highlights @user` grab media from **any** public account — no need to monitor it. Also available as the **🔎 Any user** menu button. |
+| ⬇️ **Download-all highlights** | One button fetches every highlight of an account, full quality. |
+| 🔴 **Live & story status** | The account card shows `🔴 live now` / `🎬 has an active story` in real time — checked at the moment you open the card, not at the last sweep. |
+| 🖼 **Max-quality profile pictures** | Full-resolution avatars instead of the 320 px anonymous ceiling, with automatic fallback for accounts the high-res path can't reach. |
+| ⚡ **Faster everywhere** | Downloader tokens are cached, blocked endpoints fast-fail instead of timing out, and account cards render instantly. |
 
 ---
 
 ## How It Works
 
-The Watcher runs as a single Docker container. It connects to your Telegram bot, schedules sweeps across a list of Instagram usernames, and fires a message to your chat whenever a profile changes. Everything — adding accounts, viewing history, exporting data — is done through Telegram commands or inline menus.
+The Watcher runs as a single container. It connects to your Telegram bot, sweeps a list of Instagram targets on a schedule, diffs each profile against its last snapshot, and pushes changes — with media — to your chat.
 
 ```
-Telegram Chat ──► Bot Commands ──► FastAPI + APScheduler
-                                          │
-                                   ┌──────▼──────┐
-                                   │  Instagram  │  HTTP/2 · TLS fingerprint impersonation
-                                   └──────┬──────┘
-                                          │ profile data
-                                   ┌──────▼──────┐
-                                   │  PostgreSQL │  snapshots · diffs · media hashes
-                                   └──────┬──────┘
-                                          │ change detected
-                                   ┌──────▼──────┐
-                                   │  Telegram   │  formatted alert + panel bump
-                                   └─────────────┘
+ Telegram chat ──► commands & inline menus ──► FastAPI + APScheduler
+                                                      │  sweep
+                                 ┌────────────────────┴────────────────────┐
+                                 ▼                                         ▼
+                       Instagram web API                    Anonymous media downloader
+                  HTTP/2 · Chrome TLS fingerprint           stories · highlights · posts
+                  (profile fields, counts, status)          reels · full-res avatars
+                                 └────────────────────┬────────────────────┘
+                                                      ▼
+                                                 PostgreSQL
+                                    snapshots · diffs · media hashes · dedup
+                                                      │  change detected
+                                                      ▼
+                                                  Telegram
+                                       formatted alert + photos/videos
 ```
+
+Two independent data paths mean one being blocked never takes the bot down: profile data comes from Instagram's web API behind a Chrome TLS fingerprint (`curl_cffi`), while story/post/reel **media** flows through a login-free third-party downloader that cloud IP blocks don't touch.
 
 ---
 
-## Features
+## 🚀 Features
 
-**Monitoring**
+### Change Detection
 - Tracks 10+ profile fields: followers, following, posts, reels, highlights, biography, full name, username, external link, verification badge, business flag, public/private status
-- Profile picture change detection — SHA-256 hashes each downloaded image and stores it to disk for later retrieval
-- Story and highlight monitoring — fetches new story and highlight items each sweep, downloads them, and sends photos/videos directly to Telegram with deduplication so each item is delivered exactly once
-- Sweep-complete notification — fires a summary message after every scheduled sweep so you always know the bot is alive and working
-- Configurable sweep interval with per-check jitter to avoid synchronized request bursts
-- Throttled concurrency — configurable max parallel fetches per sweep
+- Profile-picture change detection — every avatar is SHA-256 hashed and archived to disk
+- Story & live status surfaced on every sweep and live-checked when you open an account card
+- Highlight catalog tracking — detects added, renamed, and removed highlights by name
+- Sweep-complete summary after every run, so you always know the bot is alive
 
-**Telegram Interface**
-- Full command set: `/menu`, `/add`, `/remove` (alias `/rm`), `/list`, `/recheck`, `/interval`, `/status`, `/history`, `/photo`, `/fetchphoto`, `/export`, `/help`
-- Inline keyboard menus — every feature is reachable through buttons, no commands required
-  - **Main menu**: Accounts · Status · Add · Interval · Export · Help · **Sweep All**
-  - **Account card**: per-account Recheck · History · Photo · Remove
-  - **Interval picker**: six presets (5 m / 15 m / 30 m / 1 h / 2 h / 6 h) plus free-form custom entry
-  - **Status view**: live stats with a **Sweep Now** button to trigger an immediate sweep
-- Panel bumping — after each notification the main menu re-posts at the bottom of the chat so it stays accessible
-- Authorization via `TELEGRAM_ADMIN_IDS`; leave empty to allow all users
+### Media Delivery
+- **New posts & reels** auto-downloaded and sent as photos/videos the sweep they appear
+- **Stories** fetched and delivered with per-item deduplication — each story is sent exactly once
+- **Highlights** listed by name with per-highlight download buttons and a download-all option
+- **Profile pictures** in maximum available resolution, on demand via `/fetchphoto`
+- All media retrieval is **login-free** — no Instagram session is ever used
 
-**Reliability**
-- Chrome TLS fingerprint impersonation via `curl_cffi` to bypass 401/403 blocks
-- Tenacity retry with exponential backoff on transient failures
-- Debounced failure notifications — surfaces 401/403/429 errors without spamming on every retry
-- Consecutive failure counter per account surfaced in `/status` and `/list`
+### On-Demand Lookups
+- `/story @user` and `/highlights @user` work on **any public account**, monitored or not
+- **🔎 Any user** menu button does the same with zero typing
 
-**Data & API**
-- PostgreSQL persistence: snapshots, media hashes, notification logs, runtime settings
-- Configurable retention windows for snapshots, notifications, and raw API responses
+### Target Management
+- Add targets by `@username`, full profile URL, or raw numeric Instagram ID
+- Pause/resume per target — paused accounts keep their entire history and resolved Instagram ID
+- Paginated account list with live 🟢 / ⏸ state markers
+- Per-target forced recheck, change history, and stored-photo retrieval
+
+### Reliability
+- Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls
+- Fast-fail detection of IP-blocked GraphQL endpoints with automatic fallback routing
+- Cached downloader tokens — the three-step token handshake runs once, not per request
+- Tenacity retries with exponential backoff; debounced failure alerts (no 429 spam)
+- Consecutive-failure counter per target, visible in `/status` and `/list`
+
+### Data & API
+- PostgreSQL persistence: snapshots, media hashes, notification log, seen-item dedup, runtime settings
+- Configurable retention windows + a **Clear Old Data** button right in the bot
 - HTTP API with liveness/readiness probes and a cron-compatible `/sweep` endpoint
-- Token-gated mutation endpoints
-- CSV export of full notification history
+- Token-gated mutation endpoints; CSV export of the full notification history
 
 ---
 
-## Table of Contents
-
-- [Quick Start](#quick-start-local)
-- [Docker](#docker)
-- [Deploy to Render](#deploy-to-render)
-- [Configuration](#configuration)
-- [Telegram Commands](#telegram-commands)
-- [HTTP API](#http-api)
-- [Data Model](#data-model)
-- [Project Layout](#project-layout)
-- [Tech Stack](#tech-stack)
-- [Responsible Use](#responsible-use)
-- [License](#license)
-
----
-
-## Quick Start (Local)
+## 🏁 Quick Start (Local)
 
 **Prerequisites:** Python 3.12+, a PostgreSQL instance (local or remote)
 
@@ -108,11 +136,11 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-The bot starts in long-polling mode (no public URL required). Send `/add <username>` to your bot to start monitoring.
+The bot starts in long-polling mode (no public URL required). Send `/add <username>` to your bot and you're monitoring.
 
 ---
 
-## Docker
+## 🐳 Docker
 
 ```bash
 docker build -t the-watcher .
@@ -126,21 +154,21 @@ docker run -d \
   the-watcher
 ```
 
-The container exposes a `/health` endpoint and includes a built-in `HEALTHCHECK`.
+The container exposes `/health` and ships a built-in `HEALTHCHECK`.
 
 ---
 
-## Deploy to Render
+## ☁️ Deploy to Render
 
 The `render.yaml` blueprint provisions everything automatically.
 
-1. Fork this repository and push it to GitHub.
+1. Fork this repository.
 2. In Render: **New +** → **Blueprint** → select your fork.
 3. Render provisions:
    - A Docker web service
    - A managed PostgreSQL 16 database
    - A 1 GB persistent disk at `/app/data` for stored profile pictures
-4. Set the three required secrets in the Render dashboard:
+4. Set the secrets in the Render dashboard:
 
    | Variable | Value |
    |---|---|
@@ -150,11 +178,11 @@ The `render.yaml` blueprint provisions everything automatically.
 
    `DATABASE_URL` and `WEB_API_TOKEN` are auto-generated by Render.
 
-5. Click **Deploy**. The service registers a Telegram webhook using its public URL and begins sweeping immediately.
+5. Click **Deploy**. The service registers a Telegram webhook on its public URL and starts sweeping immediately — Instagram's cloud-IP blocks are handled automatically by the fallback media path.
 
 ### Optional: External Cron Trigger
 
-Render's free tier may suspend the web service between requests. Use a Render Cron Job or any external scheduler to keep sweeps firing reliably:
+Render's free tier may suspend the service between requests. Use a Render Cron Job or any external scheduler to keep sweeps firing:
 
 ```bash
 curl -fsS -X POST https://<your-service>.onrender.com/sweep \
@@ -163,9 +191,9 @@ curl -fsS -X POST https://<your-service>.onrender.com/sweep \
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
-All settings are read from environment variables. Copy `.env.example` to `.env` for local development.
+All settings come from environment variables. Copy `.env.example` to `.env` for local development.
 
 ### Required
 
@@ -180,7 +208,7 @@ All settings are read from environment variables. Copy `.env.example` to `.env` 
 | Variable | Default | Description |
 |---|---|---|
 | `TELEGRAM_ADMIN_IDS` | _(empty)_ | Comma-separated user IDs allowed to use the bot. Empty = allow all |
-| `TELEGRAM_WEBHOOK_URL` | _(empty)_ | Public base URL for webhook registration. Automatically inferred from `RENDER_EXTERNAL_URL` on Render |
+| `TELEGRAM_WEBHOOK_URL` | _(empty)_ | Public base URL for webhook registration. Auto-inferred from `RENDER_EXTERNAL_URL` on Render |
 | `TELEGRAM_WEBHOOK_SECRET` | _(empty)_ | Optional secret validated against Telegram's `X-Telegram-Bot-Api-Secret-Token` header |
 | `TELEGRAM_WEBHOOK_PATH` | `/telegram/webhook` | Webhook path registered with Telegram and mounted by FastAPI |
 
@@ -206,7 +234,7 @@ All settings are read from environment variables. Copy `.env.example` to `.env` 
 
 | Variable | Default | Description |
 |---|---|---|
-| `IG_SESSION_COOKIE` | _(empty)_ | Optional Instagram `sessionid` cookie value for authenticated requests |
+| `IG_SESSION_COOKIE` | _(empty)_ | **Optional** — full cookie string from a logged-in browser session. The bot is fully functional without it; login-free is the default and recommended mode |
 | `IG_PROXY_URL` | _(empty)_ | Optional proxy URL used specifically for Instagram requests |
 
 ### Proxy & Network
@@ -226,70 +254,83 @@ All settings are read from environment variables. Copy `.env.example` to `.env` 
 
 ---
 
-## Telegram Commands
+## 💬 Telegram Commands & Menus
 
 | Command | Description |
 |---|---|
 | `/menu` | Open the main inline menu |
-| `/add <username>` | Start monitoring an account; runs an immediate baseline fetch |
-| `/remove <username>` | Stop monitoring and delete all stored history (`/rm` is an alias) |
-| `/list` | Show all monitored accounts with last-check status and failure count |
-| `/recheck <username>` | Force an immediate check outside the normal schedule |
-| `/interval [value]` | Show or set the sweep interval — e.g. `30m`, `1h`, `1800s`. No argument shows current setting and presets |
-| `/status` | Global stats: account count, last sweep time, next scheduled sweep |
-| `/history <username>` | Last 15 detected changes for an account |
-| `/photo <username>` | Latest stored profile picture and its SHA-256 hash |
-| `/fetchphoto <username>` | Download the current live profile picture on demand — works for any public account, even ones not in the monitoring list |
-| `/export` | Download full notification history as a CSV file |
+| `/add <target>` | Start monitoring — accepts `@username`, `https://instagram.com/username`, or a numeric Instagram ID. Runs an immediate baseline fetch |
+| `/remove <user>` | Stop monitoring and delete all stored history (`/rm` is an alias) |
+| `/pause <user>` | Pause monitoring — the target and its full history stay in the database |
+| `/resume <user>` | Resume a paused target exactly where it left off |
+| `/list` | All monitored accounts with 🟢 / ⏸ state, last-check status, and failure count |
+| `/recheck <user>` | Force an immediate check outside the schedule |
+| `/interval [value]` | Show or set the sweep interval — `30m`, `1h`, `1800s`, `1h30m`. No argument shows presets |
+| `/status` | Global stats: accounts, last sweep, next scheduled sweep |
+| `/history <user>` | Recent detected changes for a target |
+| `/photo <user>` | Latest stored profile picture and its SHA-256 hash |
+| `/fetchphoto <user>` | Download the current profile picture in max quality — works for any public account |
+| `/story <user>` | Download any public user's **current story** — no monitoring required |
+| `/highlights <user>` | List any public user's highlights with per-item download buttons |
+| `/export` | Full notification history as CSV |
 | `/help` | Command reference |
+
+**Everything is also reachable through buttons** — no commands required:
+
+- **Main menu** — Accounts · Status · Add · Interval · Export · Help · **🔎 Any user** · **Sweep All**
+- **Account card** — Recheck · History · Photo · Remove · **Story** · **Highlights** · **Pause ⇄ Resume**
+- **Highlights view** — ⬇️ Download all (n) plus one download button per highlight
+- **Status view** — Sweep Now · Interval · **Clear Old Data** (with confirmation)
+- **Interval picker** — presets from 5 m to 6 h plus free-form custom entry
+- **Panel bumping** — after every notification the menu re-posts at the bottom of the chat, so it's always within thumb's reach
 
 ---
 
-## HTTP API
+## 🔌 HTTP API
 
 All responses are JSON. Mutation endpoints require `X-API-Token` when `WEB_API_TOKEN` is configured.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/health` | None | Liveness probe — returns `{"status":"ok"}` |
+| `GET`/`HEAD` | `/health` | None | Liveness probe — returns `{"status":"ok"}` |
 | `GET` | `/ready` | None | Readiness probe — checks monitor and scheduler state |
 | `GET` | `/status` | None | Stats: account counts, last sweep time, scheduler info |
 | `GET` | `/accounts` | None | List all monitored accounts |
 | `POST` | `/accounts/{username}/recheck` | Token | Force an immediate check for one account |
 | `POST` | `/sweep` | Token | Trigger a full sweep across all active accounts |
 
-**Example — trigger a sweep:**
-
 ```bash
-curl -X POST https://<host>/sweep \
-  -H "X-API-Token: your-token"
+curl -X POST https://<host>/sweep -H "X-API-Token: your-token"
 ```
 
 ---
 
-## Data Model
+## 🗄 Data Model
 
 Tables are created automatically on first boot via SQLAlchemy `create_all`.
 
 | Table | Description |
 |---|---|
-| `monitored_accounts` | One row per target account. Tracks active flag, last HTTP status, consecutive failure count |
-| `account_snapshots` | One row per fetch. Stores all parsed profile fields, raw JSON response, and HTTP status |
-| `profile_media_hashes` | One row per unique profile picture (SHA-256 + local disk path). Deduplicates across accounts |
-| `notification_logs` | One row per dispatched change event, including change type, payload, and delivery status |
-| `seen_stories` | One row per delivered story or highlight item. Deduplicates by `(account_id, story_pk)` so each item is sent exactly once |
-| `app_settings` | Key-value store for runtime-tunable config (check interval, panel message IDs) persisted across restarts |
+| `monitored_accounts` | One row per target: username, resolved Instagram ID, active/paused flag, last status, failure count |
+| `account_snapshots` | One row per fetch: all parsed profile fields, raw JSON response, HTTP status |
+| `profile_media_hashes` | One row per unique profile picture (SHA-256 + disk path), deduplicated across accounts |
+| `notification_logs` | One row per dispatched change event: type, payload, delivery status |
+| `seen_stories` | Delivery dedup for stories, highlight items, **and posts/reels** — each media item is sent exactly once |
+| `stored_highlights` | Per-account highlight catalog (id + title) used to detect added/renamed/removed highlights |
+| `app_settings` | Key-value store for runtime-tunable config persisted across restarts |
+
+Pausing a target never deletes anything — the row, its Instagram ID, and all history survive until you explicitly `/remove`.
 
 ---
 
-## Project Layout
+## 📁 Project Layout
 
 ```
 app/
 ├── api/            HTTP API routes (FastAPI router)
 ├── bot/            Telegram command handlers, inline menus, notification dispatch
 ├── database/       SQLAlchemy models, async session, CRUD helpers
-├── monitor/        Instagram client, media hasher, change detector, sweep orchestrator
+├── monitor/        Instagram client, anonymous media downloader, change detector, sweep orchestrator
 ├── utils/          Logging setup, user-agent rotation, formatting helpers
 ├── workers/        APScheduler-based sweep worker
 ├── config.py       Pydantic Settings — environment-driven configuration
@@ -303,13 +344,14 @@ requirements.txt
 
 ---
 
-## Tech Stack
+## 🧰 Tech Stack
 
 | Component | Library | Version |
 |---|---|---|
 | Web framework | FastAPI | 0.115 |
 | ASGI server | Uvicorn | 0.32 |
 | Instagram client | curl_cffi | 0.15 |
+| HTTP client | httpx (HTTP/2) | 0.28 |
 | Telegram | python-telegram-bot | 21.9 |
 | Task scheduler | APScheduler | 3.10 |
 | ORM | SQLAlchemy (async) | 2.0 |
@@ -321,15 +363,19 @@ requirements.txt
 
 ---
 
-## Responsible Use
+## ⚖️ Responsible Use
 
-- The Instagram endpoint used (`/api/v1/users/web_profile_info/`) is undocumented and rate-limited.
+- The Watcher reads only **public** data through undocumented, rate-limited endpoints.
 - Only monitor accounts you have a legitimate reason to track: your own accounts, brand assets, or authorized OSINT research.
-- Increase `CHECK_INTERVAL` and reduce `MAX_CONCURRENT_FETCHES` for large account lists.
-- The bot surfaces 401, 403, and 429 responses to the operator with debouncing so you know immediately if you are being throttled.
+- Increase `CHECK_INTERVAL` and reduce `MAX_CONCURRENT_FETCHES` for large target lists.
+- 401/403/429 responses are surfaced to you (debounced), so you know immediately if you're being throttled.
 
 ---
 
-## License
+## ⭐ Support the Project
 
-[MIT](LICENSE)
+If The Watcher saves you time, **[star the repo](https://github.com/m0hx65/The_Watcher3.0/stargazers)** — it's the easiest way to help others find it. Issues and PRs are welcome.
+
+## 📄 License
+
+[MIT](LICENSE) © 2026 [Mohamad (m0hx65)](https://github.com/m0hx65)

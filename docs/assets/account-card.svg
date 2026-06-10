@@ -1,0 +1,56 @@
+<svg viewBox="0 0 420 650" width="420" height="650" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', system-ui, -apple-system, Roboto, 'Helvetica Neue', Arial, sans-serif">
+  <!-- Telegram dark-theme chat background -->
+  <rect x="0" y="0" width="420" height="650" rx="16" fill="#0e1621"/>
+
+  <!-- Message bubble -->
+  <rect x="12" y="12" width="396" height="412" rx="12" fill="#182533"/>
+
+  <!-- Card text -->
+  <text x="26" y="40" font-size="15" font-weight="700" fill="#ffffff">@natgeo</text>
+  <text x="26" y="63" font-size="13.5" fill="#dde6ee">Instagram ID: <tspan font-family="'Cascadia Mono', Consolas, Menlo, monospace" fill="#5eb5f7">787132</tspan></text>
+  <text x="26" y="84" font-size="13.5" fill="#dde6ee">State: 🟢 active</text>
+  <text x="26" y="105" font-size="13.5" fill="#dde6ee">Last check: <tspan font-family="'Cascadia Mono', Consolas, Menlo, monospace" fill="#5eb5f7">2026-06-10 14:32 UTC</tspan> · HTTP 200</text>
+
+  <text x="26" y="134" font-size="13.5" font-weight="700" fill="#ffffff">Latest snapshot</text>
+  <text x="26" y="155" font-size="13.5" fill="#dde6ee">Name: <tspan font-family="'Cascadia Mono', Consolas, Menlo, monospace" fill="#5eb5f7">National Geographic</tspan></text>
+  <text x="26" y="176" font-size="13.5" fill="#dde6ee">Followers: <tspan font-weight="700" fill="#ffffff">285,431,002</tspan> · Following: <tspan font-weight="700" fill="#ffffff">134</tspan></text>
+  <text x="26" y="197" font-size="13.5" fill="#dde6ee">Posts: <tspan font-weight="700" fill="#ffffff">31,219</tspan></text>
+  <text x="26" y="218" font-size="13.5" fill="#dde6ee">✓ verified · 💼 business</text>
+  <text x="26" y="239" font-size="13.5" fill="#dde6ee">Story: 🎬 has an active story</text>
+
+  <text x="26" y="268" font-size="13.5" font-weight="700" fill="#ffffff">✨ Highlights (4)</text>
+  <text x="38" y="289" font-size="13.5" fill="#dde6ee">• Expeditions</text>
+  <text x="38" y="310" font-size="13.5" fill="#dde6ee">• Ocean</text>
+  <text x="38" y="331" font-size="13.5" fill="#dde6ee">• Space</text>
+  <text x="38" y="352" font-size="13.5" fill="#dde6ee">• Wildlife</text>
+  <text x="26" y="373" font-size="13" font-style="italic" fill="#7d8b99">Tap ✨ Highlights to see all highlight names.</text>
+
+  <text x="26" y="400" font-size="13.5" fill="#dde6ee">Profile picture captured: <tspan font-family="'Cascadia Mono', Consolas, Menlo, monospace" fill="#5eb5f7">2026-06-10 14:32 UTC</tspan></text>
+  <text x="394" y="416" font-size="11" fill="#5f6e7d" text-anchor="end">14:32</text>
+
+  <!-- Inline keyboard -->
+  <g font-size="13.5" fill="#eaf2f8" text-anchor="middle">
+    <rect x="12" y="430" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="109" y="454">🔄 Recheck</text>
+    <rect x="214" y="430" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="311" y="454">📜 History</text>
+
+    <rect x="12" y="472" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="109" y="496">🖼 Photo</text>
+    <rect x="214" y="472" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="311" y="496">🗑 Remove</text>
+
+    <rect x="12" y="514" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="109" y="538">📖 Story</text>
+    <rect x="214" y="514" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="311" y="538">✨ Highlights</text>
+
+    <rect x="12" y="556" width="396" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="210" y="580">⏸ Pause</text>
+
+    <rect x="12" y="598" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="109" y="622">◀️ List</text>
+    <rect x="214" y="598" width="194" height="38" rx="7" fill="#1f2c3a"/>
+    <text x="311" y="622">🏠 Home</text>
+  </g>
+</svg>
