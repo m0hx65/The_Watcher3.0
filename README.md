@@ -6,6 +6,8 @@
 
 Track any Instagram account — **public or private** — followers, bio, profile picture, stories, posts, reels — and get every change **plus the actual media** dropped straight into your chat. No Instagram account. No cookies. Nothing that can get banned.
 
+**Battle-tested in production: one instance quietly watching 25+ accounts, around the clock.**
+
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
@@ -30,7 +32,8 @@ Track any Instagram account — **public or private** — followers, bio, profil
 - 🎬 **It doesn't just notify — it delivers.** New stories, posts, reels, highlights, and profile pictures arrive in your chat as actual photos and videos, not links.
 - 📲 **Telegram is the entire UI.** Add targets, pause them, pull stories, tune the schedule, export history — all through inline buttons. You never touch a terminal after deploy.
 - ☁️ **Datacenter-proof.** Instagram blocks its GraphQL endpoints from cloud IPs; The Watcher detects the block, fast-fails, and reroutes through an anonymous downloader so everything keeps working on Render, Fly, or any VPS.
-- 📦 **One container, five minutes.** A single Docker image with a `render.yaml` blueprint — database, persistent disk, and webhook included.
+- ⚡ **Proven at scale.** A single instance sweeps 25+ accounts around the clock — with jittered scheduling and throttled concurrency so it never trips rate limits.
+- 📦 **One container, five minutes.** A single Docker image with a `render.yaml` blueprint — database, persistent disk, and webhook included. Runs on a free-tier box.
 
 ---
 
