@@ -52,6 +52,20 @@ async def init_db() -> None:
                 text("ALTER TABLE monitored_accounts ADD COLUMN instagram_id VARCHAR(64)")
             )
             logger.info("Added monitored_accounts.instagram_id column")
+        hl_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in inspect(sync_conn).get_columns("stored_highlights")
+            }
+        )
+        if "tracked" not in hl_columns:
+            await conn.execute(
+                text(
+                    "ALTER TABLE stored_highlights "
+                    "ADD COLUMN tracked BOOLEAN NOT NULL DEFAULT TRUE"
+                )
+            )
+            logger.info("Added stored_highlights.tracked column")
     logger.info("Database schema verified")
 
 

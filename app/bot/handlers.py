@@ -370,6 +370,9 @@ async def _render_account_card(
         )
         media = await crud.latest_media_hash(session, account.id)
         highlight_catalog = await crud.get_highlight_catalog(session, account.id)
+        untracked_highlights = await crud.get_untracked_highlight_ids(
+            session, account.id
+        )
 
     marker = "🟢 active" if account.active else "⏸ paused"
     last = fmt_timestamp(account.last_checked_at) if account.last_checked_at else "never"
@@ -446,8 +449,11 @@ async def _render_account_card(
     if highlight_catalog:
         lines.append("")
         lines.append(f"<b>✨ Highlights ({len(highlight_catalog)})</b>")
-        for title in sorted(highlight_catalog.values()):
-            lines.append(f"  • {esc(title) or '(untitled)'}")
+        for hid, title in sorted(
+            highlight_catalog.items(), key=lambda kv: (kv[1] or "").lower()
+        ):
+            mark = " 🔕" if hid in untracked_highlights else ""
+            lines.append(f"  • {esc(title) or '(untitled)'}{mark}")
         lines.append("<i>Tap ✨ Highlights to see all highlight names.</i>")
 
     if media:
@@ -784,15 +790,25 @@ async def _show_highlights(
             reply_markup=await _actions_keyboard(username),
         )
         return
+    untracked = result.get("untracked", set())
+    monitored = result.get("monitored", False)
     lines = [f"<b>✨ Highlights for @{esc(username)}</b> ({len(items)})", ""]
-    for i, (_hid, title) in enumerate(items, start=1):
-        lines.append(f"{i}. {esc(title) or '(untitled)'}")
+    for i, (hid, title) in enumerate(items, start=1):
+        mark = " 🔕" if hid in untracked else ""
+        lines.append(f"{i}. {esc(title) or '(untitled)'}{mark}")
     lines.append("")
     lines.append("Tap a highlight below to download and send it.")
+    if monitored:
+        lines.append(
+            "🔕 Mute skips a highlight in the sweep auto-download; "
+            "manual downloads still work."
+        )
     await _safe_edit_text(
         query,
         "\n".join(lines),
-        reply_markup=keyboards.highlights_view(username, items),
+        reply_markup=keyboards.highlights_view(
+            username, items, untracked=untracked, monitored=monitored
+        ),
     )
 
 
@@ -824,6 +840,64 @@ async def _download_highlight(
     else:
         noun = "item" if count == 1 else "items"
         await _safe_answer(query, f"Sent {count} {noun} from “{title}”.")
+
+
+async def _toggle_highlight_tracking(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    index_raw: str,
+) -> None:
+    """Mute/unmute the sweep auto-download for one highlight, then re-render."""
+    query = update.callback_query
+    if not index_raw.lstrip("-").isdigit():
+        await _safe_answer(query, "Invalid highlight.")
+        return
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.toggle_highlight_tracking(username, int(index_raw))
+    if not result.get("ok"):
+        await _safe_answer(
+            query,
+            str(result.get("error") or "Update failed."),
+            show_alert=True,
+        )
+        return
+    title = result.get("title") or "(untitled)"
+    if result.get("tracked"):
+        await _safe_answer(
+            query,
+            f"🔔 Tracking “{title}” again — items posted while muted stay skipped.",
+        )
+    else:
+        await _safe_answer(
+            query, f"🔕 Muted “{title}” — the sweep will skip it."
+        )
+    await _show_highlights(update, context, username)
+
+
+async def _set_all_highlight_tracking(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    tracked: bool,
+) -> None:
+    """Mute or resume the sweep auto-download for every highlight of an account."""
+    query = update.callback_query
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.set_all_highlight_tracking(username, tracked)
+    if not result.get("ok"):
+        await _safe_answer(
+            query,
+            str(result.get("error") or "Update failed."),
+            show_alert=True,
+        )
+        return
+    count = result.get("count", 0)
+    if tracked:
+        await _safe_answer(query, f"🔔 Tracking all {count} highlights again.")
+    else:
+        await _safe_answer(query, f"🔕 Muted all {count} highlights.")
+    await _show_highlights(update, context, username)
 
 
 async def _download_all_highlights(
@@ -1238,15 +1312,25 @@ async def cmd_highlights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=keyboards.fetch_actions(username),
         )
         return
+    untracked = result.get("untracked", set())
+    monitored = result.get("monitored", False)
     lines = [f"<b>✨ Highlights for @{esc(username)}</b> ({len(items)})", ""]
-    for i, (_hid, title) in enumerate(items, start=1):
-        lines.append(f"{i}. {esc(title) or '(untitled)'}")
+    for i, (hid, title) in enumerate(items, start=1):
+        mark = " 🔕" if hid in untracked else ""
+        lines.append(f"{i}. {esc(title) or '(untitled)'}{mark}")
     lines.append("")
     lines.append("Tap a highlight below to download and send it.")
+    if monitored:
+        lines.append(
+            "🔕 Mute skips a highlight in the sweep auto-download; "
+            "manual downloads still work."
+        )
     await status_msg.edit_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.highlights_view(username, items),
+        reply_markup=keyboards.highlights_view(
+            username, items, untracked=untracked, monitored=monitored
+        ),
     )
 
 
@@ -1646,6 +1730,15 @@ async def _handle_account(
         await _download_highlight(update, context, hl_username, parts[1])
         return
 
+    if action == "hltrk":
+        # acc:hltrk:<index>:<username> — toggle one highlight's auto-download.
+        if len(parts) < 3:
+            await _safe_answer(query)
+            return
+        hl_username = _normalize_username(parts[2]) or parts[2].lower()
+        await _toggle_highlight_tracking(update, context, hl_username, parts[1])
+        return
+
     username = _normalize_username(parts[1]) or parts[1].lower()
 
     if action == "story":
@@ -1658,6 +1751,14 @@ async def _handle_account(
 
     if action == "hlall":
         await _download_all_highlights(update, context, username)
+        return
+
+    if action == "hlmuteall":
+        await _set_all_highlight_tracking(update, context, username, False)
+        return
+
+    if action == "hltrkall":
+        await _set_all_highlight_tracking(update, context, username, True)
         return
 
     if action == "open":

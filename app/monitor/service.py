@@ -954,8 +954,20 @@ class MonitorService:
                         account_id, username, new_stories, seen_pks
                     )
 
+                # Auto-download honors per-highlight mutes: untracked reels are
+                # skipped entirely (not even fetched). Unmuting re-baselines the
+                # reel, so the skipped items never flood in later.
+                async with get_session() as session:
+                    untracked = await crud.get_untracked_highlight_ids(
+                        session, account_id
+                    )
+                tracked_catalog = {
+                    hid: title
+                    for hid, title in catalog.items()
+                    if hid not in untracked
+                }
                 highlight_items = await self._gather_highlight_items(
-                    username, catalog
+                    username, tracked_catalog
                 )
                 new_highlight_items = [
                     i for i in highlight_items if i.pk and i.pk not in seen_pks
@@ -1183,8 +1195,23 @@ class MonitorService:
             async with get_session() as session:
                 catalog = await crud.get_highlight_catalog(session, account_id)
 
+        # Mute state only exists for monitored accounts (it lives on the
+        # stored catalog rows, which non-monitored lookups don't have).
+        untracked: set[str] = set()
+        if account_id is not None:
+            async with get_session() as session:
+                untracked = await crud.get_untracked_highlight_ids(
+                    session, account_id
+                )
+
         items = sorted(catalog.items(), key=lambda kv: kv[0])
-        return {"ok": True, "items": items, "error": None}
+        return {
+            "ok": True,
+            "items": items,
+            "untracked": untracked,
+            "monitored": account_id is not None,
+            "error": None,
+        }
 
     async def download_highlight(self, username: str, index: int) -> dict:
         """Download and send one highlight reel, identified by its list index.
@@ -1256,6 +1283,91 @@ class MonitorService:
 
         sent = await self._deliver_story_items(account_id, username, story_items, set())
         return {"ok": True, "count": sent, "reels": len(items), "error": None}
+
+    async def toggle_highlight_tracking(self, username: str, index: int) -> dict:
+        """Flip the sweep auto-download mute for one highlight (by list index).
+
+        Muting keeps the highlight in the catalog (renames/removals still get
+        detected) but the sweep stops fetching its media. Unmuting first marks
+        the highlight's current items as seen WITHOUT sending them, so tracking
+        resumes from now instead of dumping everything posted while muted.
+        Returns {"ok", "title", "tracked", "error"}.
+        """
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        if account is None:
+            return {
+                "ok": False, "title": None, "tracked": None,
+                "error": "Only monitored accounts can mute highlights.",
+            }
+
+        listing = await self.list_highlights(username)
+        items = listing["items"]
+        if index < 0 or index >= len(items):
+            return {
+                "ok": False, "title": None, "tracked": None,
+                "error": "That highlight is no longer available — refresh the list.",
+            }
+        highlight_id, title = items[index]
+        tracked = highlight_id in listing["untracked"]  # flip: muted -> track
+
+        if tracked and self.stories is not None:
+            try:
+                story_items = await self.stories.fetch_highlight_items(
+                    username, highlight_id, title
+                )
+                async with get_session() as session:
+                    await crud.mark_story_items_seen(
+                        session, account.id, story_items
+                    )
+            except Exception as exc:  # pragma: no cover - network failure path
+                logger.debug(
+                    "Unmute re-baseline failed for @{} ({}): {}",
+                    username, highlight_id, exc,
+                )
+
+        async with get_session() as session:
+            ok = await crud.set_highlight_tracked(
+                session, account.id, highlight_id, tracked
+            )
+        if not ok:
+            return {
+                "ok": False, "title": title, "tracked": None,
+                "error": "Highlight not stored yet — refresh the list and retry.",
+            }
+        return {"ok": True, "title": title, "tracked": tracked, "error": None}
+
+    async def set_all_highlight_tracking(self, username: str, tracked: bool) -> dict:
+        """Mute or unmute sweep auto-download for ALL of an account's highlights.
+
+        Unmuting re-baselines every reel first (items posted while muted are
+        marked seen, not sent). Returns {"ok", "count", "error"}.
+        """
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        if account is None:
+            return {
+                "ok": False, "count": 0,
+                "error": "Only monitored accounts can mute highlights.",
+            }
+
+        if tracked and self.stories is not None:
+            async with get_session() as session:
+                catalog = await crud.get_highlight_catalog(session, account.id)
+            if catalog:
+                story_items = await self._gather_highlight_items(username, catalog)
+                async with get_session() as session:
+                    await crud.mark_story_items_seen(
+                        session, account.id, story_items
+                    )
+
+        async with get_session() as session:
+            count = await crud.set_all_highlights_tracked(
+                session, account.id, tracked
+            )
+        return {"ok": True, "count": count, "error": None}
 
     async def fetch_profile_picture(self, username: str) -> dict:
         """Download the CURRENT profile picture at the best available quality.

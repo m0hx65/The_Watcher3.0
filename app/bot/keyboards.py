@@ -19,6 +19,9 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:highlights:<u>       — list highlight names
   acc:hldl:<idx>:<u>       — download highlight at list index <idx>
   acc:hlall:<u>            — download every highlight reel at once
+  acc:hltrk:<idx>:<u>      — toggle sweep auto-download mute for one highlight
+  acc:hlmuteall:<u>        — mute auto-download for all highlights
+  acc:hltrkall:<u>         — resume auto-download for all highlights
   acc:remove:<username>    — show remove confirmation
   acc:remove_yes:<u>       — confirmed remove
   acc:pause:<username>     — pause monitoring (keep history)
@@ -171,12 +174,18 @@ def account_actions(username: str, active: bool = True) -> InlineKeyboardMarkup:
 
 
 def highlights_view(
-    username: str, items: Sequence[tuple[str, str]]
+    username: str,
+    items: Sequence[tuple[str, str]],
+    untracked: frozenset[str] | set[str] = frozenset(),
+    monitored: bool = False,
 ) -> InlineKeyboardMarkup:
     """List one download button per highlight, referenced by list index.
 
     `items` is the ordered (highlight_id, title) list shown to the user; the
     index in the callback maps back to the same ordering on the download side.
+    For monitored accounts each row also gets a 🔕/🔔 toggle that mutes or
+    resumes the sweep's auto-download for that one highlight, plus a
+    mute-all / track-all shortcut.
     """
     rows: list[list[InlineKeyboardButton]] = []
     if items:
@@ -188,18 +197,42 @@ def highlights_view(
                 )
             ]
         )
-    for idx, (_hid, title) in enumerate(items):
+        if monitored:
+            if untracked:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            "🔔 Track all", callback_data=f"acc:hltrkall:{username}"
+                        )
+                    ]
+                )
+            else:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            "🔕 Mute all", callback_data=f"acc:hlmuteall:{username}"
+                        )
+                    ]
+                )
+    for idx, (hid, title) in enumerate(items):
         label = title.strip() or "(untitled)"
         if len(label) > 28:
             label = label[:27] + "…"
-        rows.append(
-            [
+        row = [
+            InlineKeyboardButton(
+                f"⬇️ {label}",
+                callback_data=f"acc:hldl:{idx}:{username}",
+            )
+        ]
+        if monitored:
+            muted = hid in untracked
+            row.append(
                 InlineKeyboardButton(
-                    f"⬇️ {label}",
-                    callback_data=f"acc:hldl:{idx}:{username}",
+                    "🔔 Track" if muted else "🔕 Mute",
+                    callback_data=f"acc:hltrk:{idx}:{username}",
                 )
-            ]
-        )
+            )
+        rows.append(row)
     rows.append(
         [
             InlineKeyboardButton(

@@ -158,7 +158,11 @@ class NotificationLog(Base):
 
 
 class StoredHighlight(Base):
-    """Latest known highlight reels for a public account (id + title)."""
+    """Latest known highlight reels for a public account (id + title).
+
+    `tracked` is the per-highlight mute switch: untracked highlights are kept
+    in the catalog (so renames/removals are still detected) but skipped by the
+    sweep's auto-download."""
 
     __tablename__ = "stored_highlights"
 
@@ -170,6 +174,9 @@ class StoredHighlight(Base):
     )
     highlight_id: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    tracked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

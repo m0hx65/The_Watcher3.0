@@ -41,6 +41,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
+| 🔕 **Per-highlight tracking** | Choose exactly which highlights to follow, per account. Mute one, several, or all — muted highlights are skipped by the sweep's auto-download (and not even fetched), while manual downloads keep working. Unmuting resumes cleanly from now, without dumping everything posted in between. |
 | 🖼 **Post & reel auto-delivery** | Every sweep detects new posts/reels and sends the actual media to your chat — capped at 5 per sweep so a posting spree never floods you. First sweep baselines silently (no backlog dump). |
 | ⏸ **Pause / resume targets** | Freeze monitoring with one tap or `/pause` — history, snapshots, and the resolved Instagram ID are all preserved. Resume picks up exactly where it left off. |
 | 🔎 **Any public account, on demand** | `/story @user` and `/highlights @user` grab media from **any** public account — no need to monitor it. Also available as the **🔎 Any user** menu button. |
@@ -91,6 +92,7 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - **New posts & reels** auto-downloaded and sent as photos/videos the sweep they appear
 - **Stories** fetched and delivered with per-item deduplication — each story is sent exactly once
 - **Highlights** listed by name with per-highlight download buttons and a download-all option
+- **Per-highlight mute** — 🔕 toggle any highlight (or mute/track all at once) to control exactly what the sweep auto-downloads; muted ones are marked on the account card and skipped without being fetched
 - **Profile pictures** in maximum available resolution, on demand via `/fetchphoto`
 - All media retrieval is **login-free** — no Instagram session is ever used
 
@@ -284,7 +286,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 
 - **Main menu** — Accounts · Status · Add · Interval · Export · Help · **🔎 Any user** · **Sweep All**
 - **Account card** — Recheck · History · Photo · Remove · **Story** · **Highlights** · **Pause ⇄ Resume**
-- **Highlights view** — ⬇️ Download all (n) plus one download button per highlight
+- **Highlights view** — ⬇️ Download all (n), one download button per highlight, plus 🔕/🔔 mute toggles per highlight and a mute-all / track-all shortcut
 - **Status view** — Sweep Now · Interval · **Clear Old Data** (with confirmation)
 - **Interval picker** — presets from 5 m to 6 h plus free-form custom entry
 - **Panel bumping** — after every notification the menu re-posts at the bottom of the chat, so it's always within thumb's reach
@@ -321,7 +323,7 @@ Tables are created automatically on first boot via SQLAlchemy `create_all`.
 | `profile_media_hashes` | One row per unique profile picture (SHA-256 + disk path), deduplicated across accounts |
 | `notification_logs` | One row per dispatched change event: type, payload, delivery status |
 | `seen_stories` | Delivery dedup for stories, highlight items, **and posts/reels** — each media item is sent exactly once |
-| `stored_highlights` | Per-account highlight catalog (id + title) used to detect added/renamed/removed highlights |
+| `stored_highlights` | Per-account highlight catalog (id + title) used to detect added/renamed/removed highlights, with the per-highlight `tracked` mute flag |
 | `app_settings` | Key-value store for runtime-tunable config persisted across restarts |
 
 Pausing a target never deletes anything — the row, its Instagram ID, and all history survive until you explicitly `/remove`.

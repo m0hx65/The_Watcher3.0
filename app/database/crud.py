@@ -313,19 +313,75 @@ async def replace_highlight_catalog(
     account_id: int,
     catalog: dict[str, str],
 ) -> None:
-    """Replace the stored highlight catalog with the current Instagram list."""
-    await session.execute(
-        delete(StoredHighlight).where(StoredHighlight.account_id == account_id)
+    """Sync the stored highlight catalog with the current Instagram list.
+
+    Rows are updated in place — titles refresh, vanished ids are deleted, new
+    ids are inserted (tracked by default) — so per-highlight state like the
+    `tracked` mute flag survives every refresh."""
+    result = await session.execute(
+        select(StoredHighlight).where(StoredHighlight.account_id == account_id)
     )
+    existing = {row.highlight_id: row for row in result.scalars().all()}
     for highlight_id, title in catalog.items():
-        session.add(
-            StoredHighlight(
-                account_id=account_id,
-                highlight_id=highlight_id,
-                title=title or "",
+        row = existing.pop(highlight_id, None)
+        if row is None:
+            session.add(
+                StoredHighlight(
+                    account_id=account_id,
+                    highlight_id=highlight_id,
+                    title=title or "",
+                )
+            )
+        elif row.title != (title or ""):
+            row.title = title or ""
+    if existing:
+        await session.execute(
+            delete(StoredHighlight).where(
+                StoredHighlight.account_id == account_id,
+                StoredHighlight.highlight_id.in_(existing.keys()),
             )
         )
     await session.flush()
+
+
+async def get_untracked_highlight_ids(
+    session: AsyncSession, account_id: int
+) -> set[str]:
+    """Highlight ids muted for sweep auto-download on this account."""
+    result = await session.execute(
+        select(StoredHighlight.highlight_id).where(
+            StoredHighlight.account_id == account_id,
+            StoredHighlight.tracked.is_(False),
+        )
+    )
+    return set(result.scalars().all())
+
+
+async def set_highlight_tracked(
+    session: AsyncSession, account_id: int, highlight_id: str, tracked: bool
+) -> bool:
+    """Mute (tracked=False) or unmute one highlight. Returns False if unknown."""
+    result = await session.execute(
+        update(StoredHighlight)
+        .where(
+            StoredHighlight.account_id == account_id,
+            StoredHighlight.highlight_id == highlight_id,
+        )
+        .values(tracked=tracked)
+    )
+    return result.rowcount > 0
+
+
+async def set_all_highlights_tracked(
+    session: AsyncSession, account_id: int, tracked: bool
+) -> int:
+    """Mute or unmute every stored highlight of an account. Returns rows changed."""
+    result = await session.execute(
+        update(StoredHighlight)
+        .where(StoredHighlight.account_id == account_id)
+        .values(tracked=tracked)
+    )
+    return result.rowcount
 
 
 # ---------- SeenStory (deduplication for stories & highlights) ----------
