@@ -37,13 +37,9 @@ services:
         value: "INFO"
       - key: WEB_API_TOKEN
         generateValue: true
+      # External Postgres (Neon free tier — does NOT expire, unlike Render's
+      # free database). Set this in the Render dashboard to your Neon connection
+      # string; it can be pasted verbatim (sslmode/channel_binding params and
+      # the postgres:// prefix are normalized for asyncpg by app.db_url).
       - key: DATABASE_URL
-        fromDatabase:
-          name: watcher-db
-          property: connectionString
-
-databases:
-  - name: watcher-db
-    plan: free
-    region: frankfurt
-    postgresMajorVersion: "16"
+        sync: false

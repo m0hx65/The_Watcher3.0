@@ -8,6 +8,8 @@ from typing import List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.db_url import normalize_db_url
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -74,11 +76,7 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def normalize_database_url(cls, v: str) -> str:
-        if v.startswith("postgres://"):
-            v = v.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif v.startswith("postgresql://") and "+asyncpg" not in v:
-            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return v
+        return normalize_db_url(v)
 
     @field_validator("telegram_webhook_secret")
     @classmethod

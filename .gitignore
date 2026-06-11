@@ -28,6 +28,9 @@ data/
 *.log
 logs/
 
+# Local DB backups produced by scripts/migrate_db.py (contain real data)
+watcher-backup*.json
+
 .coverage
 htmlcov/
 .pytest_cache/
