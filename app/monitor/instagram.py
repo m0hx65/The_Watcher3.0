@@ -217,11 +217,17 @@ class InstagramClient:
         session: _SessionLike | None = None,
     ):
         self.max_retries = max_retries
-        # Circuit breaker for the graphql reel query: datacenter IPs (Render) get
-        # a hard 401 on /graphql/query, and retrying it wastes seconds on every
-        # call. Once we see a hard block we skip the endpoint for a short while
-        # and let callers use their fallback (saveinsta / stored data).
+        # Circuit breaker for the DIRECT graphql reel query: datacenter IPs
+        # (Render) get a hard 401 on /graphql/query, and retrying it wastes
+        # seconds on every call. Once we see a hard block we skip the endpoint
+        # for a short while and let callers use their fallback (proxy /
+        # saveinsta / stored data).
         self._reel_blocked_until: float = 0.0
+        # Short-TTL cache for reel query results. One sweep/card interaction
+        # asks for the same user's reel data up to 3 times (profile check,
+        # story status, highlight catalog) — serve repeats from memory instead
+        # of burning Instagram requests, which is the main 401 trigger.
+        self._reel_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -246,15 +252,53 @@ class InstagramClient:
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
 
+    @staticmethod
+    def _parse_hd_pic_payload(data: dict[str, Any], user_id: str) -> Optional[str]:
+        user = data.get("user") or {}
+        hd_info = user.get("hd_profile_pic_url_info") or {}
+        if hd_info.get("url"):
+            logger.debug("HD pic URL obtained for user_id={}", user_id)
+            return hd_info["url"]
+        # hd_profile_pic_url_info absent (no session / private account).
+        # Do NOT fall back to the mobile API's profile_pic_url — that is
+        # the 150px thumbnail, smaller than what web_profile_info already
+        # gave us. Return None so the caller keeps the web API URL.
+        return None
+
     async def fetch_hd_pic_url(self, user_id: str) -> Optional[str]:
         """Return the highest-resolution profile picture URL via the mobile API.
 
         Instagram's mobile endpoint returns hd_profile_pic_url_info which holds
         the full-size image (up to ~1440px) rather than the ~320px thumbnail that
         web_profile_info exposes via profile_pic_url_hd.  Falls back gracefully.
+        Routed through the Cloudflare Worker proxy when configured — datacenter
+        IPs (Render) are blocked on i.instagram.com just like the rest.
         """
         if not user_id:
             return None
+
+        # The proxy can't attach the session cookie (it would leak it to the
+        # worker and Instagram ties cookies to IPs anyway), so when a cookie is
+        # configured the direct request below is the only one that can yield
+        # hd_profile_pic_url_info — skip the proxy hop entirely.
+        if settings.ig_proxy_url and not settings.ig_session_cookie:
+            try:
+                response = await self._session.get(
+                    settings.ig_proxy_url, params={"hd_user_id": str(user_id)}
+                )
+                if response.status_code == 200:
+                    return self._parse_hd_pic_payload(response.json(), user_id)
+                logger.debug(
+                    "Proxy HD pic fetch HTTP {} for user_id={}",
+                    response.status_code, user_id,
+                )
+                # 400 = worker without this route yet; anything else = blocked
+                # upstream. Either way, try the direct mobile API below.
+            except Exception as exc:
+                logger.debug(
+                    "Proxy HD pic fetch failed for user_id={}: {}", user_id, exc
+                )
+
         url = f"https://{MOBILE_HOST}/api/v1/users/{user_id}/info/"
         headers: dict[str, str] = {
             "User-Agent": _ANDROID_UA,
@@ -266,16 +310,7 @@ class InstagramClient:
         try:
             response = await self._session.get(url, headers=headers)
             if response.status_code == 200:
-                data = response.json()
-                user = data.get("user") or {}
-                hd_info = user.get("hd_profile_pic_url_info") or {}
-                if hd_info.get("url"):
-                    logger.debug("HD pic URL obtained for user_id={}", user_id)
-                    return hd_info["url"]
-                # hd_profile_pic_url_info absent (no session / private account).
-                # Do NOT fall back to the mobile API's profile_pic_url — that is
-                # the 150px thumbnail, smaller than what web_profile_info already
-                # gave us. Return None so the caller keeps the web API URL.
+                return self._parse_hd_pic_payload(response.json(), user_id)
             logger.debug(
                 "Mobile API returned HTTP {} or no hd info for user_id={}",
                 response.status_code, user_id,
@@ -288,17 +323,81 @@ class InstagramClient:
     # again. Keeps card opens and sweeps fast where the graphql endpoint is
     # IP-blocked, while still recovering automatically if access returns.
     _REEL_BLOCK_TTL = 180.0
+    # How long a reel query result stays fresh in memory. A sweep asks for the
+    # same user's reel data several times within seconds; 90s also covers a
+    # quick card-open -> button-press sequence without re-fetching.
+    _REEL_CACHE_TTL = 90.0
 
     async def fetch_reel_user(self, user_id: str) -> Optional[dict[str, Any]]:
         """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654).
+
+        Returns {"instagram_id", "username", "highlights", "has_public_story",
+        "is_live"} or None. Served from a short-TTL cache when fresh; otherwise
+        via the Cloudflare Worker proxy when configured (datacenter IPs are
+        401-blocked on /graphql/query), falling back to the direct request.
+        """
+        if not user_id:
+            return None
+        user_id = str(user_id)
+
+        cached = self._reel_cache.get(user_id)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+
+        parsed: Optional[dict[str, Any]] = None
+        proxied_authoritative = False
+        if settings.ig_proxy_url:
+            proxied_authoritative, parsed = await self._fetch_reel_user_proxy(user_id)
+        if parsed is None and not proxied_authoritative:
+            parsed = await self._fetch_reel_user_direct(user_id)
+
+        if parsed is not None:
+            if len(self._reel_cache) > 512:  # bound memory across many targets
+                self._reel_cache.clear()
+            self._reel_cache[user_id] = (
+                time.monotonic() + self._REEL_CACHE_TTL, parsed
+            )
+        return parsed
+
+    async def _fetch_reel_user_proxy(
+        self, user_id: str
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """Reel query via the Cloudflare Worker. Returns (authoritative, parsed).
+
+        authoritative=True means the proxy answered for Instagram (200/404) and
+        the direct fallback should be skipped; False means the proxy itself was
+        unavailable/blocked (400 from an old worker build, 401 after upstream
+        retries, network error) and a direct attempt is still worth making.
+        """
+        try:
+            response = await self._session.get(
+                settings.ig_proxy_url, params={"user_id": user_id}
+            )
+        except Exception as exc:
+            logger.debug("Proxy reel query failed for id={}: {}", user_id, exc)
+            return False, None
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+            except Exception:
+                logger.debug("Proxy reel query id={} returned non-JSON 200", user_id)
+                return False, None
+            return True, _parse_reel_query_user(payload)
+        if response.status_code == 404:
+            return True, None  # Instagram says the id doesn't exist
+        logger.debug(
+            "Proxy reel query id={} HTTP {}", user_id, response.status_code
+        )
+        return False, None
+
+    async def _fetch_reel_user_direct(self, user_id: str) -> Optional[dict[str, Any]]:
+        """Direct reel query against instagram.com.
 
         Fast-fails: a hard 401/403 (typical on datacenter IPs) trips a short-lived
         circuit breaker so we don't burn seconds retrying a blocked endpoint on
         every call — callers fall back to saveinsta / stored data. Transient
         429/5xx still get one quick retry.
         """
-        if not user_id:
-            return None
         if time.monotonic() < self._reel_blocked_until:
             return None  # endpoint recently hard-blocked — skip, use fallback
         headers = _build_headers()
@@ -432,15 +531,20 @@ class InstagramClient:
                     continue
 
                 # 401/403 — retry immediately, IG usually returns 200 within a few tries.
+                # Through the worker proxy each call is already 8 upstream
+                # attempts with rotating UAs, so re-asking more than once just
+                # multiplies blocked traffic — cap at 2 attempts there.
                 logger.warning(
                     "HTTP {} on @{} (attempt {}/{})",
                     response.status_code, username, attempt, self.max_retries,
                 )
                 last_error = f"HTTP {response.status_code}"
                 if response.status_code in (401, 403):
-                    if attempt < self.max_retries:
+                    max_auth_attempts = 2 if settings.ig_proxy_url else self.max_retries
+                    if attempt < max_auth_attempts:
                         await asyncio.sleep(random.uniform(1.0, 3.0))
                         continue
+                    break
 
             except Timeout as exc:
                 last_status = 0

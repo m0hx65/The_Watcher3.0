@@ -339,15 +339,22 @@ Activate by setting `STORIESIG_API_KEY` once an API key is obtained.
 ### 6.7 Cloudflare Worker Proxy
 
 When Render's Frankfurt datacenter IPs are blocked by Instagram, a transparent
-Cloudflare Worker proxy is used:
+Cloudflare Worker proxy is used for EVERY Instagram API call:
 
 - URL: `https://ig-proxy.m-asaad2005-ma.workers.dev`
-- Accepts `?username=<x>`, forwards to Instagram's web_profile_info endpoint
-- Rotates across 6 user agents, retries 8 times
+- `?username=<x>` → web_profile_info (profile fields)
+- `?user_id=<id>` → graphql reel query (story/live status, highlight catalog,
+  username-by-id — powers `/add <numeric id>` and the ✨ Highlights button)
+- `?hd_user_id=<id>` → mobile API user info (HD profile picture; only useful
+  with a logged-in session, which the anonymous setup doesn't use)
+- Rotates across 6 user agents, retries 8 times; a 200 with a non-JSON body
+  (login-wall HTML) counts as blocked and is retried
 - Cloudflare edge IPs are never blocked by Instagram
 - Free tier: 100,000 requests/day
 
-Set `IG_PROXY_URL` in environment variables to enable.
+Set `IG_PROXY_URL` in environment variables to enable. The bot falls back to
+direct Instagram requests if the proxy is unreachable, and serves repeated
+reel queries from a 90-second in-memory cache to keep request volume low.
 
 ---
 

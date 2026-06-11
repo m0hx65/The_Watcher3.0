@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
@@ -18,6 +19,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# JSONB on Postgres (prod), plain JSON on sqlite (test scripts) — identical
+# behavior in app code, but sqlite can't compile the JSONB type.
+PortableJSONB = JSONB().with_variant(JSON(), "sqlite")
 
 
 class Base(DeclarativeBase):
@@ -83,7 +88,7 @@ class AccountSnapshot(Base):
     profile_pic_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     external_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     http_status: Mapped[int] = mapped_column(Integer, nullable=False)
-    raw_response: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    raw_response: Mapped[Optional[dict]] = mapped_column(PortableJSONB, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
@@ -146,7 +151,7 @@ class NotificationLog(Base):
         nullable=False,
     )
     change_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    payload: Mapped[Optional[dict]] = mapped_column(PortableJSONB, nullable=True)
     message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     delivered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     delivery_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

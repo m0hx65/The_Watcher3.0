@@ -462,11 +462,14 @@ class MonitorService:
         parsed = fetch.parsed
 
         # Resolve the best available profile picture URL.
-        # Try the mobile API first (returns hd_profile_pic_url_info, up to ~1440px).
-        # Fall back to the web API's profile_pic_url_hd (~320px) if unavailable.
+        # The mobile API's hd_profile_pic_url_info (~1440px) only exists for
+        # logged-in sessions — in the anonymous setup that call NEVER yields a
+        # URL, so making it once per account per sweep was pure wasted traffic
+        # (and a 401 driver). Only ask when a session cookie is configured;
+        # otherwise the web API's profile_pic_url_hd (~320px) is the ceiling.
         pic_url = parsed.get("profile_pic_url")
         instagram_id = parsed.get("instagram_id")
-        if instagram_id:
+        if instagram_id and settings.ig_session_cookie:
             hd_url = await self.instagram.fetch_hd_pic_url(str(instagram_id))
             if hd_url:
                 pic_url = hd_url
@@ -501,10 +504,20 @@ class MonitorService:
                     username, exc
                 )
 
-        # Build the raw_response with reel_data if available
-        raw_response_with_reel = fetch.raw_response.copy() if fetch.raw_response else {}
+        # Persist only what later reads actually consume: the numeric user id
+        # (404 recovery / ID backfill) and reel_data (story/live status and the
+        # highlight catalog). The full web_profile_info payload is 50–200 KB per
+        # snapshot and was the main thing filling the database — this slim form
+        # is a few hundred bytes, so the 0.5 GB free tier effectively never
+        # fills. Everything diffable already lives in the snapshot's columns.
+        parsed_instagram_id = parsed.get("instagram_id") or self._extract_instagram_id(
+            fetch.raw_response
+        )
+        slim_raw: dict = {}
+        if parsed_instagram_id:
+            slim_raw["data"] = {"user": {"id": str(parsed_instagram_id)}}
         if reel_data_response:
-            raw_response_with_reel["reel_data"] = reel_data_response
+            slim_raw["reel_data"] = reel_data_response
 
         async with get_session() as session:
             previous = await crud.get_latest_snapshot(session, account_id)
@@ -526,7 +539,7 @@ class MonitorService:
                 profile_pic_hash=new_pic_hash,
                 external_url=parsed.get("external_url"),
                 http_status=200,
-                raw_response=raw_response_with_reel,
+                raw_response=slim_raw or None,
             )
 
             # Diff first, persist only when something actually changed.
@@ -536,7 +549,11 @@ class MonitorService:
                 # Keep only the latest 200 snapshots per account
                 await crud.cleanup_old_snapshots(session, account_id, keep_count=200)
             else:
-                previous.raw_response = fetch.raw_response
+                # Refresh in place with the slim form — the old code stored the
+                # full payload here WITHOUT reel_data, so every unchanged sweep
+                # both bloated the row and wiped the stored story/highlight
+                # state. The slim form keeps reel_data current instead.
+                previous.raw_response = slim_raw or None
                 previous.profile_pic_url = parsed.get("profile_pic_url")
                 previous.profile_pic_hash = new_pic_hash
                 previous.error = None
@@ -565,9 +582,6 @@ class MonitorService:
             account = await session.get(MonitoredAccount, account_id)
             if account is not None:
                 parsed_username = (parsed.get("username") or username).lower()
-                parsed_instagram_id = parsed.get("instagram_id") or self._extract_instagram_id(
-                    fetch.raw_response
-                )
                 # Store Instagram ID if account doesn't have one yet
                 if parsed_instagram_id and not account.instagram_id:
                     account.instagram_id = str(parsed_instagram_id)
