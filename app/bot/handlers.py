@@ -990,6 +990,13 @@ def _render_download_panel(
     """Selection-panel text + keyboard from the stored panel state (no network)."""
     items: list = state.get("items", [])
     selected: set[str] = state.get("selected", set())
+    # How many highlights the account really has (from web_profile_info), vs.
+    # how many we could actually list (catalog ids/titles, needs graphql).
+    hl_total = state.get("highlight_count")
+    if hl_total is None:
+        hl_total = len(items)
+    hl_unlisted = hl_total - len(items)
+
     lines = [f"📦 <b>Bulk download — @{esc(username)}</b>"]
     if state.get("is_private"):
         lines.append("🔒 <b>Private account</b> — media downloads will usually fail.")
@@ -997,10 +1004,26 @@ def _render_download_panel(
     info_bits: list[str] = []
     if state.get("posts_count") is not None:
         info_bits.append(f"{fmt_number(state['posts_count'])} posts")
-    info_bits.append(
-        f"{len(items)} highlight{'s' if len(items) != 1 else ''}"
-    )
+    info_bits.append(f"{hl_total} highlight{'s' if hl_total != 1 else ''}")
     lines.append(" · ".join(info_bits))
+
+    if hl_unlisted > 0:
+        # The account has highlights we couldn't enumerate — almost always
+        # because Instagram 401-blocks the anonymous highlight-catalog query
+        # from this server's datacenter IP. Be honest instead of showing 0.
+        lines.append("")
+        if items:
+            lines.append(
+                f"⚠️ Only {len(items)} of {hl_total} highlights could be listed "
+                "here — the rest can't be read anonymously from this server."
+            )
+        else:
+            lines.append(
+                f"⚠️ This account has {hl_total} highlight"
+                f"{'s' if hl_total != 1 else ''}, but they can't be listed "
+                "anonymously from this server, so there's nothing to tick. "
+                "Story, photos, reels, and the profile picture still work."
+            )
     lines.append("")
     lines.append(
         "Tick what you want, then ⬇️ <b>Download selected</b> — or "
@@ -1039,6 +1062,7 @@ async def _build_download_panel(
         "is_private": overview.get("is_private"),
         "posts_count": overview.get("posts_count"),
         "instagram_id": overview.get("instagram_id"),
+        "highlight_count": overview.get("highlight_count"),
     }
     context.user_data[_DL_STATE] = state
     return _render_download_panel(username, state)

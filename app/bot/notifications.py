@@ -8,13 +8,27 @@ from typing import Awaitable, Callable, Optional, Union
 
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import RetryAfter, TelegramError, TimedOut
 
 from app.config import settings
 from app.monitor.change_detector import ChangeSet
 from app.monitor.instagram import ProfileFetchResult
 from app.utils.formatting import esc, fmt_delta, fmt_number, truncate
 from app.utils.logger import logger
+
+
+# Media uploads need far longer than the python-telegram-bot 5 s default: the
+# file is streamed to Telegram and then Telegram processes it before replying.
+# From a cloud host (Render) this routinely takes >5 s, the request times out,
+# and — fatally — the old retry loop resent the same file, posting it 2–4×.
+# Generous write/read windows make a genuine timeout rare, and on the rare one
+# we treat an upload as delivered rather than retrying (see _send_with_retry).
+_UPLOAD_TIMEOUTS = {
+    "connect_timeout": 30.0,
+    "write_timeout": 180.0,  # the upload itself (big story videos)
+    "read_timeout": 120.0,   # waiting for Telegram to accept + reply
+    "pool_timeout": 60.0,
+}
 
 
 class NotificationDispatcher:
@@ -53,9 +67,10 @@ class NotificationDispatcher:
                     photo=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
+                    **_UPLOAD_TIMEOUTS,
                 )
 
-        ok = await self._send_with_retry(_send)
+        ok = await self._send_with_retry(_send, is_upload=True)
         if ok and self.post_send_hook is not None:
             await self.post_send_hook()
         return ok
@@ -68,9 +83,10 @@ class NotificationDispatcher:
                     document=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
+                    **_UPLOAD_TIMEOUTS,
                 )
 
-        return await self._send_with_retry(_send)
+        return await self._send_with_retry(_send, is_upload=True)
 
     async def send_video(self, path: Path, caption: Optional[str] = None) -> bool:
         async def _send():
@@ -81,14 +97,15 @@ class NotificationDispatcher:
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
                     supports_streaming=True,
+                    **_UPLOAD_TIMEOUTS,
                 )
 
-        ok = await self._send_with_retry(_send)
+        ok = await self._send_with_retry(_send, is_upload=True)
         if ok and self.post_send_hook is not None:
             await self.post_send_hook()
         return ok
 
-    async def _send_with_retry(self, action) -> bool:
+    async def _send_with_retry(self, action, *, is_upload: bool = False) -> bool:
         for attempt in range(1, 5):
             delay: float = 0.0
             async with self._send_lock:
@@ -102,6 +119,22 @@ class NotificationDispatcher:
                     delay = min(float(ra.retry_after) + 1.0, 30.0)
                     logger.warning(
                         "Telegram rate limit, sleeping {:.1f}s (attempt {})", delay, attempt
+                    )
+                except TimedOut as exc:
+                    # A media upload that times out has almost always already
+                    # reached Telegram — it's the *response* that was slow.
+                    # Retrying would post the same photo/video again (the 2–4×
+                    # duplicates users saw), so treat it as delivered instead.
+                    if is_upload:
+                        logger.warning(
+                            "Upload timed out (attempt {}/4) — assuming delivered, "
+                            "not retrying to avoid a duplicate: {}",
+                            attempt, exc,
+                        )
+                        return True
+                    delay = min(10.0, 2 ** attempt)
+                    logger.warning(
+                        "Telegram timeout attempt {}/4: {}", attempt, exc
                     )
                 except TelegramError as exc:
                     delay = min(10.0, 2 ** attempt)

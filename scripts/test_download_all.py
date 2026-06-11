@@ -100,6 +100,7 @@ def make_service_mock(items=None) -> SimpleNamespace:
                 "is_private": False,
                 "posts_count": 12,
                 "instagram_id": "777",
+                "highlight_count": len(items),
                 "error": None,
             }
         ),
@@ -482,6 +483,52 @@ async def test_all_with_state_and_no_highlights() -> None:
     )
 
 
+def test_panel_warns_when_highlights_unlistable() -> None:
+    # Account genuinely has 6 highlights, but the catalog couldn't be listed.
+    state = {
+        "username": "user",
+        "items": [],
+        "selected": set(),
+        "is_private": False,
+        "posts_count": 3,
+        "instagram_id": "777",
+        "highlight_count": 6,
+    }
+    text, markup = handlers._render_download_panel("user", state)
+    expect(
+        "panel reports the real highlight count, not 0",
+        "6 highlight" in text,
+        f"text={text!r}",
+    )
+    expect(
+        "panel explains highlights couldn't be listed",
+        "can't be listed" in text.lower(),
+        f"text={text!r}",
+    )
+    expect(
+        "panel with no listable highlights still offers story/photos/reels/pic",
+        any(b.callback_data == "dl:t:story:user" for b in flatten(markup)),
+    )
+
+
+def test_panel_partial_highlight_listing_warns() -> None:
+    state = {
+        "username": "user",
+        "items": [("1", "Trips")],  # only 1 of 4 listed
+        "selected": set(),
+        "is_private": False,
+        "posts_count": 3,
+        "instagram_id": "777",
+        "highlight_count": 4,
+    }
+    text, _markup = handlers._render_download_panel("user", state)
+    expect(
+        "panel notes only some highlights could be listed",
+        "1 of 4 highlights" in text,
+        f"text={text!r}",
+    )
+
+
 async def test_overview_failure_shows_error_panel() -> None:
     service = make_service_mock()
     service.get_download_overview = AsyncMock(
@@ -508,7 +555,12 @@ async def test_overview_failure_shows_error_panel() -> None:
 
 # ---------- service layer ----------
 
-def make_real_service(*, posts=None, highlights=None, reel_user=None):
+def make_real_service(*, posts=None, highlights=None, reel_user=None, story_count=None):
+    # story_count == web_profile_info's highlight_reel_count. Default it to the
+    # size of the listable catalog so "full catalog" scenarios are consistent;
+    # pass a larger value to simulate graphql under-listing (the 401 case).
+    if story_count is None:
+        story_count = len(highlights) if highlights else 0
     instagram = SimpleNamespace(
         fetch_profile=AsyncMock(
             return_value=SimpleNamespace(
@@ -518,6 +570,7 @@ def make_real_service(*, posts=None, highlights=None, reel_user=None):
                     "instagram_id": "777",
                     "is_private": False,
                     "posts_count": 7,
+                    "story_count": story_count,
                 },
                 raw_response={},
                 error=None,
@@ -666,6 +719,28 @@ async def test_overview_includes_catalog_and_privacy() -> None:
         and overview["instagram_id"] == "777",
         f"overview={overview}",
     )
+    expect(
+        "overview highlight_count matches the listed items when catalog is full",
+        overview["highlight_count"] == 2,
+        f"overview={overview}",
+    )
+
+
+async def test_overview_reports_unlistable_highlight_count() -> None:
+    # graphql 401-blocked → empty catalog, but web_profile_info still reports
+    # the count (story_count=5). The overview must surface that count so the
+    # panel can say "5 highlights exist but can't be listed here".
+    service, _ig, _stories, _notifier = make_real_service(
+        highlights={}, story_count=5
+    )
+    overview = await service.get_download_overview("someuser")
+    expect(
+        "overview surfaces the highlight count even with an empty catalog",
+        overview["ok"]
+        and overview["items"] == []
+        and overview["highlight_count"] == 5,
+        f"overview={overview}",
+    )
 
 
 async def test_overview_404() -> None:
@@ -738,6 +813,8 @@ async def main() -> int:
     test_keyboard_callback_lengths()
     test_main_menu_has_download_button()
     test_panel_marks_reflect_selection()
+    test_panel_warns_when_highlights_unlistable()
+    test_panel_partial_highlight_listing_warns()
 
     await test_dl_menu_shows_entry()
     await test_dl_manual_sets_prompt_state()
@@ -761,6 +838,7 @@ async def main() -> int:
     await test_download_highlights_empty_catalog()
     await test_stories_skip_profile_fetch_with_known_id()
     await test_overview_includes_catalog_and_privacy()
+    await test_overview_reports_unlistable_highlight_count()
     await test_overview_404()
     await test_fetch_and_send_profile_picture_sends_document()
     await test_profile_picture_falls_back_to_web_url()

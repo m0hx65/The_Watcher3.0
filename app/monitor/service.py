@@ -1412,12 +1412,18 @@ class MonitorService:
     async def get_download_overview(self, username: str) -> dict:
         """Profile basics + highlight catalog for the bulk-download panel.
 
-        One profile fetch (existence, privacy, post count, numeric id) plus the
-        anonymous highlight catalog. Mirrors list_highlights' persist/fallback
-        behavior for monitored accounts so the two stay consistent — the items
-        ordering here matches what the download-by-index methods recompute.
-        Returns {"ok", "items", "monitored", "is_private", "posts_count",
-        "instagram_id", "error"}.
+        One profile fetch (existence, privacy, post count, numeric id, and the
+        highlight *count*) plus the anonymous highlight catalog. Mirrors
+        list_highlights' persist/fallback behavior for monitored accounts so the
+        two stay consistent — the items ordering here matches what the
+        download-by-index methods recompute.
+
+        `highlight_count` comes from web_profile_info (which works even on
+        datacenter IPs), so we can tell the user how many highlights exist even
+        when the catalog itself (ids + titles) can't be listed because the
+        graphql reel query is 401-blocked from this server. Returns
+        {"ok", "items", "monitored", "is_private", "posts_count",
+        "instagram_id", "highlight_count", "error"}.
         """
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
@@ -1427,16 +1433,19 @@ class MonitorService:
 
         is_private: Optional[bool] = None
         posts_count: Optional[int] = None
+        highlight_count: Optional[int] = None
         fetch = await self.instagram.fetch_profile(username)
         if fetch.success and fetch.parsed:
             parsed = fetch.parsed
             is_private = bool(parsed.get("is_private"))
             posts_count = parsed.get("posts_count")
+            highlight_count = parsed.get("story_count")  # = highlight_reel_count
             instagram_id = instagram_id or parsed.get("instagram_id")
         elif fetch.http_status == 404:
             return {
                 "ok": False, "items": [], "monitored": account_id is not None,
                 "is_private": None, "posts_count": None, "instagram_id": None,
+                "highlight_count": None,
                 "error": f"@{username} doesn't exist (HTTP 404).",
             }
         # Other fetch failures are non-fatal: the panel still works, we just
@@ -1458,6 +1467,10 @@ class MonitorService:
                 catalog = await crud.get_highlight_catalog(session, account_id)
 
         items = sorted(catalog.items(), key=lambda kv: kv[0])
+        # If we couldn't list the catalog but know the count, surface the count
+        # (capped to ≥ the listed items, which can't exceed the real total).
+        if highlight_count is None or highlight_count < len(items):
+            highlight_count = len(items)
         return {
             "ok": True,
             "items": items,
@@ -1465,6 +1478,7 @@ class MonitorService:
             "is_private": is_private,
             "posts_count": posts_count,
             "instagram_id": instagram_id,
+            "highlight_count": highlight_count,
             "error": None,
         }
 
