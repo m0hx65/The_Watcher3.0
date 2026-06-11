@@ -30,6 +30,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 - 🕵️ **Truly anonymous.** Works with zero Instagram credentials — no account, no session cookie, no device fingerprint tied to you. There is nothing for Instagram to ban.
 - 🔒 **Private accounts too.** Follower/following/post counts, bio, name, username, profile picture, and privacy flips are tracked even for private accounts — anonymously. (Media delivery applies to public accounts; private content is never accessed.)
 - 🎬 **It doesn't just notify — it delivers.** New stories, posts, reels, highlights, and profile pictures arrive in your chat as actual photos and videos, not links.
+- 📦 **One tap grabs a whole account.** The **Download all** panel pulls the story, photos, reels, every highlight, and the profile picture of any public account — all of it, or just the parts you tick.
 - 📲 **Telegram is the entire UI.** Add targets, pause them, pull stories, tune the schedule, export history — all through inline buttons. You never touch a terminal after deploy.
 - ☁️ **Datacenter-proof.** Instagram blocks its GraphQL endpoints from cloud IPs; The Watcher detects the block, fast-fails, and reroutes through an anonymous downloader so everything keeps working on Render, Fly, or any VPS.
 - ⚡ **Proven at scale.** A single instance sweeps 25+ accounts around the clock — with jittered scheduling and throttled concurrency so it never trips rate limits.
@@ -41,6 +42,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
+| 📦 **Bulk download — a whole account in one tap** | New home-menu button. Pick a monitored account or type any username, profile URL, or numeric ID, then tick exactly what you want — 📖 story, 🖼 photos, 🎬 reels, 👤 profile picture, and each highlight by name — or hit **⚡ Download EVERYTHING**. Live per-category progress, a final summary, and zero login, like everything else. |
 | 🔕 **Per-highlight tracking** | Choose exactly which highlights to follow, per account. Mute one, several, or all — muted highlights are skipped by the sweep's auto-download (and not even fetched), while manual downloads keep working. Unmuting resumes cleanly from now, without dumping everything posted in between. |
 | 🖼 **Post & reel auto-delivery** | Every sweep detects new posts/reels and sends the actual media to your chat — capped at 5 per sweep so a posting spree never floods you. First sweep baselines silently (no backlog dump). |
 | ⏸ **Pause / resume targets** | Freeze monitoring with one tap or `/pause` — history, snapshots, and the resolved Instagram ID are all preserved. Resume picks up exactly where it left off. |
@@ -94,11 +96,13 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - **Highlights** listed by name with per-highlight download buttons and a download-all option
 - **Per-highlight mute** — 🔕 toggle any highlight (or mute/track all at once) to control exactly what the sweep auto-downloads; muted ones are marked on the account card and skipped without being fetched
 - **Profile pictures** in maximum available resolution, on demand via `/fetchphoto`
+- **📦 Bulk download** — one panel grabs a whole account: story, photos, reels, profile picture, and any (or all) highlights, with checkbox selection or a one-tap **⚡ EVERYTHING** button
 - All media retrieval is **login-free** — no Instagram session is ever used
 
 ### On-Demand Lookups
 - `/story @user` and `/highlights @user` work on **any public account**, monitored or not
 - **🔎 Any user** menu button does the same with zero typing
+- **📦 Download all** menu button bulk-grabs any account — monitored or not — by username, profile URL, or numeric Instagram ID
 
 ### Target Management
 - Add targets by `@username`, full profile URL, or raw numeric Instagram ID
@@ -284,9 +288,10 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 
 **Everything is also reachable through buttons** — no commands required:
 
-- **Main menu** — Accounts · Status · Add · Interval · Export · Help · **🔎 Any user** · **Sweep All**
+- **Main menu** — Accounts · Status · Add · Interval · Export · Help · **🔎 Any user** · **📦 Download all** · **Sweep All**
 - **Account card** — Recheck · History · Photo · Remove · **Story** · **Highlights** · **Pause ⇄ Resume**
 - **Highlights view** — ⬇️ Download all (n), one download button per highlight, plus 🔕/🔔 mute toggles per highlight and a mute-all / track-all shortcut
+- **📦 Bulk download panel** — asks whether the target is monitored (pick from the list) or not (type a username, URL, or ID), then shows checkboxes for 📖 Story · 👤 Profile pic · 🖼 Photos · 🎬 Reels · every highlight by name, with a select-all-highlights shortcut. **⬇️ Download selected** sends exactly what's ticked; **⚡ Download EVERYTHING** sends it all — with live per-category progress and a final summary
 - **Status view** — Sweep Now · Interval · **Clear Old Data** (with confirmation)
 - **Interval picker** — presets from 5 m to 6 h plus free-form custom entry
 - **Panel bumping** — after every notification the menu re-posts at the bottom of the chat, so it's always within thumb's reach

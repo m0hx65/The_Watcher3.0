@@ -372,13 +372,41 @@ Set `IG_PROXY_URL` in environment variables to enable.
 
 ### Inline Menu Navigation
 
-The main panel has a 2×3 button grid: **Accounts · Status · Interval · Add · Export · Help**.
+The main panel buttons: **Accounts · Status · Add · Interval · Export · Help ·
+🔎 Any user · 📦 Download all · Sweep All**.
 
-From an account card: **Recheck · History · Photo · Remove · Home**.
+From an account card: **Recheck · History · Photo · Remove · Story ·
+Highlights · Pause ⇄ Resume · Home**.
 
 The panel always stays as the last message in the chat — automated sweep
 notifications push it back down, and the panel-bump logic re-sends it after
 every batch of notifications.
+
+### 📦 Bulk Download
+
+The **Download all** button on the main menu grabs a whole account in one flow:
+
+1. Asks whether the account is in the monitored list — pick it from the
+   paginated list, or type a **username**, **profile URL**, or **numeric
+   Instagram ID** (same parsing as `/add`).
+2. Shows a checkbox panel: **📖 Story · 👤 Profile pic · 🖼 Photos ·
+   🎬 Reels**, plus **every highlight listed by name** and a
+   select-all-highlights shortcut.
+3. **⬇️ Download selected** sends exactly the ticked items —
+   e.g. just the reels and two of six highlights. **⚡ Download EVERYTHING**
+   sends story + photos + reels + profile picture + all highlights without
+   ticking anything.
+
+Per-category progress is edited into the message as the run advances, and a
+summary closes it out. Works for any public account, monitored or not, and
+stays 100% login-free (anonymous GraphQL catalog + saveinsta media paths —
+photos/reels cover what the anonymous profile grid serves). For monitored
+accounts, delivered items are marked seen so the next sweep never re-sends
+them. Selection state lives in `user_data` (`dl:*` callbacks in
+`app/bot/keyboards.py`); the download fan-out is `_run_bundle_download` in
+`app/bot/handlers.py` backed by `download_posts`,
+`download_highlights_by_indexes`, `fetch_and_send_profile_picture`, and
+`get_download_overview` in `app/monitor/service.py`.
 
 ### Authorization
 
