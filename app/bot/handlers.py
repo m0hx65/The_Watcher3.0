@@ -50,6 +50,7 @@ HELP_TEXT = (
     "🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
+    "<code>/add user1 user2 user3</code> — add several at once (space/comma/newline separated)\n"
     "<code>/remove @user</code> — stop monitoring\n"
     "<code>/pause @user</code> · <code>/resume @user</code> — pause/resume a target\n"
     "<code>/list</code> — all accounts\n"
@@ -105,6 +106,9 @@ _PROMPT_MSG_ID = "prompt_msg_id"
 # moved to the bottom of the chat after automated notifications arrive.
 PANEL_MSG_ID = "panel_msg_id"
 PANEL_CHAT_ID = "panel_chat_id"
+# Splits a bulk add into individual targets on commas, spaces, or new lines.
+# Profile URLs contain none of these, so they survive intact as one token.
+_ADD_SPLIT_RE = re.compile(r"[\s,]+")
 # Instagram usernames: 1–30 chars, ASCII letters/digits/dots/underscores.
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 _INSTAGRAM_ID_RE = re.compile(r"^\d{1,64}$")
@@ -670,6 +674,95 @@ async def _do_add(
                 text=f"Initial check error: <code>{esc(repr(exc))}</code>",
                 parse_mode=ParseMode.HTML,
             )
+
+
+def _split_add_targets(raw: str) -> list[str]:
+    """Break a typed/arg string into individual add targets (comma/space/newline)."""
+    return [t for t in _ADD_SPLIT_RE.split(raw.strip()) if t]
+
+
+async def _do_add_bulk(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tokens: list[str],
+) -> None:
+    """Add several accounts from one message, then check them in the background.
+
+    Each token is parsed like a single /add (username, profile URL, or numeric
+    id). Adds are persisted immediately and a summary is sent; first checks run
+    afterwards in the background so the reply isn't held up by 11 network round
+    trips. New accounts baseline silently on that first check (no story flood).
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = _chat_id(update)
+    service: MonitorService = context.application.bot_data["monitor"]
+
+    resolved: list[tuple[str, Optional[str]]] = []
+    invalid: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        username, instagram_id = _parse_add_target(tok)
+        if not username and not instagram_id:
+            invalid.append(tok)
+            continue
+        if instagram_id and not username:
+            username = await _resolve_username_for_instagram_id(context, instagram_id)
+            if not username:
+                invalid.append(tok)
+                continue
+        if username in seen:
+            continue
+        seen.add(username)
+        resolved.append((username, instagram_id))
+
+    created: list[str] = []
+    already: list[str] = []
+    async with get_session() as session:
+        for username, instagram_id in resolved:
+            account, was_created = await crud.add_account(
+                session, username, added_by=user_id, instagram_id=instagram_id
+            )
+            (created if was_created else already).append(account.username)
+
+    lines = [f"📥 <b>Bulk add</b> — {len(tokens)} entr{'y' if len(tokens) == 1 else 'ies'}"]
+    if created:
+        lines.append(
+            f"\n✅ <b>Added ({len(created)})</b>: "
+            + ", ".join(f"@{esc(n)}" for n in created)
+        )
+    if already:
+        lines.append(
+            f"\n➡️ <b>Already monitored ({len(already)})</b>: "
+            + ", ".join(f"@{esc(n)}" for n in already)
+        )
+    if invalid:
+        lines.append(
+            f"\n⚠️ <b>Couldn't read ({len(invalid)})</b>: "
+            + ", ".join(f"<code>{esc(t)}</code>" for t in invalid)
+        )
+    if created:
+        lines.append("\n⏳ Running first checks in the background…")
+    await _reply_or_edit(
+        update, "\n".join(lines), reply_markup=keyboards.main_menu()
+    )
+
+    if not created:
+        return
+
+    async def _baseline() -> None:
+        await asyncio.gather(
+            *(service.check_username(n, notify_unchanged=False) for n in created),
+            return_exceptions=True,
+        )
+        if chat_id is not None:
+            noun = "account" if len(created) == 1 else "accounts"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ First checks done for {len(created)} {noun}. Monitoring is live.",
+                parse_mode=ParseMode.HTML,
+            )
+
+    asyncio.create_task(_baseline())
 
 
 async def _send_profile_photo(
@@ -1436,7 +1529,11 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
     if context.args:
-        username, instagram_id = _parse_add_target(context.args[0])
+        tokens = _split_add_targets(" ".join(context.args))
+        if len(tokens) > 1:
+            await _do_add_bulk(update, context, tokens)
+            return
+        username, instagram_id = _parse_add_target(tokens[0] if tokens else context.args[0])
         if not username and not instagram_id:
             await update.message.reply_text(
                 "That doesn't look like a valid Instagram username or numeric user ID. "
@@ -1466,7 +1563,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _consume_prompt_message(update, context)
     context.user_data[_AWAITING_USERNAME] = True
     prompt = await update.message.reply_text(
-        "Send the Instagram <b>username</b>, <b>profile URL</b>, or <b>numeric user ID</b> you want to monitor.",
+        "Send the Instagram <b>username</b>, <b>profile URL</b>, or <b>numeric user ID</b> "
+        "you want to monitor.\n\n"
+        "<i>Adding several? Send them all in one message, separated by spaces, "
+        "commas, or new lines.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboards.cancel_only(),
     )
@@ -1904,6 +2004,10 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _consume_prompt_message(update, context)
 
     raw = (update.message.text or "").strip()
+    tokens = _split_add_targets(raw)
+    if len(tokens) > 1:
+        await _do_add_bulk(update, context, tokens)
+        return
     username, instagram_id = _parse_add_target(raw)
     if not username and not instagram_id:
         await update.message.reply_text(
@@ -2092,7 +2196,10 @@ async def _handle_menu(
             context.user_data[_PROMPT_MSG_ID] = query.message.message_id
         await _safe_edit_text(
             query,
-            "Send the Instagram <b>username</b>, <b>profile URL</b>, or <b>numeric user ID</b> you want to monitor.",
+            "Send the Instagram <b>username</b>, <b>profile URL</b>, or <b>numeric user ID</b> "
+            "you want to monitor.\n\n"
+            "<i>Adding several? Send them all in one message, separated by spaces, "
+            "commas, or new lines.</i>",
             reply_markup=keyboards.cancel_only(),
         )
         return
