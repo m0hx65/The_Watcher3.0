@@ -191,6 +191,13 @@ async def main_async(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # asyncpg's TLS upgrade fails on Windows' default Proactor loop with
+    # "[WinError 64] The specified network name is no longer available" when
+    # talking to SSL-required hosts (Render, Neon). The Selector loop does the
+    # upgrade correctly, so force it on Windows for this one-shot tool.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     parser = argparse.ArgumentParser(description="Migrate The Watcher's DB data.")
     parser.add_argument("--source", help="Source DATABASE_URL (the old/Render DB)")
     parser.add_argument("--target", help="Target DATABASE_URL (the new/Neon DB)")
