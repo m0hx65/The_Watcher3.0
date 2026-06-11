@@ -1112,13 +1112,18 @@ class MonitorService:
     # not monitored, account_id is None: media is still fetched and sent, but
     # nothing is persisted (no snapshot, no seen-dedup row).
 
-    async def fetch_and_send_stories(self, username: str) -> dict:
+    async def fetch_and_send_stories(
+        self, username: str, *, instagram_id: Optional[str] = None
+    ) -> dict:
         """Download every current story item for a public account and send them now.
 
         Works for any public username. Unlike the sweep path this ignores the
         seen-deduplication set so the user always receives whatever is live at
         the moment they ask. For monitored accounts the items are recorded as
         seen afterwards so the next sweep won't re-send them.
+        Pass `instagram_id` when it's already known (e.g. from the bulk-download
+        panel) to skip the profile fetch — Instagram's web API rate-limits to
+        401 quickly on datacenter IPs, so every avoided call matters.
         Returns {"ok": bool, "count": int, "error": Optional[str]}.
         """
         if self.stories is None:
@@ -1127,7 +1132,7 @@ class MonitorService:
         async with get_session() as session:
             account = await crud.get_account(session, username)
         account_id = account.id if account else None
-        instagram_id = account.instagram_id if account else None
+        instagram_id = instagram_id or (account.instagram_id if account else None)
 
         # Distinguish "no active story" (a real, anonymous-knowable state) from
         # "there is a story but we can't fetch the media". The reel query tells us
@@ -1284,34 +1289,30 @@ class MonitorService:
         sent = await self._deliver_story_items(account_id, username, story_items, set())
         return {"ok": True, "count": sent, "reels": len(items), "error": None}
 
-    async def download_highlights_by_indexes(
-        self, username: str, indexes: list[int]
+    async def download_highlights_from_catalog(
+        self, username: str, catalog: dict[str, str]
     ) -> dict:
-        """Download and send a chosen subset of highlight reels (by list index).
+        """Download and send specific highlight reels from a known catalog.
 
-        The indexes refer to the ordering returned by `list_highlights` (sorted
-        by highlight id), recomputed here — same contract as download_highlight.
+        `catalog` is {highlight_id: title}, e.g. the (id, title) pairs the
+        bulk-download panel already fetched and showed the user. The media
+        comes straight from saveinsta by highlight id — no Instagram web/graphql
+        call happens here, so this still works when Instagram is 401-blocking
+        the datacenter IP (which is what list-based re-resolution dies on).
         Returns {"ok", "count", "reels", "error"}.
         """
         if self.stories is None:
             return {"ok": False, "count": 0, "reels": 0, "error": "Stories client unavailable"}
+        if not catalog:
+            return {
+                "ok": False, "count": 0, "reels": 0,
+                "error": "Those highlights are no longer available — refresh the list.",
+            }
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
             account = await crud.get_account(session, username)
         account_id = account.id if account else None
 
-        listing = await self.list_highlights(username)
-        items = listing.get("items", [])
-        wanted = {i for i in indexes if 0 <= i < len(items)}
-        if not wanted:
-            return {
-                "ok": False, "count": 0, "reels": 0,
-                "error": "Those highlights are no longer available — refresh the list.",
-            }
-
-        catalog = {
-            hid: title for i, (hid, title) in enumerate(items) if i in wanted
-        }
         story_items = await self._gather_highlight_items(username, catalog)
         if not story_items:
             return {
@@ -1415,7 +1416,8 @@ class MonitorService:
         anonymous highlight catalog. Mirrors list_highlights' persist/fallback
         behavior for monitored accounts so the two stay consistent — the items
         ordering here matches what the download-by-index methods recompute.
-        Returns {"ok", "items", "monitored", "is_private", "posts_count", "error"}.
+        Returns {"ok", "items", "monitored", "is_private", "posts_count",
+        "instagram_id", "error"}.
         """
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
@@ -1434,7 +1436,7 @@ class MonitorService:
         elif fetch.http_status == 404:
             return {
                 "ok": False, "items": [], "monitored": account_id is not None,
-                "is_private": None, "posts_count": None,
+                "is_private": None, "posts_count": None, "instagram_id": None,
                 "error": f"@{username} doesn't exist (HTTP 404).",
             }
         # Other fetch failures are non-fatal: the panel still works, we just
@@ -1462,6 +1464,7 @@ class MonitorService:
             "monitored": account_id is not None,
             "is_private": is_private,
             "posts_count": posts_count,
+            "instagram_id": instagram_id,
             "error": None,
         }
 
@@ -1559,14 +1562,11 @@ class MonitorService:
         Returns {"ok", "path", "sha256", "byte_size", "hd", "error"}.
         """
         username = username.strip().lstrip("@").lower()
-        fetch = await self.instagram.fetch_profile(username)
-        if not fetch.success or not fetch.parsed:
-            return {
-                "ok": False, "path": None,
-                "error": fetch.error or f"HTTP {fetch.http_status}",
-            }
-        web_url = fetch.parsed.get("profile_pic_url")  # already hd(320) or 150
 
+        # Try the login-free HD avatar (saveinsta) FIRST — it needs no Instagram
+        # call at all. The Instagram web fetch only happens as a fallback, since
+        # datacenter IPs get 401-rate-limited after a handful of requests and a
+        # bulk download must not burn one of those on a picture saveinsta serves.
         hd_url: Optional[str] = None
         if self.stories is not None:
             try:
@@ -1575,14 +1575,25 @@ class MonitorService:
                 logger.debug("HD profile pic fetch failed for @{}: {}", username, exc)
                 hd_url = None
 
-        chosen = hd_url or web_url
-        if not chosen:
-            return {"ok": False, "path": None, "error": "No profile picture available"}
+        hashed: Optional[HashedMedia] = None
+        if hd_url:
+            hashed = await self.hasher.hash_url(hd_url, username)
 
-        hashed = await self.hasher.hash_url(chosen, username)
-        # If the HD source failed mid-download, fall back to the web URL.
-        if hashed is None and hd_url and web_url and web_url != chosen:
+        if hashed is None:
+            # No HD avatar (private account / saveinsta down) or its download
+            # failed mid-flight — fall back to the web profile_pic_url_hd (320px).
+            fetch = await self.instagram.fetch_profile(username)
+            if not fetch.success or not fetch.parsed:
+                return {
+                    "ok": False, "path": None,
+                    "error": fetch.error or f"HTTP {fetch.http_status}",
+                }
+            web_url = fetch.parsed.get("profile_pic_url")  # already hd(320) or 150
+            if not web_url:
+                return {"ok": False, "path": None, "error": "No profile picture available"}
+            hd_url = None  # what we deliver below is the web fallback, not HD
             hashed = await self.hasher.hash_url(web_url, username)
+
         if hashed is None:
             return {"ok": False, "path": None, "error": "Failed to download profile picture"}
 

@@ -1038,6 +1038,7 @@ async def _build_download_panel(
         "selected": set(),
         "is_private": overview.get("is_private"),
         "posts_count": overview.get("posts_count"),
+        "instagram_id": overview.get("instagram_id"),
     }
     context.user_data[_DL_STATE] = state
     return _render_download_panel(username, state)
@@ -1069,6 +1070,14 @@ async def _run_bundle_download(
     """
     query = update.callback_query
     service: MonitorService = context.application.bot_data["monitor"]
+
+    # Reuse what the panel already resolved: the highlight catalog (so the
+    # download never re-asks Instagram, which 401-rate-limits datacenter IPs)
+    # and the numeric id (so the story step can skip its profile fetch).
+    state = context.user_data.get(_DL_STATE)
+    state_ok = isinstance(state, dict) and state.get("username") == username
+    panel_items: list = state.get("items", []) if state_ok else []
+    instagram_id = state.get("instagram_id") if state_ok else None
 
     hl_indexes = sorted(
         int(t[1:]) for t in tokens if t.startswith("h") and t[1:].isdigit()
@@ -1110,7 +1119,9 @@ async def _run_bundle_download(
 
     if want_story:
         await progress("current story")
-        r = await service.fetch_and_send_stories(username)
+        r = await service.fetch_and_send_stories(
+            username, instagram_id=instagram_id
+        )
         if r.get("ok"):
             count = r.get("count", 0)
             if count:
@@ -1143,8 +1154,20 @@ async def _run_bundle_download(
             )
 
     if want_all_highlights:
-        await progress("all highlights (this can take a while)")
-        r = await service.download_all_highlights(username)
+        if panel_items:
+            # The panel already knows every (id, title) — download straight
+            # from saveinsta without touching Instagram again.
+            await progress("all highlights (this can take a while)")
+            r = await service.download_highlights_from_catalog(
+                username, dict(panel_items)
+            )
+        elif state_ok:
+            # Panel state exists and genuinely has zero highlights.
+            r = {"ok": True, "count": 0, "reels": 0, "error": None}
+        else:
+            # Cold press without panel state — resolve the catalog fresh.
+            await progress("all highlights (this can take a while)")
+            r = await service.download_all_highlights(username)
         if r.get("ok"):
             reels = r.get("reels", 0)
             if reels:
@@ -1161,7 +1184,12 @@ async def _run_bundle_download(
     elif hl_indexes:
         noun = "highlight" if len(hl_indexes) == 1 else "highlights"
         await progress(f"{len(hl_indexes)} {noun} (this can take a while)")
-        r = await service.download_highlights_by_indexes(username, hl_indexes)
+        catalog = {
+            panel_items[i][0]: panel_items[i][1]
+            for i in hl_indexes
+            if 0 <= i < len(panel_items)
+        }
+        r = await service.download_highlights_from_catalog(username, catalog)
         if r.get("ok"):
             lines.append(
                 f"✨ Highlights — {r.get('count', 0)} items "

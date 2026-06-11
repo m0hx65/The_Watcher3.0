@@ -405,8 +405,12 @@ accounts, delivered items are marked seen so the next sweep never re-sends
 them. Selection state lives in `user_data` (`dl:*` callbacks in
 `app/bot/keyboards.py`); the download fan-out is `_run_bundle_download` in
 `app/bot/handlers.py` backed by `download_posts`,
-`download_highlights_by_indexes`, `fetch_and_send_profile_picture`, and
-`get_download_overview` in `app/monitor/service.py`.
+`download_highlights_from_catalog`, `fetch_and_send_profile_picture`, and
+`get_download_overview` in `app/monitor/service.py`. The panel's
+already-fetched highlight catalog and numeric id are reused by the download
+steps, so a full run makes at most one Instagram web call — important on
+datacenter IPs (e.g. Render), where Instagram starts returning 401 after a
+few requests; the media itself flows entirely through saveinsta.
 
 ### Authorization
 

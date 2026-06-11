@@ -99,6 +99,7 @@ def make_service_mock(items=None) -> SimpleNamespace:
                 "monitored": False,
                 "is_private": False,
                 "posts_count": 12,
+                "instagram_id": "777",
                 "error": None,
             }
         ),
@@ -110,7 +111,7 @@ def make_service_mock(items=None) -> SimpleNamespace:
         download_all_highlights=AsyncMock(
             return_value={"ok": True, "count": 9, "reels": 3, "error": None}
         ),
-        download_highlights_by_indexes=AsyncMock(
+        download_highlights_from_catalog=AsyncMock(
             return_value={"ok": True, "count": 4, "reels": 2, "error": None}
         ),
         instagram=SimpleNamespace(fetch_username_by_id=AsyncMock(return_value="someuser")),
@@ -351,7 +352,7 @@ async def test_go_with_empty_selection_alerts() -> None:
         service.fetch_and_send_stories.await_count == 0
         and service.download_posts.await_count == 0
         and service.download_all_highlights.await_count == 0
-        and service.download_highlights_by_indexes.await_count == 0
+        and service.download_highlights_from_catalog.await_count == 0
         and service.fetch_and_send_profile_picture.await_count == 0,
     )
 
@@ -365,10 +366,17 @@ async def test_go_routes_selection_to_services() -> None:
         "selected": {"story", "ph", "h0", "h2"},
         "is_private": False,
         "posts_count": 12,
+        "instagram_id": "777",
     }
     update = make_update(callback_data="dl:go:user")
     await handlers.on_callback(update, context)
-    expect("go downloads the story", service.fetch_and_send_stories.await_count == 1)
+    story_call = service.fetch_and_send_stories.call_args
+    expect(
+        "go downloads the story reusing the panel's instagram_id",
+        story_call is not None
+        and story_call.kwargs.get("instagram_id") == "777",
+        f"call={story_call}",
+    )
     call = service.download_posts.call_args
     expect(
         "go downloads photos only (reels not ticked)",
@@ -377,10 +385,10 @@ async def test_go_routes_selection_to_services() -> None:
         and call.kwargs.get("videos") is False,
         f"call={call}",
     )
-    hl_call = service.download_highlights_by_indexes.call_args
+    hl_call = service.download_highlights_from_catalog.call_args
     expect(
-        "go downloads exactly the two ticked highlights",
-        hl_call is not None and hl_call.args[1] == [0, 2],
+        "go downloads exactly the two ticked highlights from the panel catalog",
+        hl_call is not None and hl_call.args[1] == {"1": "Trips", "3": "Cats"},
         f"call={hl_call}",
     )
     expect(
@@ -391,6 +399,8 @@ async def test_go_routes_selection_to_services() -> None:
 
 
 async def test_all_downloads_everything() -> None:
+    # Cold press (no panel state): everything still works, highlights resolve
+    # the catalog fresh via download_all_highlights.
     service = make_service_mock()
     context = make_context(service)
     update = make_update(callback_data="dl:all:user")
@@ -407,7 +417,68 @@ async def test_all_downloads_everything() -> None:
     )
     expect(
         "EVERYTHING needs no stored panel state",
-        service.download_highlights_by_indexes.await_count == 0,
+        service.download_highlights_from_catalog.await_count == 0,
+    )
+
+
+async def test_all_with_panel_state_skips_relisting() -> None:
+    # Regression for the production 401 failure: with the panel open, EVERYTHING
+    # must reuse the already-fetched catalog and never re-resolve via Instagram.
+    service = make_service_mock()
+    context = make_context(service)
+    context.user_data[handlers._DL_STATE] = {
+        "username": "user",
+        "items": [("1", "Trips"), ("2", "Food")],
+        "selected": set(),
+        "is_private": False,
+        "posts_count": 12,
+        "instagram_id": "777",
+    }
+    update = make_update(callback_data="dl:all:user")
+    await handlers.on_callback(update, context)
+    hl_call = service.download_highlights_from_catalog.call_args
+    expect(
+        "EVERYTHING with panel state downloads from the stored catalog",
+        hl_call is not None
+        and hl_call.args[1] == {"1": "Trips", "2": "Food"},
+        f"call={hl_call}",
+    )
+    expect(
+        "EVERYTHING with panel state never re-lists highlights",
+        service.download_all_highlights.await_count == 0,
+    )
+    story_call = service.fetch_and_send_stories.call_args
+    expect(
+        "EVERYTHING passes the panel's instagram_id to the story step",
+        story_call is not None
+        and story_call.kwargs.get("instagram_id") == "777",
+        f"call={story_call}",
+    )
+
+
+async def test_all_with_state_and_no_highlights() -> None:
+    service = make_service_mock()
+    context = make_context(service)
+    context.user_data[handlers._DL_STATE] = {
+        "username": "user",
+        "items": [],
+        "selected": set(),
+        "is_private": False,
+        "posts_count": 3,
+        "instagram_id": "777",
+    }
+    update = make_update(callback_data="dl:all:user")
+    await handlers.on_callback(update, context)
+    expect(
+        "EVERYTHING with a zero-highlight panel skips both highlight paths",
+        service.download_highlights_from_catalog.await_count == 0
+        and service.download_all_highlights.await_count == 0,
+    )
+    expect(
+        "the rest of EVERYTHING still runs with no highlights",
+        service.fetch_and_send_profile_picture.await_count == 1
+        and service.fetch_and_send_stories.await_count == 1
+        and service.download_posts.await_count == 1,
     )
 
 
@@ -523,9 +594,10 @@ async def test_download_posts_empty_grid_reports_error() -> None:
     )
 
 
-async def test_download_highlights_by_indexes_picks_right_reels() -> None:
-    highlights = {"1": "Trips", "2": "Food", "3": "Cats"}
-    service, _ig, stories, notifier = make_real_service(highlights=highlights)
+async def test_download_highlights_from_catalog_no_instagram_calls() -> None:
+    # Regression for the production 401 failure: with a known catalog, the
+    # highlight download must run purely on saveinsta — zero Instagram calls.
+    service, ig, stories, notifier = make_real_service()
 
     async def fake_items(username, hid, title):
         return [
@@ -537,10 +609,12 @@ async def test_download_highlights_by_indexes_picks_right_reels() -> None:
         ]
 
     stories.fetch_highlight_items = AsyncMock(side_effect=fake_items)
-    result = await service.download_highlights_by_indexes("someuser", [0, 2])
+    result = await service.download_highlights_from_catalog(
+        "someuser", {"1": "Trips", "3": "Cats"}
+    )
     fetched = sorted(c.args[1] for c in stories.fetch_highlight_items.call_args_list)
     expect(
-        "indexes 0 and 2 map to highlight ids 1 and 3 (sorted ordering)",
+        "exactly the given highlight ids are fetched",
         fetched == ["1", "3"],
         f"fetched={fetched}",
     )
@@ -550,15 +624,31 @@ async def test_download_highlights_by_indexes_picks_right_reels() -> None:
         f"result={result}",
     )
     expect("items sent as photos", notifier.send_photo.await_count == 2)
-
-
-async def test_download_highlights_bad_indexes() -> None:
-    service, _ig, _stories, _notifier = make_real_service(highlights={"1": "Trips"})
-    result = await service.download_highlights_by_indexes("someuser", [5])
     expect(
-        "out-of-range indexes fail gracefully",
+        "catalog download makes ZERO Instagram web/graphql calls",
+        ig.fetch_profile.await_count == 0 and ig.fetch_reel_user.await_count == 0,
+        f"profile={ig.fetch_profile.await_count} reel={ig.fetch_reel_user.await_count}",
+    )
+
+
+async def test_download_highlights_empty_catalog() -> None:
+    service, _ig, _stories, _notifier = make_real_service()
+    result = await service.download_highlights_from_catalog("someuser", {})
+    expect(
+        "empty catalog fails gracefully",
         not result["ok"] and "refresh" in (result["error"] or "").lower(),
         f"result={result}",
+    )
+
+
+async def test_stories_skip_profile_fetch_with_known_id() -> None:
+    service, ig, stories, _notifier = make_real_service()
+    stories.fetch_stories = AsyncMock(return_value=[post("s1", "image")])
+    result = await service.fetch_and_send_stories("someuser", instagram_id="777")
+    expect(
+        "stories with a known id never call fetch_profile",
+        result["ok"] and ig.fetch_profile.await_count == 0,
+        f"result={result} profile_calls={ig.fetch_profile.await_count}",
     )
 
 
@@ -568,11 +658,12 @@ async def test_overview_includes_catalog_and_privacy() -> None:
     )
     overview = await service.get_download_overview("@SomeUser")
     expect(
-        "overview returns sorted highlight items + profile basics",
+        "overview returns sorted highlight items + profile basics + id",
         overview["ok"]
         and overview["items"] == [("1", "A"), ("2", "B")]
         and overview["is_private"] is False
-        and overview["posts_count"] == 7,
+        and overview["posts_count"] == 7
+        and overview["instagram_id"] == "777",
         f"overview={overview}",
     )
 
@@ -594,7 +685,7 @@ async def test_overview_404() -> None:
 
 
 async def test_fetch_and_send_profile_picture_sends_document() -> None:
-    service, _ig, stories, notifier = make_real_service()
+    service, ig, stories, notifier = make_real_service()
     pic = SimpleNamespace(
         sha256="ab" * 32, local_path=Path("pic.jpg"), byte_size=1000,
         content_type="image/jpeg", source_url="u",
@@ -605,6 +696,35 @@ async def test_fetch_and_send_profile_picture_sends_document() -> None:
     expect(
         "profile picture fetched HD and sent as a document",
         result["ok"] and result["hd"] and notifier.send_document.await_count == 1,
+        f"result={result}",
+    )
+    expect(
+        "HD avatar path makes zero Instagram calls",
+        ig.fetch_profile.await_count == 0,
+        f"profile_calls={ig.fetch_profile.await_count}",
+    )
+
+
+async def test_profile_picture_falls_back_to_web_url() -> None:
+    service, ig, stories, _notifier = make_real_service()
+    pic = SimpleNamespace(
+        sha256="cd" * 32, local_path=Path("pic.jpg"), byte_size=500,
+        content_type="image/jpeg", source_url="u",
+    )
+    stories.fetch_profile_pic_url = AsyncMock(return_value=None)  # saveinsta has nothing
+    ig.fetch_profile = AsyncMock(
+        return_value=SimpleNamespace(
+            success=True, http_status=200,
+            parsed={"profile_pic_url": "https://ig.example/320.jpg"},
+            raw_response={}, error=None,
+        )
+    )
+    service.hasher.hash_url = AsyncMock(return_value=pic)
+    result = await service.fetch_profile_picture("someuser")
+    expect(
+        "no HD avatar falls back to the web profile_pic_url (320px, hd=False)",
+        result["ok"] and result["hd"] is False
+        and ig.fetch_profile.await_count == 1,
         f"result={result}",
     )
 
@@ -630,16 +750,20 @@ async def main() -> int:
     await test_go_with_empty_selection_alerts()
     await test_go_routes_selection_to_services()
     await test_all_downloads_everything()
+    await test_all_with_panel_state_skips_relisting()
+    await test_all_with_state_and_no_highlights()
     await test_overview_failure_shows_error_panel()
 
     await test_download_posts_filters_photos_only()
     await test_download_posts_both_kinds()
     await test_download_posts_empty_grid_reports_error()
-    await test_download_highlights_by_indexes_picks_right_reels()
-    await test_download_highlights_bad_indexes()
+    await test_download_highlights_from_catalog_no_instagram_calls()
+    await test_download_highlights_empty_catalog()
+    await test_stories_skip_profile_fetch_with_known_id()
     await test_overview_includes_catalog_and_privacy()
     await test_overview_404()
     await test_fetch_and_send_profile_picture_sends_document()
+    await test_profile_picture_falls_back_to_web_url()
 
     await dispose_engine()
 
