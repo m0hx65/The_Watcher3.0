@@ -3,7 +3,9 @@
 The full web_profile_info payload is 50-200 KB per row and was filling the
 0.5 GB Neon tier; _handle_success must store only {data.user.id, reel_data}.
 Also guards the regression where an unchanged sweep refreshed the latest row
-with the full payload and silently dropped reel_data.
+with the full payload and silently dropped reel_data, and asserts that a
+manual check_username() runs the SAME story/highlight phase as a scheduled
+sweep (catalog stored + items baselined).
 
 Runs on sqlite with fakes — no Telegram, no network.
 """
@@ -31,10 +33,17 @@ os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}
 
 from sqlalchemy import select  # noqa: E402
 
-from app.database.models import AccountSnapshot, Base, MonitoredAccount  # noqa: E402
+from app.database.models import (  # noqa: E402
+    AccountSnapshot,
+    Base,
+    MonitoredAccount,
+    SeenStory,
+    StoredHighlight,
+)
 from app.database.session import dispose_engine, engine, get_session  # noqa: E402
 from app.monitor.instagram import ProfileFetchResult  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402
+from app.monitor.stories import StoryItem  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -168,6 +177,45 @@ async def main() -> int:
     )
     raw_size = len(json.dumps(raw))
     expect("refreshed row is still slim", raw_size < 2048, f"{raw_size} bytes")
+
+    # --- Manual recheck runs the SAME story/highlight phase as a sweep ---
+    class FakeStories:
+        async def fetch_stories(self, username: str):
+            return [
+                StoryItem(pk="story1", taken_at=0, media_type="image",
+                          url="http://x/1.jpg", source="story")
+            ]
+
+        async def fetch_highlight_items(self, username: str, hid: str, title: str):
+            return [
+                StoryItem(pk="hl1", taken_at=0, media_type="image",
+                          url="http://x/2.jpg", source="highlight",
+                          highlight_id=hid, highlight_title=title)
+            ]
+
+    service_with_stories = MonitorService(
+        instagram=FakeInstagram(),
+        hasher=AsyncMock(hash_url=AsyncMock(return_value=None)),
+        notifier=notifier,
+        stories=FakeStories(),
+    )
+    result = await service_with_stories.check_username("opscn1")
+    expect("recheck with stories ok", result.get("ok") is True, repr(result))
+
+    async with get_session() as session:
+        highlights = (await session.execute(select(StoredHighlight))).scalars().all()
+        seen = (await session.execute(select(SeenStory))).scalars().all()
+    expect(
+        "manual check stored the highlight catalog",
+        [h.highlight_id for h in highlights] == ["17843931795296435"],
+        repr([(h.highlight_id, h.title) for h in highlights]),
+    )
+    seen_pks = {s.story_pk for s in seen}
+    expect(
+        "manual check baselined story + highlight items",
+        {"story1", "hl1"} <= seen_pks,
+        repr(seen_pks),
+    )
 
     await dispose_engine()
     if DB_FILE.exists():

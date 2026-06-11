@@ -54,7 +54,14 @@ class MonitorService:
     async def check_username(
         self, username: str, *, notify_unchanged: bool = False
     ) -> dict:
-        """Run one check by username. Returns a summary dict."""
+        """Run one FULL check by username. Returns a summary dict.
+
+        Covers exactly what a scheduled sweep covers: the profile diff +
+        new-post/reel delivery (inside _run_check), then the same
+        story/highlight phase check_all runs — story & live status, highlight
+        catalog diff, and new story/highlight media delivery. A manual
+        Recheck (button, /recheck, REST) must never see less than the sweep.
+        """
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
             account = await crud.get_account(session, username)
@@ -62,7 +69,22 @@ class MonitorService:
                 return {"ok": False, "error": f"@{username} is not monitored"}
             account_id = account.id
 
-        return await self._run_check(account_id, username, notify_unchanged=notify_unchanged)
+        result = await self._run_check(
+            account_id, username, notify_unchanged=notify_unchanged
+        )
+
+        if self.stories is not None and result.get("ok"):
+            meta = await self._load_account_story_meta(account_id)
+            is_private = result.get("is_private")
+            if is_private is None:
+                is_private = meta["is_private"]
+            if not is_private:
+                await self._check_stories_and_highlights(
+                    account_id,
+                    result.get("username", username),
+                    instagram_id=result.get("instagram_id") or meta["instagram_id"],
+                )
+        return result
 
     async def backfill_instagram_ids(self) -> dict:
         """Resolve and store instagram_id for accounts that do not have one yet."""

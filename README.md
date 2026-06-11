@@ -32,7 +32,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 - 🎬 **It doesn't just notify — it delivers.** New stories, posts, reels, highlights, and profile pictures arrive in your chat as actual photos and videos, not links.
 - 📦 **One tap grabs a whole account.** The **Download all** panel pulls the story, photos, reels, every highlight, and the profile picture of any public account — all of it, or just the parts you tick.
 - 📲 **Telegram is the entire UI.** Add targets, pause them, pull stories, tune the schedule, export history — all through inline buttons. You never touch a terminal after deploy.
-- ☁️ **Datacenter-proof.** Instagram blocks its GraphQL endpoints from cloud IPs; The Watcher detects the block, fast-fails, and reroutes through an anonymous downloader so everything keeps working on Render, Fly, or any VPS.
+- ☁️ **Datacenter-proof.** Instagram 401-blocks cloud-host IPs wholesale; The Watcher routes **every** Instagram API call through a free Cloudflare Worker at the edge — IPs Instagram doesn't block — with a direct-request fallback and an anonymous media downloader as a second, independent path. Render, Fly, any VPS: it just works.
 - ⚡ **Proven at scale.** A single instance sweeps 25+ accounts around the clock — with jittered scheduling and throttled concurrency so it never trips rate limits.
 - 📦 **One container, five minutes.** A single Docker image with a `render.yaml` blueprint — database, persistent disk, and webhook included. Runs on a free-tier box.
 
@@ -42,6 +42,9 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
+| 🛰 **Every Instagram call rides the edge** | Story/live status, highlight names, and `/add` by numeric ID now go through the same free Cloudflare Worker proxy as profile fetches — so they work flawlessly from cloud hosts whose IPs Instagram 401-blocks. Repeated lookups are served from a 90-second cache, and retry storms against blocked endpoints are gone. |
+| 🪶 **Featherweight database** | Each snapshot now stores ~300 bytes instead of Instagram's full 50–200 KB payload — ~99% smaller. A free 0.5 GB Postgres now lasts effectively forever. |
+| 🔄 **Full-coverage rechecks** | A manual recheck (🔄 button, `/recheck`, REST endpoint) now covers exactly what a scheduled sweep covers: profile diff, new posts & reels, story & live status, highlight catalog changes, and new story/highlight media delivery. |
 | 📦 **Bulk download — a whole account in one tap** | New home-menu button. Pick a monitored account or type any username, profile URL, or numeric ID, then tick exactly what you want — 📖 story, 🖼 photos, 🎬 reels, 👤 profile picture, and each highlight by name — or hit **⚡ Download EVERYTHING**. Live per-category progress, a final summary, and zero login, like everything else. |
 | 🔕 **Per-highlight tracking** | Choose exactly which highlights to follow, per account. Mute one, several, or all — muted highlights are skipped by the sweep's auto-download (and not even fetched), while manual downloads keep working. Unmuting resumes cleanly from now, without dumping everything posted in between. |
 | 🖼 **Post & reel auto-delivery** | Every sweep detects new posts/reels and sends the actual media to your chat — capped at 5 per sweep so a posting spree never floods you. First sweep baselines silently (no backlog dump). |
@@ -63,9 +66,9 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
                                                       │  sweep
                                  ┌────────────────────┴────────────────────┐
                                  ▼                                         ▼
-                       Instagram web API                    Anonymous media downloader
-                  HTTP/2 · Chrome TLS fingerprint           stories · highlights · posts
-                  (profile fields, counts, status)          reels · full-res avatars
+                  Instagram API (web + graphql)              Anonymous media downloader
+              via Cloudflare Worker edge proxy · 90s cache   stories · highlights · posts
+           (profile fields, story/live status, highlights)   reels · full-res avatars
                                  └────────────────────┬────────────────────┘
                                                       ▼
                                                  PostgreSQL
@@ -76,7 +79,7 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
                                        formatted alert + photos/videos
 ```
 
-Two independent data paths mean one being blocked never takes the bot down: profile data comes from Instagram's web API behind a Chrome TLS fingerprint (`curl_cffi`), while story/post/reel **media** flows through a login-free third-party downloader that cloud IP blocks don't touch.
+Two independent data paths mean one being blocked never takes the bot down: profile fields and story/live/highlight **status** come from Instagram's own API, routed through a free Cloudflare Worker on edge IPs Instagram doesn't block (with a Chrome-TLS-fingerprint direct fallback for local runs), while story/post/reel **media** flows through a login-free third-party downloader that cloud IP blocks don't touch.
 
 ---
 
@@ -111,14 +114,17 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - Per-target forced recheck, change history, and stored-photo retrieval
 
 ### Reliability
-- Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls
-- Fast-fail detection of IP-blocked GraphQL endpoints with automatic fallback routing
+- **Every Instagram API call routed through a Cloudflare Worker edge proxy** (free tier, 100k req/day) — cloud-host IP blocks never reach the bot; falls back to direct requests if the proxy is down
+- Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls on the direct path
+- 90-second reel-data cache — sweeps and card opens never re-ask Instagram for the same data
+- Fast-fail circuit breaker on blocked endpoints instead of retry storms
 - Cached downloader tokens — the three-step token handshake runs once, not per request
 - Tenacity retries with exponential backoff; debounced failure alerts (no 429 spam)
 - Consecutive-failure counter per target, visible in `/status` and `/list`
 
 ### Data & API
 - PostgreSQL persistence: snapshots, media hashes, notification log, seen-item dedup, runtime settings
+- **Featherweight snapshots** — ~300 bytes stored per check instead of Instagram's 50–200 KB raw payload, so a free 0.5 GB database lasts for years
 - Configurable retention windows + a **Clear Old Data** button right in the bot
 - HTTP API with liveness/readiness probes and a cron-compatible `/sweep` endpoint
 - Token-gated mutation endpoints; CSV export of the full notification history
@@ -192,7 +198,7 @@ The `render.yaml` blueprint provisions everything automatically.
 
    `WEB_API_TOKEN` is auto-generated by Render.
 
-5. Click **Deploy**. The service registers a Telegram webhook on its public URL and starts sweeping immediately — Instagram's cloud-IP blocks are handled automatically by the fallback media path.
+5. Click **Deploy**. The service registers a Telegram webhook on its public URL and starts sweeping immediately — Instagram's cloud-IP blocks are bypassed out of the box: `render.yaml` presets `IG_PROXY_URL` to a Cloudflare Worker edge proxy that carries every Instagram API call.
 
 > **Already running on Render's free Postgres?** It expires ~30 days after
 > creation. Move your data to Neon with zero loss using
@@ -254,7 +260,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | Variable | Default | Description |
 |---|---|---|
 | `IG_SESSION_COOKIE` | _(empty)_ | **Optional** — full cookie string from a logged-in browser session. The bot is fully functional without it; login-free is the default and recommended mode |
-| `IG_PROXY_URL` | _(empty)_ | Optional proxy URL used specifically for Instagram requests |
+| `IG_PROXY_URL` | _(empty)_ | Cloudflare Worker that proxies **all** Instagram API calls — profile fields, story/live status, highlight catalog, ID-to-username resolution. Strongly recommended on cloud hosts (preset in `render.yaml`); without it the bot makes direct requests, which datacenter IPs usually get 401-blocked on |
 
 ### Proxy & Network
 
