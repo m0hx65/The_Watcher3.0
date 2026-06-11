@@ -1284,6 +1284,187 @@ class MonitorService:
         sent = await self._deliver_story_items(account_id, username, story_items, set())
         return {"ok": True, "count": sent, "reels": len(items), "error": None}
 
+    async def download_highlights_by_indexes(
+        self, username: str, indexes: list[int]
+    ) -> dict:
+        """Download and send a chosen subset of highlight reels (by list index).
+
+        The indexes refer to the ordering returned by `list_highlights` (sorted
+        by highlight id), recomputed here — same contract as download_highlight.
+        Returns {"ok", "count", "reels", "error"}.
+        """
+        if self.stories is None:
+            return {"ok": False, "count": 0, "reels": 0, "error": "Stories client unavailable"}
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        account_id = account.id if account else None
+
+        listing = await self.list_highlights(username)
+        items = listing.get("items", [])
+        wanted = {i for i in indexes if 0 <= i < len(items)}
+        if not wanted:
+            return {
+                "ok": False, "count": 0, "reels": 0,
+                "error": "Those highlights are no longer available — refresh the list.",
+            }
+
+        catalog = {
+            hid: title for i, (hid, title) in enumerate(items) if i in wanted
+        }
+        story_items = await self._gather_highlight_items(username, catalog)
+        if not story_items:
+            return {
+                "ok": False, "count": 0, "reels": len(catalog),
+                "error": _DOWNLOAD_UNAVAILABLE_MSG,
+            }
+
+        sent = await self._deliver_story_items(account_id, username, story_items, set())
+        return {"ok": True, "count": sent, "reels": len(catalog), "error": None}
+
+    async def download_posts(
+        self,
+        username: str,
+        *,
+        photos: bool = True,
+        videos: bool = True,
+        limit: int = 100,
+    ) -> dict:
+        """Download and send the account's feed grid media (login-free).
+
+        saveinsta's profile listing serves the post/reel grid at full
+        resolution; `photos` keeps image posts, `videos` keeps video posts and
+        reels. Like the other on-demand paths this ignores seen-dedup so the
+        user always gets the media, but monitored accounts still get the items
+        marked seen so the sweep won't re-send them.
+        Returns {"ok", "count", "photos", "videos", "error"}.
+        """
+        if self.stories is None:
+            return {
+                "ok": False, "count": 0, "photos": 0, "videos": 0,
+                "error": "Stories client unavailable",
+            }
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        account_id = account.id if account else None
+
+        try:
+            posts = await self.stories.fetch_posts(username, limit=limit)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning("On-demand post fetch failed for @{}: {}", username, exc)
+            posts = []
+        if not posts:
+            return {
+                "ok": False, "count": 0, "photos": 0, "videos": 0,
+                "error": (
+                    "No posts found — the account may have none, be private, "
+                    "or the anonymous source is rate-limited."
+                ),
+            }
+
+        photo_items = [p for p in posts if p.media_type != "video"] if photos else []
+        video_items = [p for p in posts if p.media_type == "video"] if videos else []
+
+        sent_photos = 0
+        if photo_items:
+            sent_photos = await self._deliver_story_items(
+                account_id, username, photo_items, set()
+            )
+        sent_videos = 0
+        if video_items:
+            sent_videos = await self._deliver_story_items(
+                account_id, username, video_items, set()
+            )
+
+        return {
+            "ok": True,
+            "count": sent_photos + sent_videos,
+            "photos": sent_photos,
+            "videos": sent_videos,
+            "error": None,
+        }
+
+    async def fetch_and_send_profile_picture(self, username: str) -> dict:
+        """Fetch the current profile picture (best quality) and send it now.
+
+        Same fetch path as fetch_profile_picture, but delivery happens here via
+        the notifier so bulk flows don't have to handle the file themselves.
+        Returns {"ok", "hd", "error"}.
+        """
+        username = username.strip().lstrip("@").lower()
+        result = await self.fetch_profile_picture(username)
+        if not result.get("ok"):
+            return {"ok": False, "hd": False, "error": result.get("error")}
+        quality = "HD" if result.get("hd") else "320px (anonymous max)"
+        caption = (
+            f"👤 <b>@{esc(username)}</b> — profile picture · {quality}\n"
+            f"SHA256: <code>{esc(result['sha256'])}</code>"
+        )
+        ok = await self.notifier.send_document(result["path"], caption=caption)
+        return {
+            "ok": ok,
+            "hd": bool(result.get("hd")),
+            "error": None if ok else "Telegram send failed",
+        }
+
+    async def get_download_overview(self, username: str) -> dict:
+        """Profile basics + highlight catalog for the bulk-download panel.
+
+        One profile fetch (existence, privacy, post count, numeric id) plus the
+        anonymous highlight catalog. Mirrors list_highlights' persist/fallback
+        behavior for monitored accounts so the two stay consistent — the items
+        ordering here matches what the download-by-index methods recompute.
+        Returns {"ok", "items", "monitored", "is_private", "posts_count", "error"}.
+        """
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        account_id = account.id if account else None
+        instagram_id = account.instagram_id if account else None
+
+        is_private: Optional[bool] = None
+        posts_count: Optional[int] = None
+        fetch = await self.instagram.fetch_profile(username)
+        if fetch.success and fetch.parsed:
+            parsed = fetch.parsed
+            is_private = bool(parsed.get("is_private"))
+            posts_count = parsed.get("posts_count")
+            instagram_id = instagram_id or parsed.get("instagram_id")
+        elif fetch.http_status == 404:
+            return {
+                "ok": False, "items": [], "monitored": account_id is not None,
+                "is_private": None, "posts_count": None,
+                "error": f"@{username} doesn't exist (HTTP 404).",
+            }
+        # Other fetch failures are non-fatal: the panel still works, we just
+        # don't know privacy/post count.
+
+        catalog: dict[str, str] = {}
+        try:
+            catalog = await self._fetch_highlight_catalog(username, instagram_id)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning(
+                "Bulk-download highlight catalog failed for @{}: {}", username, exc
+            )
+            catalog = {}
+        if catalog and account_id is not None:
+            async with get_session() as session:
+                await crud.replace_highlight_catalog(session, account_id, catalog)
+        elif not catalog and account_id is not None:
+            async with get_session() as session:
+                catalog = await crud.get_highlight_catalog(session, account_id)
+
+        items = sorted(catalog.items(), key=lambda kv: kv[0])
+        return {
+            "ok": True,
+            "items": items,
+            "monitored": account_id is not None,
+            "is_private": is_private,
+            "posts_count": posts_count,
+            "error": None,
+        }
+
     async def toggle_highlight_tracking(self, username: str, index: int) -> dict:
         """Flip the sweep auto-download mute for one highlight (by list index).
 

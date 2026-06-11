@@ -63,7 +63,11 @@ HELP_TEXT = (
     "<code>/highlights @user</code> — list any user's highlights to download\n"
     "<code>/export</code> — download CSV\n\n"
     "<b>🔎 Any user</b> on the menu does the same as /story and /highlights for "
-    "any public account, without adding it to monitoring."
+    "any public account, without adding it to monitoring.\n\n"
+    "<b>📦 Download all</b> grabs a whole account at once — story, photos, "
+    "reels, highlights, and the profile picture. Pick a monitored account or "
+    "type any username, tick what you want (or hit ⚡ EVERYTHING), and the "
+    "media lands in the chat."
 )
 
 BOT_COMMANDS: list[BotCommand] = [
@@ -87,7 +91,12 @@ BOT_COMMANDS: list[BotCommand] = [
 
 _AWAITING_USERNAME = "awaiting_username"
 _AWAITING_FETCH_USERNAME = "awaiting_fetch_username"
+_AWAITING_DLALL_USERNAME = "awaiting_dlall_username"
 _AWAITING_INTERVAL = "awaiting_interval"
+# Bulk-download panel state: {"username", "items", "selected", "is_private",
+# "posts_count"} for the account whose selection panel is currently open.
+# Selection toggles re-render from this without refetching anything.
+_DL_STATE = "dl_state"
 # Message id of the bot's most recent prompt (the message that displays
 # a Cancel button while we wait for typed input). Used so we can clean it
 # up once the user has actually responded.
@@ -970,6 +979,368 @@ async def _send_csv_export(
             pass
 
 
+# ---------- Bulk download ("📦 Download all") ----------
+
+_DL_FIXED_TOKENS = frozenset({"story", "pic", "ph", "rl"})
+
+
+def _render_download_panel(
+    username: str, state: dict
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Selection-panel text + keyboard from the stored panel state (no network)."""
+    items: list = state.get("items", [])
+    selected: set[str] = state.get("selected", set())
+    lines = [f"📦 <b>Bulk download — @{esc(username)}</b>"]
+    if state.get("is_private"):
+        lines.append("🔒 <b>Private account</b> — media downloads will usually fail.")
+    lines.append("")
+    info_bits: list[str] = []
+    if state.get("posts_count") is not None:
+        info_bits.append(f"{fmt_number(state['posts_count'])} posts")
+    info_bits.append(
+        f"{len(items)} highlight{'s' if len(items) != 1 else ''}"
+    )
+    lines.append(" · ".join(info_bits))
+    lines.append("")
+    lines.append(
+        "Tick what you want, then ⬇️ <b>Download selected</b> — or "
+        "⚡ <b>Download EVERYTHING</b> (story + photos + reels + profile pic "
+        "+ all highlights)."
+    )
+    if selected:
+        lines.append("")
+        lines.append(f"Selected: <b>{len(selected)}</b>")
+    return "\n".join(lines), keyboards.download_panel(username, items, selected)
+
+
+async def _build_download_panel(
+    context: ContextTypes.DEFAULT_TYPE, username: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Fetch the account overview, store fresh panel state, render the panel.
+
+    On failure (e.g. the username doesn't exist) returns an error text with
+    the entry keyboard so the user can immediately try another account.
+    """
+    service: MonitorService = context.application.bot_data["monitor"]
+    overview = await service.get_download_overview(username)
+    if not overview.get("ok"):
+        context.user_data.pop(_DL_STATE, None)
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=False)
+        return (
+            f"Couldn't open <b>@{esc(username)}</b>: "
+            f"<code>{esc(str(overview.get('error')))}</code>",
+            keyboards.download_entry(bool(accounts)),
+        )
+    state = {
+        "username": username,
+        "items": overview.get("items", []),
+        "selected": set(),
+        "is_private": overview.get("is_private"),
+        "posts_count": overview.get("posts_count"),
+    }
+    context.user_data[_DL_STATE] = state
+    return _render_download_panel(username, state)
+
+
+async def _show_download_panel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, username: str
+) -> None:
+    """Open (or refresh) the selection panel from a callback."""
+    query = update.callback_query
+    await _safe_answer(query, "Loading…")
+    await _safe_edit_text(query, f"⏳ Loading <b>@{esc(username)}</b>…")
+    text, kb = await _build_download_panel(context, username)
+    await _safe_edit_text(query, text, reply_markup=kb)
+
+
+async def _run_bundle_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    *,
+    tokens: set[str],
+    everything: bool,
+) -> None:
+    """Download every selected category in sequence and report progress.
+
+    Media is delivered by the service via the notifier (same as sweeps); this
+    message tracks per-category progress and ends with a summary.
+    """
+    query = update.callback_query
+    service: MonitorService = context.application.bot_data["monitor"]
+
+    hl_indexes = sorted(
+        int(t[1:]) for t in tokens if t.startswith("h") and t[1:].isdigit()
+    )
+    want_story = everything or "story" in tokens
+    want_pic = everything or "pic" in tokens
+    want_photos = everything or "ph" in tokens
+    want_reels = everything or "rl" in tokens
+    want_all_highlights = everything
+
+    if not (
+        want_story or want_pic or want_photos or want_reels
+        or want_all_highlights or hl_indexes
+    ):
+        await _safe_answer(query, "Pick at least one item first.", show_alert=True)
+        return
+
+    await _safe_answer(query, "Starting download…")
+    lines: list[str] = []
+
+    async def progress(active: Optional[str]) -> None:
+        body = list(lines)
+        if active:
+            body.append(f"⏳ {active}…")
+        await _safe_edit_text(
+            query,
+            f"📦 <b>@{esc(username)}</b> — bulk download\n\n" + "\n".join(body),
+        )
+
+    if want_pic:
+        await progress("profile picture")
+        r = await service.fetch_and_send_profile_picture(username)
+        if r.get("ok"):
+            lines.append("👤 Profile picture — sent ✓")
+        else:
+            lines.append(
+                f"👤 Profile picture — ✗ <code>{esc(str(r.get('error')))}</code>"
+            )
+
+    if want_story:
+        await progress("current story")
+        r = await service.fetch_and_send_stories(username)
+        if r.get("ok"):
+            count = r.get("count", 0)
+            if count:
+                noun = "item" if count == 1 else "items"
+                lines.append(f"📖 Story — {count} {noun} ✓")
+            else:
+                lines.append("📖 Story — no active story")
+        else:
+            lines.append(f"📖 Story — ✗ <code>{esc(str(r.get('error')))}</code>")
+
+    if want_photos or want_reels:
+        if want_photos and want_reels:
+            label = "photos & reels"
+        elif want_photos:
+            label = "photos"
+        else:
+            label = "reels"
+        await progress(label)
+        r = await service.download_posts(
+            username, photos=want_photos, videos=want_reels
+        )
+        if r.get("ok"):
+            if want_photos:
+                lines.append(f"🖼 Photos — {r.get('photos', 0)} sent ✓")
+            if want_reels:
+                lines.append(f"🎬 Reels/videos — {r.get('videos', 0)} sent ✓")
+        else:
+            lines.append(
+                f"🖼🎬 Posts & reels — ✗ <code>{esc(str(r.get('error')))}</code>"
+            )
+
+    if want_all_highlights:
+        await progress("all highlights (this can take a while)")
+        r = await service.download_all_highlights(username)
+        if r.get("ok"):
+            reels = r.get("reels", 0)
+            if reels:
+                lines.append(
+                    f"✨ Highlights — {r.get('count', 0)} items "
+                    f"from {reels} reel{'s' if reels != 1 else ''} ✓"
+                )
+            else:
+                lines.append("✨ Highlights — none to download")
+        else:
+            lines.append(
+                f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
+            )
+    elif hl_indexes:
+        noun = "highlight" if len(hl_indexes) == 1 else "highlights"
+        await progress(f"{len(hl_indexes)} {noun} (this can take a while)")
+        r = await service.download_highlights_by_indexes(username, hl_indexes)
+        if r.get("ok"):
+            lines.append(
+                f"✨ Highlights — {r.get('count', 0)} items "
+                f"from {r.get('reels', 0)} reel{'s' if r.get('reels', 0) != 1 else ''} ✓"
+            )
+        else:
+            lines.append(
+                f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
+            )
+
+    await _safe_edit_text(
+        query,
+        f"📦 <b>@{esc(username)}</b> — bulk download finished\n\n"
+        + "\n".join(lines),
+        reply_markup=keyboards.download_result(username),
+    )
+
+
+async def _handle_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parts: list[str],
+) -> None:
+    query = update.callback_query
+    if not parts:
+        await _safe_answer(query)
+        return
+    action = parts[0]
+
+    if action == "menu":
+        await _safe_answer(query)
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=False)
+        if accounts:
+            text = (
+                "📦 <b>Bulk download</b>\n\n"
+                "Grab everything — or just what you pick — from any public "
+                "account: story, photos, reels, highlights, and the profile "
+                "picture.\n\n"
+                "Is the account in your monitored list?"
+            )
+        else:
+            text = (
+                "📦 <b>Bulk download</b>\n\n"
+                "Grab everything — or just what you pick — from any public "
+                "account: story, photos, reels, highlights, and the profile "
+                "picture.\n\n"
+                "No accounts are monitored yet, so type the one you want."
+            )
+        await _safe_edit_text(
+            query, text, reply_markup=keyboards.download_entry(bool(accounts))
+        )
+        return
+
+    if action == "list":
+        await _safe_answer(query)
+        page = (
+            int(parts[1])
+            if len(parts) > 1 and parts[1].lstrip("-").isdigit()
+            else 0
+        )
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=False)
+        if not accounts:
+            await _safe_edit_text(
+                query,
+                "📦 <b>Bulk download</b>\n\nNo accounts monitored yet — type "
+                "the one you want instead.",
+                reply_markup=keyboards.download_entry(False),
+            )
+            return
+        await _safe_edit_text(
+            query,
+            f"📦 <b>Bulk download</b> — choose an account ({len(accounts)}):",
+            reply_markup=keyboards.download_accounts_list(accounts, page=page),
+        )
+        return
+
+    if action == "manual":
+        await _safe_answer(query)
+        context.user_data[_AWAITING_DLALL_USERNAME] = True
+        if query.message:
+            context.user_data[_PROMPT_MSG_ID] = query.message.message_id
+        await _safe_edit_text(
+            query,
+            "Send the Instagram <b>username</b>, <b>profile URL</b>, or "
+            "<b>numeric user ID</b> you want to download from.",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+
+    if len(parts) < 2:
+        await _safe_answer(query)
+        return
+
+    if action == "t":
+        # dl:t:<token>:<username> — flip one selection checkbox.
+        if len(parts) < 3:
+            await _safe_answer(query)
+            return
+        token = parts[1]
+        username = _normalize_username(parts[2]) or parts[2].lower()
+        state = context.user_data.get(_DL_STATE)
+        if not isinstance(state, dict) or state.get("username") != username:
+            # Panel state lost (restart / different account) — rebuild it.
+            await _show_download_panel(update, context, username)
+            return
+        items = state.get("items", [])
+        valid = token in _DL_FIXED_TOKENS or (
+            token.startswith("h")
+            and token[1:].isdigit()
+            and int(token[1:]) < len(items)
+        )
+        if not valid:
+            await _safe_answer(query, "That item is gone — refreshing.")
+            await _show_download_panel(update, context, username)
+            return
+        selected: set[str] = state.setdefault("selected", set())
+        if token in selected:
+            selected.discard(token)
+        else:
+            selected.add(token)
+        await _safe_answer(query)
+        text, kb = _render_download_panel(username, state)
+        await _safe_edit_text(query, text, reply_markup=kb)
+        return
+
+    username = _normalize_username(parts[1]) or parts[1].lower()
+
+    if action == "open":
+        await _show_download_panel(update, context, username)
+        return
+
+    if action == "hall":
+        state = context.user_data.get(_DL_STATE)
+        if not isinstance(state, dict) or state.get("username") != username:
+            await _show_download_panel(update, context, username)
+            return
+        items = state.get("items", [])
+        if not items:
+            await _safe_answer(query, "No highlights on this account.")
+            return
+        selected = state.setdefault("selected", set())
+        all_tokens = {f"h{i}" for i in range(len(items))}
+        if all_tokens <= selected:
+            selected -= all_tokens
+            await _safe_answer(query, "Highlights cleared.")
+        else:
+            selected |= all_tokens
+            await _safe_answer(query, f"All {len(items)} highlights selected.")
+        text, kb = _render_download_panel(username, state)
+        await _safe_edit_text(query, text, reply_markup=kb)
+        return
+
+    if action == "go":
+        state = context.user_data.get(_DL_STATE)
+        if not isinstance(state, dict) or state.get("username") != username:
+            await _safe_answer(
+                query,
+                "Selection expired — pick again.",
+                show_alert=True,
+            )
+            await _show_download_panel(update, context, username)
+            return
+        tokens = set(state.get("selected", set()))
+        await _run_bundle_download(
+            update, context, username, tokens=tokens, everything=False
+        )
+        return
+
+    if action == "all":
+        await _run_bundle_download(
+            update, context, username, tokens=set(), everything=True
+        )
+        return
+
+    await _safe_answer(query, "Unknown action.")
+
+
 # ---------- Command handlers ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1436,6 +1807,45 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    if context.user_data.get(_AWAITING_DLALL_USERNAME):
+        context.user_data.pop(_AWAITING_DLALL_USERNAME, None)
+        await _consume_prompt_message(update, context)
+        raw = (update.message.text or "").strip()
+        username, instagram_id = _parse_add_target(raw)
+        if not username and not instagram_id:
+            await update.message.reply_text(
+                "That doesn't look like a valid Instagram username, profile URL, "
+                "or numeric user ID. Letters, numbers, dots, and underscores "
+                "only (max 30 chars).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.download_entry(True),
+            )
+            return
+        if instagram_id:
+            username = await _resolve_username_for_instagram_id(
+                context, instagram_id
+            )
+            if not username:
+                await update.message.reply_text(
+                    "Could not resolve that Instagram ID to a username. "
+                    "Try a current numeric user ID or use @username instead.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboards.download_entry(True),
+                )
+                return
+        status_msg = await update.message.reply_text(
+            f"⏳ Loading <b>@{esc(username)}</b>…",
+            parse_mode=ParseMode.HTML,
+        )
+        text, kb = await _build_download_panel(context, username)
+        await status_msg.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        return
+
     if not context.user_data.get(_AWAITING_USERNAME):
         return  # Ignore typed text unless we're waiting for input.
     context.user_data.pop(_AWAITING_USERNAME, None)
@@ -1480,12 +1890,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keep_interval_prompt = (data == "menu:setinterval:custom")
     keep_username_prompt = (data == "menu:add")
     keep_fetch_prompt = (data == "menu:fetch")
+    keep_dlall_prompt = (data == "dl:manual")
     if not keep_interval_prompt:
         context.user_data.pop(_AWAITING_INTERVAL, None)
     if not keep_username_prompt:
         context.user_data.pop(_AWAITING_USERNAME, None)
     if not keep_fetch_prompt:
         context.user_data.pop(_AWAITING_FETCH_USERNAME, None)
+    if not keep_dlall_prompt:
+        context.user_data.pop(_AWAITING_DLALL_USERNAME, None)
 
     # If the user has a Cancel-button prompt left over on a different message
     # than the one they're now interacting with, remove the orphaned prompt
@@ -1515,6 +1928,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _handle_menu(update, context, parts[1:])
         elif parts[0] == "acc":
             await _handle_account(update, context, parts[1:])
+        elif parts[0] == "dl":
+            await _handle_download(update, context, parts[1:])
         else:
             await _safe_answer(query, "Unknown action.")
     except Exception as exc:

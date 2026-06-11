@@ -28,6 +28,14 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:resume:<username>    — resume monitoring
   menu:cleardb             — show clear-history confirmation
   menu:cleardb_yes         — execute clear-history
+  dl:menu                  — bulk-download entry (monitored list or typed user?)
+  dl:list:<page>           — bulk download: pick from monitored accounts
+  dl:manual                — bulk download: prompt for username / URL / ID
+  dl:open:<username>       — bulk download: show the selection panel
+  dl:t:<token>:<u>         — toggle one selection (story|pic|ph|rl|h<idx>)
+  dl:hall:<username>       — select/clear all highlights at once
+  dl:go:<username>         — download everything currently selected
+  dl:all:<username>        — download EVERYTHING (story+photos+reels+pic+highlights)
   noop                     — non-actionable button (e.g. page indicator)
 """
 
@@ -57,10 +65,172 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("🔎 Any user", callback_data="menu:fetch"),
+                InlineKeyboardButton("📦 Download all", callback_data="dl:menu"),
             ],
             [
                 InlineKeyboardButton("🔄 Sweep All", callback_data="menu:sweep"),
             ],
+        ]
+    )
+
+
+def download_entry(has_accounts: bool) -> InlineKeyboardMarkup:
+    """Bulk-download entry: pick a monitored account or type any username."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_accounts:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📋 Yes — pick from my list", callback_data="dl:list:0"
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⌨️ No — type username / URL / ID", callback_data="dl:manual"
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("🏠 Home", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def download_accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
+    """Monitored-accounts picker for the bulk-download flow (paginated)."""
+    total = len(accounts)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for a in accounts[start:end]:
+        marker = "🟢" if a.active else "⏸"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{marker} @{a.username}",
+                    callback_data=f"dl:open:{a.username}",
+                ),
+            ]
+        )
+
+    if pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀️", callback_data=f"dl:list:{page - 1}")
+            )
+        nav.append(
+            InlineKeyboardButton(f"· {page + 1} / {pages} ·", callback_data="noop")
+        )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton("▶️", callback_data=f"dl:list:{page + 1}")
+            )
+        rows.append(nav)
+
+    rows.append(
+        [
+            InlineKeyboardButton("⌨️ Type a user", callback_data="dl:manual"),
+            InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def download_panel(
+    username: str,
+    items: Sequence[tuple[str, str]],
+    selected: set[str] | frozenset[str] = frozenset(),
+) -> InlineKeyboardMarkup:
+    """Selection panel for the bulk download: toggleable story / profile pic /
+    photos / reels rows plus one row per highlight (by name), a select-all-
+    highlights shortcut, Download selected, and Download EVERYTHING.
+
+    `items` is the ordered (highlight_id, title) list; the h<idx> token in the
+    callback maps back to the same ordering on the download side. Selection
+    state lives in user_data, so the callbacks only carry the token.
+    """
+
+    def mark(token: str) -> str:
+        return "✅" if token in selected else "⬜"
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                "⚡ Download EVERYTHING", callback_data=f"dl:all:{username}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{mark('story')} 📖 Story", callback_data=f"dl:t:story:{username}"
+            ),
+            InlineKeyboardButton(
+                f"{mark('pic')} 👤 Profile pic", callback_data=f"dl:t:pic:{username}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"{mark('ph')} 🖼 Photos", callback_data=f"dl:t:ph:{username}"
+            ),
+            InlineKeyboardButton(
+                f"{mark('rl')} 🎬 Reels", callback_data=f"dl:t:rl:{username}"
+            ),
+        ],
+    ]
+    for idx, (_hid, title) in enumerate(items):
+        label = title.strip() or "(untitled)"
+        if len(label) > 26:
+            label = label[:25] + "…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark(f'h{idx}')} ✨ {label}",
+                    callback_data=f"dl:t:h{idx}:{username}",
+                )
+            ]
+        )
+    if items:
+        all_selected = all(f"h{i}" in selected for i in range(len(items)))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✨ Clear highlights"
+                    if all_selected
+                    else f"✨ Select all highlights ({len(items)})",
+                    callback_data=f"dl:hall:{username}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"⬇️ Download selected ({len(selected)})",
+                callback_data=f"dl:go:{username}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"dl:open:{username}"),
+            InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def download_result(username: str) -> InlineKeyboardMarkup:
+    """Shown under the bulk-download summary once everything has been sent."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📦 Download more", callback_data=f"dl:open:{username}"
+                ),
+                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
+            ]
         ]
     )
 
