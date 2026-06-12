@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.bot.notifications import (
@@ -283,6 +283,13 @@ class MonitorService:
                 return_exceptions=True,
             )
 
+        # Went-dark radar: flag targets that have posted nothing for a while.
+        # Runs after the story phase so this sweep's fresh activity is counted.
+        try:
+            await self._check_dark_radar()
+        except Exception as exc:  # pragma: no cover - never sink a sweep on this
+            logger.exception("Dark-radar check failed: {}", exc)
+
         noun = "profile" if checked == 1 else "profiles"
         summary = f"👁 Sweep complete — {checked} {noun} checked."
         if failed:
@@ -309,6 +316,124 @@ class MonitorService:
         if id_backfill is not None:
             result["id_backfill"] = id_backfill
         return result
+
+    # ---------- Went-dark radar ----------
+
+    @staticmethod
+    def _dark_state_key(account_id: int) -> str:
+        return f"dark_state:{account_id}"
+
+    @staticmethod
+    def _humanize_silence(delta: timedelta) -> str:
+        days = delta.days
+        if days >= 1:
+            return f"{days} day{'s' if days != 1 else ''}"
+        hours = delta.seconds // 3600
+        if hours >= 1:
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        minutes = max(1, delta.seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+
+    async def _check_dark_radar(self) -> None:
+        """Alert when a monitored account goes quiet, and when it returns.
+
+        "Activity" = a delivered story, post, or highlight (seen_stories).
+        Accounts with no activity on record yet are skipped — there's no
+        baseline to call them dark from. State is one app_settings flag per
+        account so an account is announced dark/back exactly once per spell.
+        """
+        threshold_days = settings.dark_radar_days
+        if threshold_days <= 0:
+            return
+        threshold = timedelta(days=threshold_days)
+        now = datetime.now(timezone.utc)
+
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=True)
+
+        for account in accounts:
+            async with get_session() as session:
+                last = await crud.last_activity_at(session, account.id)
+                state_key = self._dark_state_key(account.id)
+                currently_flagged = (
+                    await crud.get_setting(session, state_key)
+                ) is not None
+            if last is None:
+                continue  # no activity baseline — can't judge
+            silent = now - last
+            if silent >= threshold and not currently_flagged:
+                async with get_session() as session:
+                    await crud.set_setting(session, state_key, last.isoformat())
+                msg = (
+                    f"🌑 <b>@{esc(account.username)}</b> has gone dark — no new "
+                    f"story, post, or reel in <b>{self._humanize_silence(silent)}</b>.\n"
+                    f"Last activity: <code>{fmt_timestamp(last)}</code>"
+                )
+                delivered = await self.notifier.send_text(msg)
+                async with get_session() as session:
+                    await crud.log_notification(
+                        session,
+                        account_id=account.id,
+                        change_type="went_dark",
+                        payload={"last_activity": last.isoformat(),
+                                 "silent_seconds": int(silent.total_seconds())},
+                        message=msg,
+                        delivered=delivered,
+                    )
+            elif silent < threshold and currently_flagged:
+                async with get_session() as session:
+                    await crud.delete_setting(session, state_key)
+                msg = (
+                    f"☀️ <b>@{esc(account.username)}</b> is active again — "
+                    "posted after a quiet spell."
+                )
+                delivered = await self.notifier.send_text(msg)
+                async with get_session() as session:
+                    await crud.log_notification(
+                        session,
+                        account_id=account.id,
+                        change_type="back_active",
+                        payload={"last_activity": last.isoformat()},
+                        message=msg,
+                        delivered=delivered,
+                    )
+
+    async def dark_radar_report(self) -> dict:
+        """On-demand snapshot of silence per monitored account, quietest first.
+
+        Returns {"threshold_days", "accounts": [{username, last, silent_days,
+        dark, never}]}. `never` marks accounts with no activity on record.
+        """
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=True)
+            rows = []
+            for account in accounts:
+                last = await crud.last_activity_at(session, account.id)
+                rows.append((account.username, last))
+        threshold_days = settings.dark_radar_days
+        report = []
+        for username, last in rows:
+            if last is None:
+                report.append({
+                    "username": username, "last": None,
+                    "silent_days": None, "dark": False, "never": True,
+                })
+                continue
+            silent = now - last
+            report.append({
+                "username": username,
+                "last": last,
+                "silent_days": silent.days,
+                "silent": silent,
+                "dark": threshold_days > 0 and silent >= timedelta(days=threshold_days),
+                "never": False,
+            })
+        # Quietest first; "never seen" accounts sort to the end.
+        report.sort(
+            key=lambda r: (r["never"], -(r["silent_days"] or 0)),
+        )
+        return {"threshold_days": threshold_days, "accounts": report}
 
     async def _run_check(
         self, account_id: int, username: str, *, notify_unchanged: bool = False

@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=20, alias="REQUEST_TIMEOUT")
     max_concurrent_fetches: int = Field(default=3, alias="MAX_CONCURRENT_FETCHES")
 
+    # Stakeout mode — temporary high-frequency watch on a single target.
+    # The floor sits above the 90s reel-data cache so every tick gets fresh
+    # data without hammering Instagram into rate-limit 401s. Kept gentle on
+    # purpose: all calls already route through the Cloudflare edge proxy.
+    stakeout_default_interval: int = Field(default=180, alias="STAKEOUT_DEFAULT_INTERVAL")
+    stakeout_min_interval: int = Field(default=120, alias="STAKEOUT_MIN_INTERVAL")
+    stakeout_default_duration: int = Field(default=3600, alias="STAKEOUT_DEFAULT_DURATION")
+    stakeout_max_duration: int = Field(default=21600, alias="STAKEOUT_MAX_DURATION")
+
+    # Went-dark radar: alert when a monitored account posts nothing (no story,
+    # post, or reel) for this many days. 0 disables the radar.
+    dark_radar_days: int = Field(default=3, alias="DARK_RADAR_DAYS")
+
     # Storage
     media_dir: str = Field(default="./data/media", alias="MEDIA_DIR")
 

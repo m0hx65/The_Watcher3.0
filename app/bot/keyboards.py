@@ -26,6 +26,10 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:remove_yes:<u>       — confirmed remove
   acc:pause:<username>     — pause monitoring (keep history)
   acc:resume:<username>    — resume monitoring
+  acc:rhythm:<username>    — show the account's posting-time rhythm
+  acc:stakeout:<username>  — start a stakeout (default interval/duration)
+  acc:unstakeout:<u>       — stop an active stakeout
+  menu:darkradar           — list accounts by how long they've been quiet
   menu:cleardb             — show clear-history confirmation
   menu:cleardb_yes         — execute clear-history
   dl:menu                  — bulk-download entry (monitored list or typed user?)
@@ -299,7 +303,9 @@ def accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def account_actions(username: str, active: bool = True) -> InlineKeyboardMarkup:
+def account_actions(
+    username: str, active: bool = True, stakeout_active: bool = False
+) -> InlineKeyboardMarkup:
     if active:
         toggle = InlineKeyboardButton(
             "⏸ Pause", callback_data=f"acc:pause:{username}"
@@ -307,6 +313,14 @@ def account_actions(username: str, active: bool = True) -> InlineKeyboardMarkup:
     else:
         toggle = InlineKeyboardButton(
             "▶️ Resume", callback_data=f"acc:resume:{username}"
+        )
+    if stakeout_active:
+        stakeout_btn = InlineKeyboardButton(
+            "🛑 Stop stakeout", callback_data=f"acc:unstakeout:{username}"
+        )
+    else:
+        stakeout_btn = InlineKeyboardButton(
+            "🎯 Stakeout", callback_data=f"acc:stakeout:{username}"
         )
     return InlineKeyboardMarkup(
         [
@@ -333,6 +347,12 @@ def account_actions(username: str, active: bool = True) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "✨ Highlights", callback_data=f"acc:highlights:{username}"
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Rhythm", callback_data=f"acc:rhythm:{username}"
+                ),
+                stakeout_btn,
             ],
             [toggle],
             [
@@ -460,11 +480,12 @@ def status_actions() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔄 Sweep Now", callback_data="menu:sweep:ids"),
             ],
             [
+                InlineKeyboardButton("🌑 Dark radar", callback_data="menu:darkradar"),
                 InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
-                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ],
             [
                 InlineKeyboardButton("🗑 Clear Old Data", callback_data="menu:cleardb"),
+                InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ],
         ]
     )

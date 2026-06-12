@@ -31,6 +31,13 @@ services:
         value: "20"
       - key: MAX_CONCURRENT_FETCHES
         value: "3"
+      # Stakeout floor stays above the 90s reel cache so high-frequency
+      # single-target watches never hammer Instagram into 401s.
+      - key: STAKEOUT_MIN_INTERVAL
+        value: "120"
+      # Went-dark radar: alert after this many quiet days. 0 disables.
+      - key: DARK_RADAR_DAYS
+        value: "3"
       - key: MEDIA_DIR
         value: "/app/data/media"
       - key: LOG_LEVEL

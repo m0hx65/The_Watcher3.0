@@ -459,6 +459,63 @@ async def mark_story_seen(
     await session.flush()
 
 
+# ---------- Activity rhythm & went-dark radar (from seen_stories) ----------
+
+async def activity_timestamps(
+    session: AsyncSession, account_id: int
+) -> list[datetime]:
+    """All delivered-item timestamps for an account (stories, posts, highlights).
+
+    seen_at is when the bot first caught the item — within one sweep of the
+    real post for stories/posts — so it's a faithful proxy for posting time.
+    taken_at from the anonymous media source is usually 0, so it isn't used."""
+    result = await session.execute(
+        select(SeenStory.seen_at).where(SeenStory.account_id == account_id)
+    )
+    out: list[datetime] = []
+    for ts in result.scalars().all():
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        out.append(ts)
+    return out
+
+
+async def last_activity_at(
+    session: AsyncSession, account_id: int
+) -> Optional[datetime]:
+    """Most recent delivered story/post/highlight time, or None if never."""
+    result = await session.execute(
+        select(func.max(SeenStory.seen_at)).where(
+            SeenStory.account_id == account_id
+        )
+    )
+    ts = result.scalar_one_or_none()
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+async def first_activity_at(
+    session: AsyncSession, account_id: int
+) -> Optional[datetime]:
+    """Earliest delivered item time — the start of the observation window."""
+    result = await session.execute(
+        select(func.min(SeenStory.seen_at)).where(
+            SeenStory.account_id == account_id
+        )
+    )
+    ts = result.scalar_one_or_none()
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
 # ---------- AppSetting (runtime-tunable KV) ----------
 
 async def get_setting(session: AsyncSession, key: str) -> Optional[str]:
@@ -475,6 +532,11 @@ async def set_setting(session: AsyncSession, key: str, value: str) -> None:
     else:
         row.value = value
     await session.flush()
+
+
+async def delete_setting(session: AsyncSession, key: str) -> bool:
+    result = await session.execute(delete(AppSetting).where(AppSetting.key == key))
+    return result.rowcount > 0
 
 
 # ---------- Data retention ----------

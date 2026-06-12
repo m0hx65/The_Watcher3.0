@@ -27,6 +27,7 @@ from app.bot import keyboards
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
+from app.monitor.analytics import compute_rhythm, render_rhythm
 from app.monitor.service import MonitorService
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
@@ -55,6 +56,10 @@ HELP_TEXT = (
     "<code>/pause @user</code> · <code>/resume @user</code> — pause/resume a target\n"
     "<code>/list</code> — all accounts\n"
     "<code>/recheck @user</code> — force a check now\n"
+    "<code>/stakeout @user [2h]</code> — watch one target closely for a while\n"
+    "<code>/unstakeout @user</code> — stop a stakeout early\n"
+    "<code>/rhythm @user</code> — posting-time rhythm (when they're active)\n"
+    "<code>/darkradar</code> — accounts that have gone quiet\n"
     "<code>/status</code> — monitoring stats\n"
     "<code>/interval [value]</code> — get or set interval (e.g. <code>30m</code>)\n"
     "<code>/history @user</code> — recent changes\n"
@@ -81,6 +86,10 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("status", "Show monitoring statistics"),
     BotCommand("interval", "Show or change the recheck interval"),
     BotCommand("recheck", "Force a check for a username"),
+    BotCommand("stakeout", "Watch one target closely for a while"),
+    BotCommand("unstakeout", "Stop a stakeout early"),
+    BotCommand("rhythm", "Show a target's posting-time rhythm"),
+    BotCommand("darkradar", "List accounts that have gone quiet"),
     BotCommand("history", "Recent changes for a username"),
     BotCommand("photo", "Current profile picture"),
     BotCommand("fetchphoto", "Download current profile picture on demand"),
@@ -494,6 +503,16 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     sched = _scheduler(context)
     interval = sched.interval_seconds if sched else settings.check_interval
 
+    stakeout_line = ""
+    if sched is not None:
+        active = sched.active_stakeouts()
+        if active:
+            names = ", ".join(
+                f"@{esc(s['username'])} (every {_format_interval(s['interval'])})"
+                for s in active
+            )
+            stakeout_line = f"\n🎯 Stakeouts: <b>{len(active)}</b> — {names}"
+
     return (
         "<b>📊 Watcher status</b>\n\n"
         f"Accounts: <b>{stats['accounts_total']}</b> "
@@ -504,6 +523,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"Interval: <b>{_format_interval(interval)}</b> "
         f"(±{settings.jitter_seconds}s jitter)\n"
         f"Next sweep: <b>{next_run_str}</b>"
+        f"{stakeout_line}"
     )
 
 
@@ -579,6 +599,54 @@ async def _render_history_message(username: str) -> str:
             detail = truncate(f"{esc(str(old))} → {esc(str(new))}", 200)
         lines.append(f"<code>{ts}</code>\n<b>{esc(n.change_type)}</b>: {detail}\n")
 
+    return "\n".join(lines)
+
+
+async def _render_rhythm_message(username: str) -> str:
+    """Posting-time rhythm for a monitored account, from delivered items."""
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+        if not account:
+            return (
+                f"<b>@{esc(username)}</b> is not monitored, so there's no "
+                "activity history to chart yet."
+            )
+        timestamps = await crud.activity_timestamps(session, account.id)
+        first = await crud.first_activity_at(session, account.id)
+        last = await crud.last_activity_at(session, account.id)
+    rhythm = compute_rhythm(timestamps)
+    return render_rhythm(username, rhythm, first=first, last=last)
+
+
+async def _render_dark_radar_message(service: MonitorService) -> str:
+    report = await service.dark_radar_report()
+    threshold = report["threshold_days"]
+    accounts = report["accounts"]
+    if not accounts:
+        return "🌑 <b>Dark radar</b>\n\nNo active accounts to watch."
+    if threshold <= 0:
+        head = (
+            "🌑 <b>Dark radar</b>\n"
+            "<i>Alerts are off (DARK_RADAR_DAYS=0). Showing silence anyway.</i>\n"
+        )
+    else:
+        head = (
+            "🌑 <b>Dark radar</b>\n"
+            f"<i>Flagged after {threshold} day{'s' if threshold != 1 else ''} "
+            "with no story, post, or reel.</i>\n"
+        )
+    lines = [head]
+    for row in accounts:
+        if row["never"]:
+            lines.append(f"• <b>@{esc(row['username'])}</b> — no activity on record yet")
+            continue
+        mark = "🌑" if row["dark"] else "🟢"
+        silent = row.get("silent")
+        human = MonitorService._humanize_silence(silent) if silent else "—"
+        lines.append(
+            f"{mark} <b>@{esc(row['username'])}</b> — quiet for <b>{human}</b> "
+            f"(last {fmt_timestamp(row['last'])})"
+        )
     return "\n".join(lines)
 
 
@@ -817,15 +885,95 @@ async def _send_profile_photo(
     await _delete_callback_message(update)
 
 
-async def _actions_keyboard(username: str):
+async def _actions_keyboard(
+    username: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None
+):
     """Account-card actions when the user is monitored; lightweight story/
-    highlights actions when it's an ad-hoc (non-monitored) lookup."""
+    highlights actions when it's an ad-hoc (non-monitored) lookup.
+
+    When `context` is given, the Stakeout button reflects whether a stakeout is
+    currently running on this account (🎯 start vs 🛑 stop)."""
     async with get_session() as session:
         account = await crud.get_account(session, username)
-    return (
-        keyboards.account_actions(username, account.active)
-        if account is not None
-        else keyboards.fetch_actions(username)
+    if account is None:
+        return keyboards.fetch_actions(username)
+    stakeout_active = False
+    if context is not None:
+        sched = _scheduler(context)
+        if sched is not None:
+            stakeout_active = sched.stakeout_for(account.id) is not None
+    return keyboards.account_actions(username, account.active, stakeout_active)
+
+
+async def _begin_stakeout(
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    *,
+    duration: Optional[int] = None,
+) -> dict:
+    """Shared stakeout starter for the button and the /stakeout command.
+
+    Returns {"ok": bool, "text": str}. On success also kicks off one immediate
+    check so the user sees current state without waiting a full interval."""
+    sched = _scheduler(context)
+    if sched is None:
+        return {"ok": False, "text": "Scheduler unavailable — can't start a stakeout."}
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+    if account is None:
+        return {
+            "ok": False,
+            "text": (
+                f"<b>@{esc(username)}</b> isn't monitored. Add it with "
+                f"<code>/add @{esc(username)}</code> first, then start a stakeout."
+            ),
+        }
+    info = await sched.start_stakeout(account.id, username, duration=duration)
+    service: MonitorService = context.application.bot_data["monitor"]
+    # Immediate first check (don't wait one interval) — fire-and-forget.
+    asyncio.create_task(service.check_username(username, notify_unchanged=False))
+    interval = info["interval"]
+    end = info["end"]
+    text = (
+        f"🎯 <b>Stakeout started — @{esc(username)}</b>\n\n"
+        f"Checking every <b>{_format_interval(interval)}</b> until "
+        f"<code>{fmt_timestamp(end)}</code>.\n\n"
+        "<i>Each tick covers profile, posts, reels, stories &amp; highlights — "
+        "all through the Cloudflare edge proxy and the 90s cache, so it stays "
+        "well clear of Instagram's rate limits (no 401s).</i>"
+    )
+    return {"ok": True, "text": text}
+
+
+async def _start_stakeout(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, username: str
+) -> None:
+    query = update.callback_query
+    await _safe_answer(query, "🎯 Starting stakeout…")
+    result = await _begin_stakeout(context, username)
+    await _safe_edit_text(
+        query, result["text"], reply_markup=await _actions_keyboard(username, context)
+    )
+
+
+async def _stop_stakeout(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, username: str
+) -> None:
+    query = update.callback_query
+    sched = _scheduler(context)
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+    stopped = False
+    if sched is not None and account is not None:
+        stopped = await sched.stop_stakeout(account.id)
+    await _safe_answer(query, "🛑 Stakeout stopped" if stopped else "No active stakeout")
+    text = (
+        f"🛑 <b>Stakeout on @{esc(username)}</b> stopped."
+        if stopped
+        else f"<b>@{esc(username)}</b> had no active stakeout."
+    )
+    await _safe_edit_text(
+        query, text, reply_markup=await _actions_keyboard(username, context)
     )
 
 
@@ -1698,6 +1846,92 @@ async def cmd_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_stakeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stakeout @user [duration] — temporary high-frequency watch on one target."""
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/stakeout &lt;username&gt; [duration]</code>\n"
+            "e.g. <code>/stakeout @user 2h</code> "
+            f"(default {_format_interval(settings.stakeout_default_duration)}, "
+            f"checks every {_format_interval(settings.stakeout_default_interval)}).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    duration: Optional[int] = None
+    if context.args and len(context.args) > 1:
+        duration = _parse_interval(context.args[1])
+    result = await _begin_stakeout(context, username, duration=duration)
+    await update.message.reply_text(
+        result["text"],
+        parse_mode=ParseMode.HTML,
+        reply_markup=(
+            await _actions_keyboard(username, context)
+            if result["ok"]
+            else keyboards.back_to_menu()
+        ),
+    )
+
+
+async def cmd_unstakeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unstakeout @user — end a stakeout early."""
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/unstakeout &lt;username&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    sched = _scheduler(context)
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+    stopped = False
+    if sched is not None and account is not None:
+        stopped = await sched.stop_stakeout(account.id)
+    msg = (
+        f"🛑 Stakeout on <b>@{esc(username)}</b> stopped."
+        if stopped
+        else f"<b>@{esc(username)}</b> had no active stakeout."
+    )
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.HTML, reply_markup=keyboards.back_to_menu()
+    )
+
+
+async def cmd_rhythm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rhythm @user — posting-time histogram from delivered items."""
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/rhythm &lt;username&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    text = await _render_rhythm_message(username)
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=await _actions_keyboard(username, context),
+    )
+
+
+async def cmd_darkradar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/darkradar — list monitored accounts by how long they've been silent."""
+    if await _reject_if_unauthorized(update):
+        return
+    service: MonitorService = context.application.bot_data["monitor"]
+    text = await _render_dark_radar_message(service)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=keyboards.back_to_menu()
+    )
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -2253,6 +2487,15 @@ async def _handle_menu(
         )
         return
 
+    if action == "darkradar":
+        await _safe_answer(query)
+        service: MonitorService = context.application.bot_data["monitor"]
+        text = await _render_dark_radar_message(service)
+        await _safe_edit_text(
+            query, text, reply_markup=keyboards.status_actions()
+        )
+        return
+
     if action == "cleardb":
         await _safe_answer(query)
         await _safe_edit_text(
@@ -2350,8 +2593,24 @@ async def _handle_account(
             )
             return
         await _safe_edit_text(
-            query, text, reply_markup=await _actions_keyboard(username)
+            query, text, reply_markup=await _actions_keyboard(username, context)
         )
+        return
+
+    if action == "rhythm":
+        await _safe_answer(query)
+        text = await _render_rhythm_message(username)
+        await _safe_edit_text(
+            query, text, reply_markup=await _actions_keyboard(username, context)
+        )
+        return
+
+    if action == "stakeout":
+        await _start_stakeout(update, context, username)
+        return
+
+    if action == "unstakeout":
+        await _stop_stakeout(update, context, username)
         return
 
     if action == "recheck":
@@ -2366,7 +2625,7 @@ async def _handle_account(
                 query,
                 f"Check for <b>@{esc(username)}</b> failed: "
                 f"<code>{esc(str(result.get('error')))}</code>",
-                reply_markup=await _actions_keyboard(username),
+                reply_markup=await _actions_keyboard(username, context),
             )
             return
         username = result.get("username", username)
@@ -2385,7 +2644,7 @@ async def _handle_account(
             )
             return
         await _safe_edit_text(
-            query, text + suffix, reply_markup=await _actions_keyboard(username)
+            query, text + suffix, reply_markup=await _actions_keyboard(username, context)
         )
         return
 
@@ -2393,7 +2652,7 @@ async def _handle_account(
         await _safe_answer(query)
         text = await _render_history_message(username)
         await _safe_edit_text(
-            query, text, reply_markup=await _actions_keyboard(username)
+            query, text, reply_markup=await _actions_keyboard(username, context)
         )
         return
 
@@ -2410,7 +2669,7 @@ async def _handle_account(
         await _safe_edit_text(
             query,
             text or f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
-            reply_markup=await _actions_keyboard(username),
+            reply_markup=await _actions_keyboard(username, context),
         )
         return
 
@@ -2476,6 +2735,10 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("recheck", cmd_recheck))
+    app.add_handler(CommandHandler("stakeout", cmd_stakeout))
+    app.add_handler(CommandHandler("unstakeout", cmd_unstakeout))
+    app.add_handler(CommandHandler("rhythm", cmd_rhythm))
+    app.add_handler(CommandHandler("darkradar", cmd_darkradar))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("history", cmd_history))

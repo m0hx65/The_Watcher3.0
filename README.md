@@ -42,6 +42,9 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
+| 🎯 **Stakeout mode** | `/stakeout @user 2h` (or the 🎯 button) watches a single target on a tight loop for a set window, then auto-reverts to the normal schedule. Every tick is a full check — profile, posts, reels, stories, highlights — all through the edge proxy and 90s cache, with an interval floor that keeps it clear of Instagram's rate limits (no 401s). Survives restarts. |
+| 📊 **Activity rhythm** | `/rhythm @user` (or the 📊 button) charts *when* a target is active — an hour-of-day and day-of-week histogram built from everything the bot has caught, in your local time. Spot the windows they post in at a glance. |
+| 🌑 **Went-dark radar** | The sweep flags any account that posts nothing — no story, post, or reel — for N days (`DARK_RADAR_DAYS`, default 3), and announces the comeback when they return. `/darkradar` lists every target ranked by how long they've been quiet. |
 | 🛰 **Every Instagram call rides the edge** | Story/live status, highlight names, and `/add` by numeric ID now go through the same free Cloudflare Worker proxy as profile fetches — so they work flawlessly from cloud hosts whose IPs Instagram 401-blocks. Repeated lookups are served from a 90-second cache, and retry storms against blocked endpoints are gone. |
 | 🪶 **Featherweight database** | Each snapshot now stores ~300 bytes instead of Instagram's full 50–200 KB payload — ~99% smaller. A free 0.5 GB Postgres now lasts effectively forever. |
 | 🔄 **Full-coverage rechecks** | A manual recheck (🔄 button, `/recheck`, REST endpoint) now covers exactly what a scheduled sweep covers: profile diff, new posts & reels, story & live status, highlight catalog changes, and new story/highlight media delivery. |
@@ -106,6 +109,11 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - `/story @user` and `/highlights @user` work on **any public account**, monitored or not
 - **🔎 Any user** menu button does the same with zero typing
 - **📦 Download all** menu button bulk-grabs any account — monitored or not — by username, profile URL, or numeric Instagram ID
+
+### Intelligence
+- **🎯 Stakeout mode** — temporarily watch one target on a tight loop (`/stakeout @user 2h` or the 🎯 button), then auto-revert. Rate-limit-safe: a hard interval floor above the 90s cache, all traffic via the edge proxy. Survives restarts and shows in `/status`
+- **📊 Activity rhythm** — `/rhythm @user` renders an hour-of-day and day-of-week histogram of when a target is active, in local time
+- **🌑 Went-dark radar** — sweeps flag accounts silent for `DARK_RADAR_DAYS` days and announce their return; `/darkradar` ranks every target by how long it's been quiet
 
 ### Target Management
 - Add targets by `@username`, full profile URL, or raw numeric Instagram ID
@@ -246,6 +254,16 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `MAX_CONCURRENT_FETCHES` | `3` | Max parallel profile fetches per sweep |
 | `REQUEST_TIMEOUT` | `20` | Per-request timeout in seconds |
 
+### Stakeout & Radar
+
+| Variable | Default | Description |
+|---|---|---|
+| `STAKEOUT_DEFAULT_INTERVAL` | `180` | Seconds between checks during a stakeout |
+| `STAKEOUT_MIN_INTERVAL` | `120` | Floor for the stakeout interval — kept above the 90s reel cache so every tick is fresh without risking 401s |
+| `STAKEOUT_DEFAULT_DURATION` | `3600` | Default stakeout length in seconds when none is given |
+| `STAKEOUT_MAX_DURATION` | `21600` | Hard cap (6 h) on a single stakeout |
+| `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel. `0` disables the radar |
+
 ### Storage & Retention
 
 | Variable | Default | Description |
@@ -290,8 +308,12 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `/resume <user>` | Resume a paused target exactly where it left off |
 | `/list` | All monitored accounts with 🟢 / ⏸ state, last-check status, and failure count |
 | `/recheck <user>` | Force an immediate check outside the schedule |
+| `/stakeout <user> [duration]` | Watch one target on a tight loop for a window (e.g. `2h`), then auto-revert. Rate-limit-safe |
+| `/unstakeout <user>` | End a stakeout early |
+| `/rhythm <user>` | Posting-time histogram — when the target is active, by hour and weekday |
+| `/darkradar` | List monitored accounts ranked by how long they've been silent |
 | `/interval [value]` | Show or set the sweep interval — `30m`, `1h`, `1800s`, `1h30m`. No argument shows presets |
-| `/status` | Global stats: accounts, last sweep, next scheduled sweep |
+| `/status` | Global stats: accounts, last sweep, next scheduled sweep, active stakeouts |
 | `/history <user>` | Recent detected changes for a target |
 | `/photo <user>` | Latest stored profile picture and its SHA-256 hash |
 | `/fetchphoto <user>` | Download the current profile picture in max quality — works for any public account |
@@ -303,12 +325,16 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 **Everything is also reachable through buttons** — no commands required:
 
 - **Main menu** — Accounts · Status · Add · Interval · Export · Help · **🔎 Any user** · **📦 Download all** · **Sweep All**
-- **Account card** — Recheck · History · Photo · Remove · **Story** · **Highlights** · **Pause ⇄ Resume**
+- **Account card** — Recheck · History · Photo · Remove · **Story** · **Highlights** · **📊 Rhythm** · **🎯 Stakeout** · **Pause ⇄ Resume**
 - **Highlights view** — ⬇️ Download all (n), one download button per highlight, plus 🔕/🔔 mute toggles per highlight and a mute-all / track-all shortcut
 - **📦 Bulk download panel** — asks whether the target is monitored (pick from the list) or not (type a username, URL, or ID), then shows checkboxes for 📖 Story · 👤 Profile pic · 🖼 Photos · 🎬 Reels · every highlight by name, with a select-all-highlights shortcut. **⬇️ Download selected** sends exactly what's ticked; **⚡ Download EVERYTHING** sends it all — with live per-category progress and a final summary
-- **Status view** — Sweep Now · Interval · **Clear Old Data** (with confirmation)
+- **Status view** — Sweep Now · **🌑 Dark radar** · Interval · **Clear Old Data** (with confirmation)
 - **Interval picker** — presets from 5 m to 6 h plus free-form custom entry
 - **Panel bumping** — after every notification the menu re-posts at the bottom of the chat, so it's always within thumb's reach
+
+> **Tip — one thread per target:** run the bot in a Telegram group with
+> **Topics** enabled to give each account its own thread. See
+> [docs/telegram-forum-topics.md](docs/telegram-forum-topics.md).
 
 ---
 
