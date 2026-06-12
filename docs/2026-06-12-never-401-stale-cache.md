@@ -84,3 +84,30 @@ KV copy newer than 24 h (i.e. a brand-new account added during a block, or a
 block lasting a full day). For monitored accounts in steady state that's
 effectively never. If a multi-day colo block ever shows up, the systemic
 answer remains a residential proxy via `settings.proxy`.
+
+## UPDATE — same day: stale serving REMOVED (owner decision)
+
+The owner's call: **"I would rather choose nothing + an error over old
+data."** The Watcher is a monitoring tool — a 200 must mean live, current
+Instagram data, never a stored copy. So:
+
+- The worker's memory + KV cache layers were removed entirely; the KV
+  namespace (`bc12e5cfefdc4de59d9f02ecc23fdfaa`) was deleted along with the
+  seeded data. The worker now returns live JSON, a real 404, or an honest
+  401 — nothing else. Deployed version `9dd66fc2-d6a6-4863-a398-db95e3456531`.
+- The bot-side stale-marker plumbing (never committed) was dropped.
+
+What REMAINS from this work, because it gets *real* data more often rather
+than papering over failures:
+
+- worker host rotation (www ↔ i.instagram.com, separately gated) + UA
+  rotation with jittered backoff,
+- paced sweep launches (`_SWEEP_STAGGER_SECONDS`),
+- the post-sweep retry pass for rate-limited accounts,
+- the story phase reusing the profile check's highlight catalog (one fewer
+  Instagram call per account per sweep).
+
+Consequence, by design: when Instagram blocks the colo for longer than a
+sweep, the sweep summary reports those accounts as failed — truthfully. The
+only path to "always live data AND never an error" is a residential proxy
+(`PROXY_URL` / `settings.proxy`).
