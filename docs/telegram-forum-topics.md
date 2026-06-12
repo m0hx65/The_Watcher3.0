@@ -98,3 +98,25 @@ own thread.
 ### Turn it off
 Set `TELEGRAM_FORUM_TOPICS=false` (default) and everything posts to General
 again — a plain 1:1 chat or non-forum group behaves exactly as before.
+
+## 6. Get alerts in your DM *and* the forum (mirroring)
+
+Keep the organized forum **and** a personal flat feed in your DM at the same
+time. Set `TELEGRAM_MIRROR_CHAT_IDS` to one or more chat ids (comma-separated):
+
+```
+TELEGRAM_CHAT_ID=-1003940865570        # forum group (primary, has topics)
+TELEGRAM_MIRROR_CHAT_IDS=930123749     # your DM (gets a flat copy)
+```
+
+Every notification — profile changes, story status, highlights, media,
+went-dark — is sent to the primary chat (in its per-account topic when topics
+are on) **and** to each mirror as a flat message (DMs and non-forum chats can't
+have topics, so mirrors are always threadless). The mirror is best-effort: if a
+mirror send fails the primary delivery still counts.
+
+> Use a **valid** mirror id. A wrong id makes every notification burn its full
+> retry budget against the bad chat before moving on, which slows delivery.
+> Get your DM's id by messaging the bot and reading the logs, or from a helper
+> like @RawDataBot. Note: the bot must have messaged you at least once (or you
+> must have started it) for it to be allowed to DM you.

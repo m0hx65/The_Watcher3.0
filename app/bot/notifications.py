@@ -34,11 +34,32 @@ _UPLOAD_TIMEOUTS = {
 class NotificationDispatcher:
     """Thin wrapper around python-telegram-bot for sending alerts."""
 
-    def __init__(self, bot: Bot, chat_id: Union[int, str]) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: Union[int, str],
+        mirror_chat_ids: Optional[list[Union[int, str]]] = None,
+    ) -> None:
         self.bot = bot
+        # Primary chat — the one that owns per-account forum topics.
         self.chat_id = chat_id
+        # Extra chats that receive a flat copy of every message (no topics).
+        self.mirror_chat_ids: list[Union[int, str]] = list(mirror_chat_ids or [])
         self._send_lock = asyncio.Lock()
         self.post_send_hook: Optional[Callable[[], Awaitable[None]]] = None
+
+    def _targets(
+        self, message_thread_id: Optional[int]
+    ) -> list[tuple[Union[int, str], Optional[int]]]:
+        """(chat_id, thread) for each destination: the primary keeps its topic
+        thread; mirrors always post flat (None) since DMs/non-forum chats have
+        no topics."""
+        targets: list[tuple[Union[int, str], Optional[int]]] = [
+            (self.chat_id, message_thread_id)
+        ]
+        for mid in self.mirror_chat_ids:
+            targets.append((mid, None))
+        return targets
 
     async def create_forum_topic(self, name: str) -> Optional[int]:
         """Create a forum topic in the configured chat; return its thread id.
@@ -63,21 +84,25 @@ class NotificationDispatcher:
     ) -> bool:
         # Telegram caps text at 4096 chars
         chunks = _split_text(text, limit=4000)
-        delivered_any = False
+        delivered_primary = False
         for chunk in chunks:
-            delivered_any |= await self._send_with_retry(
-                lambda thread, c=chunk: self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=c,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
+            for cid, thread in self._targets(message_thread_id):
+                ok = await self._send_with_retry(
+                    lambda chat, th, c=chunk: self.bot.send_message(
+                        chat_id=chat,
+                        text=c,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=True,
+                        message_thread_id=th,
+                    ),
+                    chat_id=cid,
                     message_thread_id=thread,
-                ),
-                message_thread_id=message_thread_id,
-            )
-        if delivered_any and self.post_send_hook is not None:
+                )
+                if cid == self.chat_id:
+                    delivered_primary |= ok
+        if delivered_primary and self.post_send_hook is not None:
             await self.post_send_hook()
-        return delivered_any
+        return delivered_primary
 
     async def send_photo(
         self,
@@ -86,10 +111,10 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
-        def _send(thread):
+        def _send(chat, thread):
             with open(path, "rb") as f:
                 return self.bot.send_photo(
-                    chat_id=self.chat_id,
+                    chat_id=chat,
                     photo=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
@@ -97,9 +122,7 @@ class NotificationDispatcher:
                     **_UPLOAD_TIMEOUTS,
                 )
 
-        ok = await self._send_with_retry(
-            _send, is_upload=True, message_thread_id=message_thread_id
-        )
+        ok = await self._send_to_targets(_send, message_thread_id, is_upload=True)
         if ok and self.post_send_hook is not None:
             await self.post_send_hook()
         return ok
@@ -111,10 +134,10 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
-        def _send(thread):
+        def _send(chat, thread):
             with open(path, "rb") as f:
                 return self.bot.send_document(
-                    chat_id=self.chat_id,
+                    chat_id=chat,
                     document=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
@@ -122,9 +145,7 @@ class NotificationDispatcher:
                     **_UPLOAD_TIMEOUTS,
                 )
 
-        return await self._send_with_retry(
-            _send, is_upload=True, message_thread_id=message_thread_id
-        )
+        return await self._send_to_targets(_send, message_thread_id, is_upload=True)
 
     async def send_video(
         self,
@@ -133,10 +154,10 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
-        def _send(thread):
+        def _send(chat, thread):
             with open(path, "rb") as f:
                 return self.bot.send_video(
-                    chat_id=self.chat_id,
+                    chat_id=chat,
                     video=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
@@ -145,25 +166,42 @@ class NotificationDispatcher:
                     **_UPLOAD_TIMEOUTS,
                 )
 
-        ok = await self._send_with_retry(
-            _send, is_upload=True, message_thread_id=message_thread_id
-        )
+        ok = await self._send_to_targets(_send, message_thread_id, is_upload=True)
         if ok and self.post_send_hook is not None:
             await self.post_send_hook()
         return ok
 
-    async def _send_with_retry(
-        self, action, *, is_upload: bool = False, message_thread_id: Optional[int] = None
+    async def _send_to_targets(
+        self, action, message_thread_id: Optional[int], *, is_upload: bool = False
     ) -> bool:
-        # `action` accepts the current thread id, which can be cleared mid-flight
-        # if Telegram reports the topic gone (handled in the BadRequest branch).
+        """Send one media item to the primary + every mirror. Returns the
+        primary's delivery result (mirrors are best-effort)."""
+        delivered_primary = False
+        for cid, thread in self._targets(message_thread_id):
+            ok = await self._send_with_retry(
+                action, is_upload=is_upload, chat_id=cid, message_thread_id=thread
+            )
+            if cid == self.chat_id:
+                delivered_primary = ok
+        return delivered_primary
+
+    async def _send_with_retry(
+        self,
+        action,
+        *,
+        is_upload: bool = False,
+        chat_id: Union[int, str],
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
+        # `action(chat_id, thread)` — thread can be cleared mid-flight if
+        # Telegram reports the topic gone (handled in the BadRequest branch).
         thread = message_thread_id
 
         for attempt in range(1, 5):
             delay: float = 0.0
             async with self._send_lock:
                 try:
-                    result = action(thread)
+                    result = action(chat_id, thread)
                     if asyncio.iscoroutine(result):
                         await result
                     return True
@@ -373,4 +411,7 @@ def build_dispatcher(bot: Bot) -> NotificationDispatcher:
     chat_id: Union[int, str] = settings.telegram_chat_id
     if isinstance(chat_id, str) and chat_id.lstrip("-").isdigit():
         chat_id = int(chat_id)
-    return NotificationDispatcher(bot, chat_id)
+    mirrors = [m for m in settings.mirror_chat_ids if m != chat_id]
+    if mirrors:
+        logger.info("Mirroring notifications to {} extra chat(s)", len(mirrors))
+    return NotificationDispatcher(bot, chat_id, mirror_chat_ids=mirrors)

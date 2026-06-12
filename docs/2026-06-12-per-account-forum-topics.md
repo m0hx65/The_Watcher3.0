@@ -50,3 +50,13 @@ create-failure latch → General.
 Full pre-existing suite still passes — notably `test_notification_retry`, which
 covers the refactored `_send_with_retry` (actions now take the thread id and the
 new BadRequest/thread-fallback branch).
+
+## Addendum: mirroring to multiple chats
+
+`TELEGRAM_MIRROR_CHAT_IDS` (comma-separated) sends a flat copy of every
+notification to extra chats — e.g. your DM while the primary `TELEGRAM_CHAT_ID`
+is the forum group. The dispatcher now fans out: `_targets(thread)` yields the
+primary with its topic thread plus each mirror with `None` (DMs/non-forum chats
+have no topics). `action(chat_id, thread)` is invoked per destination;
+`_send_to_targets` handles media. The return value reflects the **primary's**
+delivery — mirrors are best-effort. Covered by `scripts/test_mirror.py`.

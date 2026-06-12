@@ -265,6 +265,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `STAKEOUT_MAX_DURATION` | `21600` | Hard cap (6 h) on a single stakeout |
 | `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel. `0` disables the radar |
 | `TELEGRAM_FORUM_TOPICS` | `false` | Give each account its own forum topic when the chat is a Topics-enabled group and the bot is admin with *Manage topics*. Global messages stay in General |
+| `TELEGRAM_MIRROR_CHAT_IDS` | _(empty)_ | Comma-separated extra chats that receive a flat copy of every notification — e.g. your DM, while `TELEGRAM_CHAT_ID` is the forum group. Mirrors never use topics |
 
 ### Storage & Retention
 

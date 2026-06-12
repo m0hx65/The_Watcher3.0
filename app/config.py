@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(..., alias="TELEGRAM_CHAT_ID")
     telegram_admin_ids: str = Field(default="", alias="TELEGRAM_ADMIN_IDS")
+    # Extra chats that receive a COPY of every notification (comma-separated).
+    # Use this to mirror alerts to your DM while the primary TELEGRAM_CHAT_ID is
+    # a forum group — the group keeps per-account topics, the mirrors get a flat
+    # stream (DMs/non-forum chats can't have topics).
+    telegram_mirror_chat_ids: str = Field(default="", alias="TELEGRAM_MIRROR_CHAT_IDS")
 
     # Telegram webhook mode. If a public URL is available we run as a webhook
     # (one HTTP consumer, no `getUpdates` Conflict). If no URL is set we fall
@@ -117,6 +122,21 @@ class Settings(BaseSettings):
             chunk = chunk.strip()
             if chunk.isdigit() or (chunk.startswith("-") and chunk[1:].isdigit()):
                 out.append(int(chunk))
+        return out
+
+    @property
+    def mirror_chat_ids(self) -> List[Union[int, str]]:
+        """Parsed mirror chat ids — numeric ones become ints, the rest stay
+        strings (e.g. @channel). Empty when no mirrors are configured."""
+        out: List[Union[int, str]] = []
+        for chunk in self.telegram_mirror_chat_ids.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if chunk.lstrip("-").isdigit():
+                out.append(int(chunk))
+            else:
+                out.append(chunk)
         return out
 
     @property
