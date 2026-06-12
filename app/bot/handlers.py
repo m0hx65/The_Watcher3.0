@@ -90,6 +90,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("unstakeout", "Stop a stakeout early"),
     BotCommand("rhythm", "Show a target's posting-time rhythm"),
     BotCommand("darkradar", "List accounts that have gone quiet"),
+    BotCommand("synctopics", "Give each account its own forum topic"),
     BotCommand("history", "Recent changes for a username"),
     BotCommand("photo", "Current profile picture"),
     BotCommand("fetchphoto", "Download current profile picture on demand"),
@@ -1932,6 +1933,34 @@ async def cmd_darkradar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def _render_sync_topics_result(result: dict) -> str:
+    if not result.get("ok"):
+        return f"🧵 <b>Topics</b>\n\n{esc(str(result.get('error')))}"
+    created = result.get("created", 0)
+    existing = result.get("existing", 0)
+    return (
+        "🧵 <b>Topics synced</b>\n\n"
+        f"Created: <b>{created}</b>\n"
+        f"Already had one: <b>{existing}</b>\n\n"
+        "<i>Each account now has its own thread. New alerts route there; "
+        "global messages stay in General.</i>"
+    )
+
+
+async def cmd_synctopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/synctopics — create a forum topic for every monitored account at once."""
+    if await _reject_if_unauthorized(update):
+        return
+    service: MonitorService = context.application.bot_data["monitor"]
+    await update.message.reply_text("🧵 Syncing topics…", parse_mode=ParseMode.HTML)
+    result = await service.sync_topics()
+    await update.message.reply_text(
+        _render_sync_topics_result(result),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboards.back_to_menu(),
+    )
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -2496,6 +2525,17 @@ async def _handle_menu(
         )
         return
 
+    if action == "synctopics":
+        await _safe_answer(query, "🧵 Syncing topics…")
+        service: MonitorService = context.application.bot_data["monitor"]
+        result = await service.sync_topics()
+        await _safe_edit_text(
+            query,
+            _render_sync_topics_result(result),
+            reply_markup=keyboards.status_actions(),
+        )
+        return
+
     if action == "cleardb":
         await _safe_answer(query)
         await _safe_edit_text(
@@ -2739,6 +2779,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("unstakeout", cmd_unstakeout))
     app.add_handler(CommandHandler("rhythm", cmd_rhythm))
     app.add_handler(CommandHandler("darkradar", cmd_darkradar))
+    app.add_handler(CommandHandler("synctopics", cmd_synctopics))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("history", cmd_history))

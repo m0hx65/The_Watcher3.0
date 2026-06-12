@@ -30,6 +30,7 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:stakeout:<username>  — start a stakeout (default interval/duration)
   acc:unstakeout:<u>       — stop an active stakeout
   menu:darkradar           — list accounts by how long they've been quiet
+  menu:synctopics          — create a forum topic per account (backfill)
   menu:cleardb             — show clear-history confirmation
   menu:cleardb_yes         — execute clear-history
   dl:menu                  — bulk-download entry (monitored list or typed user?)
@@ -481,10 +482,13 @@ def status_actions() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("🌑 Dark radar", callback_data="menu:darkradar"),
-                InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
+                InlineKeyboardButton("🧵 Sync topics", callback_data="menu:synctopics"),
             ],
             [
+                InlineKeyboardButton("⏱ Interval", callback_data="menu:interval"),
                 InlineKeyboardButton("🗑 Clear Old Data", callback_data="menu:cleardb"),
+            ],
+            [
                 InlineKeyboardButton("🏠 Home", callback_data="menu:main"),
             ],
         ]

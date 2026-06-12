@@ -8,7 +8,7 @@ from typing import Awaitable, Callable, Optional, Union
 
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError, TimedOut
+from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 
 from app.config import settings
 from app.monitor.change_detector import ChangeSet
@@ -40,80 +40,145 @@ class NotificationDispatcher:
         self._send_lock = asyncio.Lock()
         self.post_send_hook: Optional[Callable[[], Awaitable[None]]] = None
 
-    async def send_text(self, text: str, *, parse_mode: str = ParseMode.HTML) -> bool:
+    async def create_forum_topic(self, name: str) -> Optional[int]:
+        """Create a forum topic in the configured chat; return its thread id.
+
+        Returns None when the chat isn't a forum (or the bot lacks the
+        manage-topics right) — callers then fall back to the General thread."""
+        try:
+            topic = await self.bot.create_forum_topic(
+                chat_id=self.chat_id, name=name[:128]
+            )
+            return topic.message_thread_id
+        except TelegramError as exc:
+            logger.debug("create_forum_topic({}) failed: {}", name, exc)
+            return None
+
+    async def send_text(
+        self,
+        text: str,
+        *,
+        parse_mode: str = ParseMode.HTML,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
         # Telegram caps text at 4096 chars
         chunks = _split_text(text, limit=4000)
         delivered_any = False
         for chunk in chunks:
             delivered_any |= await self._send_with_retry(
-                lambda c=chunk: self.bot.send_message(
+                lambda thread, c=chunk: self.bot.send_message(
                     chat_id=self.chat_id,
                     text=c,
                     parse_mode=parse_mode,
                     disable_web_page_preview=True,
-                )
+                    message_thread_id=thread,
+                ),
+                message_thread_id=message_thread_id,
             )
         if delivered_any and self.post_send_hook is not None:
             await self.post_send_hook()
         return delivered_any
 
     async def send_photo(
-        self, path: Path, caption: Optional[str] = None
+        self,
+        path: Path,
+        caption: Optional[str] = None,
+        *,
+        message_thread_id: Optional[int] = None,
     ) -> bool:
-        async def _send():
+        def _send(thread):
             with open(path, "rb") as f:
-                await self.bot.send_photo(
+                return self.bot.send_photo(
                     chat_id=self.chat_id,
                     photo=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
+                    message_thread_id=thread,
                     **_UPLOAD_TIMEOUTS,
                 )
 
-        ok = await self._send_with_retry(_send, is_upload=True)
+        ok = await self._send_with_retry(
+            _send, is_upload=True, message_thread_id=message_thread_id
+        )
         if ok and self.post_send_hook is not None:
             await self.post_send_hook()
         return ok
 
-    async def send_document(self, path: Path, caption: Optional[str] = None) -> bool:
-        async def _send():
+    async def send_document(
+        self,
+        path: Path,
+        caption: Optional[str] = None,
+        *,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
+        def _send(thread):
             with open(path, "rb") as f:
-                await self.bot.send_document(
+                return self.bot.send_document(
                     chat_id=self.chat_id,
                     document=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
+                    message_thread_id=thread,
                     **_UPLOAD_TIMEOUTS,
                 )
 
-        return await self._send_with_retry(_send, is_upload=True)
+        return await self._send_with_retry(
+            _send, is_upload=True, message_thread_id=message_thread_id
+        )
 
-    async def send_video(self, path: Path, caption: Optional[str] = None) -> bool:
-        async def _send():
+    async def send_video(
+        self,
+        path: Path,
+        caption: Optional[str] = None,
+        *,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
+        def _send(thread):
             with open(path, "rb") as f:
-                await self.bot.send_video(
+                return self.bot.send_video(
                     chat_id=self.chat_id,
                     video=f,
                     caption=caption or "",
                     parse_mode=ParseMode.HTML,
                     supports_streaming=True,
+                    message_thread_id=thread,
                     **_UPLOAD_TIMEOUTS,
                 )
 
-        ok = await self._send_with_retry(_send, is_upload=True)
+        ok = await self._send_with_retry(
+            _send, is_upload=True, message_thread_id=message_thread_id
+        )
         if ok and self.post_send_hook is not None:
             await self.post_send_hook()
         return ok
 
-    async def _send_with_retry(self, action, *, is_upload: bool = False) -> bool:
+    async def _send_with_retry(
+        self, action, *, is_upload: bool = False, message_thread_id: Optional[int] = None
+    ) -> bool:
+        # `action` accepts the current thread id, which can be cleared mid-flight
+        # if Telegram reports the topic gone (handled in the BadRequest branch).
+        thread = message_thread_id
+
         for attempt in range(1, 5):
             delay: float = 0.0
             async with self._send_lock:
                 try:
-                    result = action()
+                    result = action(thread)
                     if asyncio.iscoroutine(result):
                         await result
                     return True
+                except BadRequest as exc:
+                    # A deleted/invalid topic must not eat the message — drop the
+                    # thread and resend to General instead of failing.
+                    if thread is not None and "thread" in str(exc).lower():
+                        logger.warning(
+                            "Topic {} invalid ({}); resending to General",
+                            thread, exc,
+                        )
+                        thread = None
+                        continue
+                    delay = min(10.0, 2 ** attempt)
+                    logger.warning("Telegram error attempt {}/4: {}", attempt, exc)
                 except RetryAfter as ra:
                     # Cap at 30s so the lock isn't held (or slept) for minutes
                     delay = min(float(ra.retry_after) + 1.0, 30.0)

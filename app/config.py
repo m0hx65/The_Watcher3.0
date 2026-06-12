@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     telegram_webhook_url: Optional[str] = Field(default=None, alias="TELEGRAM_WEBHOOK_URL")
     telegram_webhook_secret: Optional[str] = Field(default=None, alias="TELEGRAM_WEBHOOK_SECRET")
     telegram_webhook_path: str = Field(default="/telegram/webhook", alias="TELEGRAM_WEBHOOK_PATH")
+    # When the chat is a forum-enabled group, give each monitored account its
+    # own topic (thread). Per-account alerts/media route to that thread; global
+    # messages (sweeps, summaries, the menu) stay in General. Off by default so
+    # plain 1:1 chats and non-forum groups behave exactly as before.
+    telegram_forum_topics: bool = Field(default=False, alias="TELEGRAM_FORUM_TOPICS")
     # Render injects this with the public service URL — we use it as a fallback.
     render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
 

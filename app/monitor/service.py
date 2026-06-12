@@ -50,6 +50,87 @@ class MonitorService:
         self.notifier = notifier
         self.stories = stories
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
+        # account_id -> forum topic (message_thread_id). Resolved lazily and
+        # cached so each account's alerts land in its own thread.
+        self._topic_cache: dict[int, int] = {}
+        # Latched True once topic creation fails (chat isn't a forum / no
+        # manage-topics right) so we don't re-attempt on every message.
+        self._topics_unavailable: bool = False
+
+    async def topic_for(
+        self, account_id: Optional[int], username: str
+    ) -> Optional[int]:
+        """Resolve the forum topic id for an account, creating it on first use.
+
+        Returns None — meaning post to the General thread — when forum topics
+        are disabled, the account isn't monitored, or the chat isn't a forum.
+        One topic per account: results are cached and persisted, and a single
+        creation failure latches the feature off for this process so a non-forum
+        chat never gets hammered with create attempts.
+        """
+        if (
+            not settings.telegram_forum_topics
+            or account_id is None
+            or self._topics_unavailable
+        ):
+            return None
+        if account_id in self._topic_cache:
+            return self._topic_cache[account_id]
+        async with get_session() as session:
+            stored = await crud.get_account_topic(session, account_id)
+        if stored is not None:
+            self._topic_cache[account_id] = stored
+            return stored
+        thread = await self.notifier.create_forum_topic(f"@{username}")
+        if thread is None:
+            self._topics_unavailable = True
+            logger.info(
+                "Forum topics unavailable (chat isn't a forum or bot lacks "
+                "manage-topics) — routing everything to General."
+            )
+            return None
+        async with get_session() as session:
+            await crud.set_account_topic(session, account_id, thread)
+        self._topic_cache[account_id] = thread
+        logger.info("Created forum topic for @{} (thread {})", username, thread)
+        return thread
+
+    async def sync_topics(self) -> dict:
+        """Create a forum topic for every monitored account that lacks one.
+
+        Backfills all existing accounts at once (including private ones, which
+        otherwise only get a topic the first time they change). Returns
+        {ok, created, existing, error}."""
+        if not settings.telegram_forum_topics:
+            return {
+                "ok": False, "created": 0, "existing": 0,
+                "error": "Forum topics are off — set TELEGRAM_FORUM_TOPICS=true and redeploy.",
+            }
+        # Let an explicit sync retry even if a prior auto-attempt latched off.
+        self._topics_unavailable = False
+        async with get_session() as session:
+            accounts = await crud.list_accounts(session, only_active=False)
+        created = 0
+        existing = 0
+        for account in accounts:
+            async with get_session() as session:
+                stored = await crud.get_account_topic(session, account.id)
+            if stored is not None:
+                self._topic_cache[account.id] = stored
+                existing += 1
+                continue
+            thread = await self.topic_for(account.id, account.username)
+            if thread is None:
+                return {
+                    "ok": False, "created": created, "existing": existing,
+                    "error": (
+                        "Couldn't create a topic — make sure the chat is a forum "
+                        "(Topics enabled) and the bot is an admin with the "
+                        "'Manage topics' right."
+                    ),
+                }
+            created += 1
+        return {"ok": True, "created": created, "existing": existing, "error": None}
 
     async def check_username(
         self, username: str, *, notify_unchanged: bool = False
@@ -369,7 +450,8 @@ class MonitorService:
                     f"story, post, or reel in <b>{self._humanize_silence(silent)}</b>.\n"
                     f"Last activity: <code>{fmt_timestamp(last)}</code>"
                 )
-                delivered = await self.notifier.send_text(msg)
+                thread_id = await self.topic_for(account.id, account.username)
+                delivered = await self.notifier.send_text(msg, message_thread_id=thread_id)
                 async with get_session() as session:
                     await crud.log_notification(
                         session,
@@ -387,7 +469,8 @@ class MonitorService:
                     f"☀️ <b>@{esc(account.username)}</b> is active again — "
                     "posted after a quiet spell."
                 )
-                delivered = await self.notifier.send_text(msg)
+                thread_id = await self.topic_for(account.id, account.username)
+                delivered = await self.notifier.send_text(msg, message_thread_id=thread_id)
                 async with get_session() as session:
                     await crud.log_notification(
                         session,
@@ -801,11 +884,13 @@ class MonitorService:
         new_pic_path,
         notify_unchanged: bool,
     ) -> None:
+        thread_id = await self.topic_for(account_id, username)
         if not changeset.has_changes:
             if notify_unchanged:
                 await self.notifier.send_text(
                     f"<b>@{username}</b>\nNo changes detected.\n"
-                    f"Checked at {fmt_timestamp(datetime.now(timezone.utc))}"
+                    f"Checked at {fmt_timestamp(datetime.now(timezone.utc))}",
+                    message_thread_id=thread_id,
                 )
             return
 
@@ -813,7 +898,7 @@ class MonitorService:
         text = render_changes_message(changeset, first_seen=previous_snapshot_id is None)
         delivered = False
         if text:
-            delivered = await self.notifier.send_text(text)
+            delivered = await self.notifier.send_text(text, message_thread_id=thread_id)
 
         async with get_session() as session:
             for change in changeset.changes:
@@ -833,7 +918,9 @@ class MonitorService:
                 f"Old hash: <code>{changeset.old_pic_hash}</code>\n"
                 f"New hash: <code>{changeset.new_pic_hash}</code>"
             )
-            ok = await self.notifier.send_document(new_pic_path, caption=caption)
+            ok = await self.notifier.send_document(
+                new_pic_path, caption=caption, message_thread_id=thread_id
+            )
             async with get_session() as session:
                 await crud.log_notification(
                     session,
@@ -948,6 +1035,9 @@ class MonitorService:
                     )
                     seen_pks = await crud.get_seen_story_pks(session, account_id)
 
+                # Route everything in this account's check to its own topic.
+                thread_id = await self.topic_for(account_id, username)
+
                 # Extract reel data from the latest snapshot (fetched during profile check)
                 # Reel data is used ONLY for story/live status detection, not for highlight catalog
                 reel_data = None
@@ -991,7 +1081,9 @@ class MonitorService:
                             renamed=renamed,
                             total=len(catalog),
                         )
-                        delivered = await self.notifier.send_text(msg)
+                        delivered = await self.notifier.send_text(
+                            msg, message_thread_id=thread_id
+                        )
                         async with get_session() as session:
                             await crud.log_notification(
                                 session,
@@ -1073,7 +1165,9 @@ class MonitorService:
                         msg = f"<b>@{esc(username)}</b> — ⭕ NO STORY"
                         change_type = "story_status"
 
-                    delivered = await self.notifier.send_text(msg)
+                    delivered = await self.notifier.send_text(
+                        msg, message_thread_id=thread_id
+                    )
                     async with get_session() as session:
                         await crud.log_notification(
                             session,
@@ -1110,9 +1204,10 @@ class MonitorService:
 
                 if new_stories:
                     alert = render_new_stories_alert(username, len(new_stories))
-                    await self.notifier.send_text(alert)
+                    await self.notifier.send_text(alert, message_thread_id=thread_id)
                     await self._deliver_story_items(
-                        account_id, username, new_stories, seen_pks
+                        account_id, username, new_stories, seen_pks,
+                        message_thread_id=thread_id,
                     )
 
                 # Auto-download honors per-highlight mutes: untracked reels are
@@ -1135,7 +1230,8 @@ class MonitorService:
                 ]
                 if new_highlight_items:
                     await self._deliver_story_items(
-                        account_id, username, new_highlight_items, seen_pks
+                        account_id, username, new_highlight_items, seen_pks,
+                        message_thread_id=thread_id,
                     )
             except Exception as exc:
                 logger.exception(
@@ -1148,12 +1244,16 @@ class MonitorService:
         username: str,
         items: list,
         seen_pks: set[str],
+        *,
+        message_thread_id: Optional[int] = None,
     ) -> int:
         """Download and send each item; record it as seen. Returns the number sent.
 
         `account_id` is None for ad-hoc fetches of accounts that aren't monitored
         (e.g. /story for any username) — in that case nothing is persisted as
         seen, since there's no account row to dedup against on later sweeps.
+        `message_thread_id` routes the media to a per-account forum topic when
+        set (sweep path); on-demand callers leave it None for the General thread.
         """
         assert self.stories is not None
         sent = 0
@@ -1191,9 +1291,13 @@ class MonitorService:
                 caption = f"📖 <b>@{esc(username)}</b> — new story"
 
             if item.media_type == "video":
-                ok = await self.notifier.send_video(path, caption=caption)
+                ok = await self.notifier.send_video(
+                    path, caption=caption, message_thread_id=message_thread_id
+                )
             else:
-                ok = await self.notifier.send_photo(path, caption=caption)
+                ok = await self.notifier.send_photo(
+                    path, caption=caption, message_thread_id=message_thread_id
+                )
 
             if ok:
                 sent += 1
@@ -1263,10 +1367,14 @@ class MonitorService:
             return
         new_posts = new_posts[:5]  # cap so a big jump never floods the chat
         noun = "post" if len(new_posts) == 1 else "posts"
+        thread_id = await self.topic_for(account_id, username)
         await self.notifier.send_text(
-            f"🖼 <b>@{esc(username)}</b> shared {len(new_posts)} new {noun}"
+            f"🖼 <b>@{esc(username)}</b> shared {len(new_posts)} new {noun}",
+            message_thread_id=thread_id,
         )
-        await self._deliver_story_items(account_id, username, new_posts, seen_pks)
+        await self._deliver_story_items(
+            account_id, username, new_posts, seen_pks, message_thread_id=thread_id
+        )
 
     # ---------- On-demand actions ----------
     # These work for ANY public username, monitored or not. When the account is

@@ -43,7 +43,8 @@ way to get it:
 2. Put that in `TELEGRAM_CHAT_ID` and redeploy. Remove the helper bot.
 
 At this point **all** alerts land in the group's **General** topic. That alone
-is often enough — you get a dedicated, shareable feed.
+is often enough — but the bot can also give **each account its own thread**
+(next section).
 
 ## 4. (Optional) Get a topic's id
 
@@ -59,28 +60,41 @@ bot must pass that id with every message. To find it:
 
 ---
 
-## 5. (Optional) Wire per-account topic routing in the bot
+## 5. Per-account topics — one thread per account (built in)
 
-Today every send goes to `TELEGRAM_CHAT_ID` with no thread id, so everything
-lands in General. To route each account to its own topic you'd:
+The bot can give **every monitored account its own topic**: `@nasa` alerts in
+the *@nasa* thread, `@natgeo` in *@natgeo*, while global messages (sweep
+start/complete, ID-backfill summaries, the menu panel) stay in **General**.
 
-1. **Store a topic id per account.** Add a nullable `topic_id` column to
-   `monitored_accounts` (mirrors how `instagram_id` was added), or keep a
-   `app_settings` entry keyed `topic:<account_id>`.
-2. **Auto-create on add.** In the `/add` flow call the Bot API
-   `createForumTopic(chat_id, name="@<username>")`, store the returned
-   `message_thread_id`. python-telegram-bot exposes this as
-   `bot.create_forum_topic(...)`.
-3. **Thread every send.** `NotificationDispatcher.send_text/photo/video/document`
-   take a `message_thread_id` and pass it through to the
-   `bot.send_*` calls (the parameter already exists in the Bot API). The
-   `MonitorService` story/profile paths would look up the account's topic id and
-   hand it to the dispatcher.
-4. **Fallback.** When an account has no topic id (or the chat isn't a forum),
-   omit `message_thread_id` so it posts to General exactly like today — no
-   regression for single-chat users.
+### Turn it on
+1. Make the chat a forum and the bot an admin with **Manage topics** (sections
+   1–3 above).
+2. Set `TELEGRAM_FORUM_TOPICS=true` and redeploy.
+3. Tap **📊 Status → 🧵 Sync topics** (or run `/synctopics`) once. The bot
+   creates a topic named `@<username>` for every monitored account, including
+   private ones. New accounts get a topic automatically when added.
 
-This is a self-contained feature (one column, one dispatcher param, one lookup);
-it's deliberately left out of the default build so the bot keeps working in a
-plain one-on-one chat with zero configuration. Open an issue or ask if you want
-it turned on — the hooks above are where it slots in.
+That's it. From then on each account's profile changes, story/live status,
+highlight updates, new story/post/reel media, and went-dark alerts route to its
+own thread.
+
+### How it works (for the curious)
+- **Mapping:** each account's `message_thread_id` is stored in `app_settings`
+  under `topic:<account_id>` — no schema migration needed.
+- **Lazy creation:** `MonitorService.topic_for(account_id, username)` creates the
+  topic on first use (`bot.create_forum_topic`), caches it in memory, and
+  persists it. Public accounts also get one on the next sweep (their per-sweep
+  story-status message triggers creation), so `/synctopics` is mainly for an
+  immediate, complete backfill.
+- **Threading:** `NotificationDispatcher.send_text/photo/video/document` take a
+  `message_thread_id`; the per-account service paths pass the resolved topic,
+  global paths pass `None` (General).
+- **Resilience:** if a topic is later deleted, Telegram's "thread not found"
+  error is caught and the message is resent to General instead of being lost.
+  If the chat isn't a forum or the bot lacks the right, topic creation fails
+  once, the feature latches off for the process, and everything posts to
+  General — so a misconfiguration never drops alerts.
+
+### Turn it off
+Set `TELEGRAM_FORUM_TOPICS=false` (default) and everything posts to General
+again — a plain 1:1 chat or non-forum group behaves exactly as before.

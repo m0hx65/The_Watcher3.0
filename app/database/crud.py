@@ -539,6 +539,28 @@ async def delete_setting(session: AsyncSession, key: str) -> bool:
     return result.rowcount > 0
 
 
+# ---------- Per-account forum topic mapping (stored in app_settings) ----------
+
+def _topic_key(account_id: int) -> str:
+    return f"topic:{account_id}"
+
+
+async def get_account_topic(
+    session: AsyncSession, account_id: int
+) -> Optional[int]:
+    """Return the Telegram forum topic (message_thread_id) for an account."""
+    raw = await get_setting(session, _topic_key(account_id))
+    if raw and raw.lstrip("-").isdigit():
+        return int(raw)
+    return None
+
+
+async def set_account_topic(
+    session: AsyncSession, account_id: int, thread_id: int
+) -> None:
+    await set_setting(session, _topic_key(account_id), str(thread_id))
+
+
 # ---------- Data retention ----------
 
 async def purge_old_data(

@@ -42,6 +42,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
+| 🧵 **One thread per account** | In a Topics-enabled group, the bot gives every monitored account its own forum thread — that account's profile changes, story status, highlights, media, and went-dark alerts route to its thread, while sweeps and summaries stay in General. Enable with `TELEGRAM_FORUM_TOPICS=true` then **Status → 🧵 Sync topics**. Deleted-topic and non-forum cases fall back to General safely. |
 | 🎯 **Stakeout mode** | `/stakeout @user 2h` (or the 🎯 button) watches a single target on a tight loop for a set window, then auto-reverts to the normal schedule. Every tick is a full check — profile, posts, reels, stories, highlights — all through the edge proxy and 90s cache, with an interval floor that keeps it clear of Instagram's rate limits (no 401s). Survives restarts. |
 | 📊 **Activity rhythm** | `/rhythm @user` (or the 📊 button) charts *when* a target is active — an hour-of-day and day-of-week histogram built from everything the bot has caught, in your local time. Spot the windows they post in at a glance. |
 | 🌑 **Went-dark radar** | The sweep flags any account that posts nothing — no story, post, or reel — for N days (`DARK_RADAR_DAYS`, default 3), and announces the comeback when they return. `/darkradar` lists every target ranked by how long they've been quiet. |
@@ -263,6 +264,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `STAKEOUT_DEFAULT_DURATION` | `3600` | Default stakeout length in seconds when none is given |
 | `STAKEOUT_MAX_DURATION` | `21600` | Hard cap (6 h) on a single stakeout |
 | `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel. `0` disables the radar |
+| `TELEGRAM_FORUM_TOPICS` | `false` | Give each account its own forum topic when the chat is a Topics-enabled group and the bot is admin with *Manage topics*. Global messages stay in General |
 
 ### Storage & Retention
 
@@ -312,6 +314,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `/unstakeout <user>` | End a stakeout early |
 | `/rhythm <user>` | Posting-time histogram — when the target is active, by hour and weekday |
 | `/darkradar` | List monitored accounts ranked by how long they've been silent |
+| `/synctopics` | Create a forum topic per account (needs `TELEGRAM_FORUM_TOPICS=true` + a Topics group) |
 | `/interval [value]` | Show or set the sweep interval — `30m`, `1h`, `1800s`, `1h30m`. No argument shows presets |
 | `/status` | Global stats: accounts, last sweep, next scheduled sweep, active stakeouts |
 | `/history <user>` | Recent detected changes for a target |
@@ -332,9 +335,10 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 - **Interval picker** — presets from 5 m to 6 h plus free-form custom entry
 - **Panel bumping** — after every notification the menu re-posts at the bottom of the chat, so it's always within thumb's reach
 
-> **Tip — one thread per target:** run the bot in a Telegram group with
-> **Topics** enabled to give each account its own thread. See
-> [docs/telegram-forum-topics.md](docs/telegram-forum-topics.md).
+> **🧵 One thread per target:** run the bot in a Telegram group with **Topics**
+> enabled, set `TELEGRAM_FORUM_TOPICS=true`, and tap **Status → 🧵 Sync topics**
+> (or `/synctopics`). Each account gets its own thread; global messages stay in
+> General. Full guide: [docs/telegram-forum-topics.md](docs/telegram-forum-topics.md).
 
 ---
 

@@ -38,6 +38,11 @@ services:
       # Went-dark radar: alert after this many quiet days. 0 disables.
       - key: DARK_RADAR_DAYS
         value: "3"
+      # Per-account forum topics. Set to "true" when running in a Topics-enabled
+      # group with the bot as admin (Manage topics) to give each account its own
+      # thread. Default off → everything posts to one chat / General.
+      - key: TELEGRAM_FORUM_TOPICS
+        value: "false"
       - key: MEDIA_DIR
         value: "/app/data/media"
       - key: LOG_LEVEL
