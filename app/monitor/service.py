@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -33,6 +34,18 @@ _DOWNLOAD_UNAVAILABLE_MSG = (
     "limited or temporarily down. Try again shortly. Highlight names and story "
     "status still work."
 )
+
+# Seconds between sweep launch starts. Firing every account at once is the
+# main 401 trigger — Instagram rate-limits the proxy egress on bursts, and a
+# blocked call retries inside the worker, snowballing the blocked traffic.
+_SWEEP_STAGGER_SECONDS = 2.0
+# Cooldown before re-checking accounts that hit a rate-limit block during the
+# sweep. Instagram's anonymous throttle windows are short — by the time the
+# story phase plus this pause have run, a retry usually goes through.
+_SWEEP_RETRY_COOLDOWN_SECONDS = 30.0
+# Fetch statuses worth a second pass: rate-limit blocks and network timeouts.
+# 404s are handled by the rename-recovery path, not by retrying.
+_RETRIABLE_STATUSES = (401, 403, 429, 0)
 
 
 class MonitorService:
@@ -315,22 +328,25 @@ class MonitorService:
             f"👁 Sweep started — {len(targets)} {noun} queued."
         )
         results = await asyncio.gather(
-            *(self._run_check(aid, uname) for aid, uname in targets),
+            *(
+                self._staggered_check(i, aid, uname)
+                for i, (aid, uname) in enumerate(targets)
+            ),
             return_exceptions=True,
         )
 
-        checked = 0
-        changed = 0
-        failed = 0
-        failed_usernames: list[str] = []
+        # account_id -> (fallback username, result dict). Exceptions become
+        # failure dicts (flagged "crashed") so the retry pass can rewrite any
+        # entry and the final stats fall out of one structure.
+        outcomes: list[tuple[int, str, dict]] = []
         story_targets: list[tuple[int, str, Optional[str]]] = []
         for (target_account_id, uname), r in zip(targets, results):
             if isinstance(r, Exception):
-                failed += 1
-                failed_usernames.append(uname)
                 logger.exception("Unhandled error during sweep: {}", r)
+                r = {"ok": False, "username": uname, "error": repr(r), "crashed": True}
+            outcomes.append((target_account_id, uname, r))
+            if r.get("crashed"):
                 continue
-            checked += 1
             result_username = r.get("username", uname)
             meta = await self._load_account_story_meta(target_account_id)
             is_private = r.get("is_private")
@@ -343,15 +359,6 @@ class MonitorService:
                 story_targets.append(
                     (target_account_id, result_username, instagram_id)
                 )
-            if r.get("changed"):
-                changed += 1
-            if not r.get("ok"):
-                failed += 1
-                failed_usernames.append(result_username)
-
-        logger.info(
-            "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
-        )
 
         if self.stories is not None and story_targets:
             await asyncio.gather(
@@ -363,6 +370,40 @@ class MonitorService:
                 ),
                 return_exceptions=True,
             )
+
+        # Second pass: accounts that hit a rate-limit block get one more
+        # chance after a cooldown (the story phase above already added some).
+        # The throttle is transient — a paced sequential retry usually
+        # succeeds, so the sweep summary stops reporting phantom failures.
+        retriable = [
+            (idx, aid, uname)
+            for idx, (aid, uname, r) in enumerate(outcomes)
+            if not r.get("ok") and r.get("status") in _RETRIABLE_STATUSES
+        ]
+        if retriable:
+            logger.info(
+                "Retrying {} rate-limited account(s) after a {:.0f}s cooldown",
+                len(retriable), _SWEEP_RETRY_COOLDOWN_SECONDS,
+            )
+            await asyncio.sleep(_SWEEP_RETRY_COOLDOWN_SECONDS)
+            for idx, aid, uname in retriable:
+                retry = await self._run_check(aid, uname)
+                if retry.get("ok"):
+                    outcomes[idx] = (aid, uname, retry)
+                await asyncio.sleep(random.uniform(2.0, 5.0))
+
+        checked = sum(1 for _, _, r in outcomes if not r.get("crashed"))
+        changed = sum(1 for _, _, r in outcomes if r.get("changed"))
+        failed_usernames = [
+            r.get("username", uname)
+            for _, uname, r in outcomes
+            if not r.get("ok")
+        ]
+        failed = len(failed_usernames)
+
+        logger.info(
+            "Sweep done: checked={}, changed={}, failed={}", checked, changed, failed
+        )
 
         # Went-dark radar: flag targets that have posted nothing for a while.
         # Runs after the story phase so this sweep's fresh activity is counted.
@@ -517,6 +558,21 @@ class MonitorService:
             key=lambda r: (r["never"], -(r["silent_days"] or 0)),
         )
         return {"threshold_days": threshold_days, "accounts": report}
+
+    async def _staggered_check(
+        self, index: int, account_id: int, username: str
+    ) -> dict:
+        """Run one sweep check after a position-based delay.
+
+        Spreads the sweep's Instagram traffic over ~2s per account instead of
+        bursting everything at once — bursts are what trip Instagram's
+        anonymous rate limiter into 401s on the shared proxy egress.
+        """
+        if index:
+            await asyncio.sleep(
+                index * _SWEEP_STAGGER_SECONDS + random.uniform(0.0, 0.8)
+            )
+        return await self._run_check(account_id, username)
 
     async def _run_check(
         self, account_id: int, username: str, *, notify_unchanged: bool = False
@@ -1051,14 +1107,23 @@ class MonitorService:
                         reel_data = {
                             "has_public_story": reel_user.get("has_public_story", False),
                             "is_live": reel_user.get("is_live", False),
+                            "highlights": reel_user.get("highlights", {}),
                         }
                         logger.debug(
                             "Fetched reel data for @{} during story check (not in snapshot)",
                             username
                         )
 
-                # Fetch the current highlight catalog (graphql reel query, anonymous).
-                catalog = await self._fetch_highlight_catalog(username, instagram_id)
+                # Highlight catalog: the profile check already fetched it (it
+                # rides on the same reel query as story/live status), so reuse
+                # it rather than asking Instagram again — every avoided call
+                # lowers the 401 rate. Only fetch when the snapshot predates
+                # highlights being stored in reel_data.
+                catalog = (reel_data or {}).get("highlights")
+                if catalog is None:
+                    catalog = await self._fetch_highlight_catalog(
+                        username, instagram_id
+                    )
 
                 establishing_baseline = not previous_catalog and bool(catalog)
 
