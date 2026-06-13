@@ -112,15 +112,19 @@ class NotificationDispatcher:
         message_thread_id: Optional[int] = None,
     ) -> bool:
         def _send(chat, thread):
-            with open(path, "rb") as f:
-                return self.bot.send_photo(
-                    chat_id=chat,
-                    photo=f,
-                    caption=caption or "",
-                    parse_mode=ParseMode.HTML,
-                    message_thread_id=thread,
-                    **_UPLOAD_TIMEOUTS,
-                )
+            # Pass the path itself — python-telegram-bot reads the file when the
+            # coroutine is awaited. Opening a handle here and returning the
+            # coroutine would close the file (end of `with`) BEFORE the await in
+            # _send_with_retry, raising "read of closed file" and silently
+            # dropping every upload.
+            return self.bot.send_photo(
+                chat_id=chat,
+                photo=path,
+                caption=caption or "",
+                parse_mode=ParseMode.HTML,
+                message_thread_id=thread,
+                **_UPLOAD_TIMEOUTS,
+            )
 
         ok = await self._send_to_targets(_send, message_thread_id, is_upload=True)
         if ok and self.post_send_hook is not None:
@@ -135,15 +139,16 @@ class NotificationDispatcher:
         message_thread_id: Optional[int] = None,
     ) -> bool:
         def _send(chat, thread):
-            with open(path, "rb") as f:
-                return self.bot.send_document(
-                    chat_id=chat,
-                    document=f,
-                    caption=caption or "",
-                    parse_mode=ParseMode.HTML,
-                    message_thread_id=thread,
-                    **_UPLOAD_TIMEOUTS,
-                )
+            # See send_photo: pass the path so PTB reads it at await time. A
+            # `with open(...)` here closes the handle before the await.
+            return self.bot.send_document(
+                chat_id=chat,
+                document=path,
+                caption=caption or "",
+                parse_mode=ParseMode.HTML,
+                message_thread_id=thread,
+                **_UPLOAD_TIMEOUTS,
+            )
 
         return await self._send_to_targets(_send, message_thread_id, is_upload=True)
 
@@ -155,16 +160,17 @@ class NotificationDispatcher:
         message_thread_id: Optional[int] = None,
     ) -> bool:
         def _send(chat, thread):
-            with open(path, "rb") as f:
-                return self.bot.send_video(
-                    chat_id=chat,
-                    video=f,
-                    caption=caption or "",
-                    parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
-                    message_thread_id=thread,
-                    **_UPLOAD_TIMEOUTS,
-                )
+            # See send_photo: pass the path so PTB reads it at await time. A
+            # `with open(...)` here closes the handle before the await.
+            return self.bot.send_video(
+                chat_id=chat,
+                video=path,
+                caption=caption or "",
+                parse_mode=ParseMode.HTML,
+                supports_streaming=True,
+                message_thread_id=thread,
+                **_UPLOAD_TIMEOUTS,
+            )
 
         ok = await self._send_to_targets(_send, message_thread_id, is_upload=True)
         if ok and self.post_send_hook is not None:

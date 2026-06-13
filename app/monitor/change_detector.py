@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 from app.database.models import AccountSnapshot
+from app.monitor.media_hasher import PHASH_PREFIX
+
+# Max Hamming distance between two profile-picture perceptual hashes that still
+# counts as "the same picture". CDN re-encodes of one avatar measure 0 apart;
+# different pictures sit ~30 apart — so anything up to this is noise, not a
+# change. Comfortably between the two so re-encodes never alarm and real swaps
+# always do.
+PHASH_HAMMING_THRESHOLD = 10
 
 
 @dataclass
@@ -93,9 +101,10 @@ def detect_changes(
                 Change(field=field_name, old=old_val, new=new_val, label=label)
             )
 
-    # Profile picture: compare via hash, not URL (URLs rotate often).
+    # Profile picture: compare perceptual hashes, not URLs (which rotate) or raw
+    # bytes (the CDN re-encodes the same avatar per signed URL — see HashedMedia).
     old_hash = previous.profile_pic_hash
-    if new_pic_hash and old_hash and new_pic_hash != old_hash:
+    if new_pic_hash and old_hash and _pic_changed(old_hash, new_pic_hash):
         changeset.profile_pic_changed = True
         changeset.old_pic_hash = old_hash
         changeset.new_pic_hash = new_pic_hash
@@ -104,6 +113,25 @@ def detect_changes(
         changeset.new_pic_hash = new_pic_hash
 
     return changeset
+
+
+def _pic_changed(old_hash: str, new_hash: str) -> bool:
+    """True only when two profile-picture hashes are a real, visible change.
+
+    Both perceptual: compare by Hamming distance against PHASH_HAMMING_THRESHOLD.
+    Anything else (a legacy raw-SHA256 on one side after the upgrade, or a
+    payload we couldn't perceptually hash) is treated as a silent baseline — the
+    new value is recorded but no change is reported — so the format switch never
+    fires a one-off false alarm.
+    """
+    if not (old_hash.startswith(PHASH_PREFIX) and new_hash.startswith(PHASH_PREFIX)):
+        return False
+    try:
+        old_bits = int(old_hash[len(PHASH_PREFIX):], 16)
+        new_bits = int(new_hash[len(PHASH_PREFIX):], 16)
+    except ValueError:
+        return False
+    return bin(old_bits ^ new_bits).count("1") > PHASH_HAMMING_THRESHOLD
 
 
 def _is_meaningful_change(field_name: str, old: Any, new: Any) -> bool:

@@ -764,7 +764,12 @@ class MonitorService:
         if pic_url:
             hashed = await self.hasher.hash_url(pic_url, username)
 
-        new_pic_hash = hashed.sha256 if hashed else None
+        # Change detection runs on the PERCEPTUAL hash, not sha256: the CDN
+        # serves byte-different re-encodes of the same avatar on every signed
+        # URL, so sha256 flip-flops each sweep and raised a false "profile
+        # picture changed" alert every time. phash is stable across re-encodes.
+        # (The sha256 + file still feed the ProfileMediaHash dedup ledger below.)
+        new_pic_hash = hashed.phash if hashed else None
 
         # For public accounts with instagram_id, fetch reel data (stories/highlights/live status)
         # This will be stored in the snapshot for future reference
@@ -808,6 +813,14 @@ class MonitorService:
         async with get_session() as session:
             previous = await crud.get_latest_snapshot(session, account_id)
 
+            # If this fetch couldn't be perceptually hashed (rare non-image
+            # payload), carry the last known hash forward instead of nulling the
+            # baseline — losing it would make the next good fetch look like a
+            # first observation and skip the legitimate change alert.
+            stored_pic_hash = new_pic_hash or (
+                previous.profile_pic_hash if previous else None
+            )
+
             snapshot = AccountSnapshot(
                 account_id=account_id,
                 username=parsed.get("username") or username,
@@ -822,7 +835,7 @@ class MonitorService:
                 is_verified=parsed.get("is_verified"),
                 is_business=parsed.get("is_business"),
                 profile_pic_url=parsed.get("profile_pic_url"),
-                profile_pic_hash=new_pic_hash,
+                profile_pic_hash=stored_pic_hash,
                 external_url=parsed.get("external_url"),
                 http_status=200,
                 raw_response=slim_raw or None,
@@ -841,7 +854,7 @@ class MonitorService:
                 # state. The slim form keeps reel_data current instead.
                 previous.raw_response = slim_raw or None
                 previous.profile_pic_url = parsed.get("profile_pic_url")
-                previous.profile_pic_hash = new_pic_hash
+                previous.profile_pic_hash = stored_pic_hash
                 previous.error = None
                 logger.debug(
                     "@{} - no changes detected; refreshed latest 200 response",
@@ -971,8 +984,8 @@ class MonitorService:
         if changeset.profile_pic_changed and new_pic_path is not None:
             caption = (
                 f"<b>@{username}</b> changed profile picture\n"
-                f"Old hash: <code>{changeset.old_pic_hash}</code>\n"
-                f"New hash: <code>{changeset.new_pic_hash}</code>"
+                f"Old fingerprint: <code>{changeset.old_pic_hash}</code>\n"
+                f"New fingerprint: <code>{changeset.new_pic_hash}</code>"
             )
             ok = await self.notifier.send_document(
                 new_pic_path, caption=caption, message_thread_id=thread_id

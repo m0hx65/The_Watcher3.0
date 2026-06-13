@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,11 +12,17 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
+from PIL import Image, UnidentifiedImageError
 
 from app.config import settings
 from app.utils.logger import logger
 
 CHROME_IMPERSONATE = "chrome120"
+
+# Prefix marking a perceptual (dHash) value, so change detection can tell it
+# apart from a legacy raw-SHA256 profile_pic_hash and treat a format switch as
+# a silent baseline rather than a spurious "changed".
+PHASH_PREFIX = "p:"
 
 
 @dataclass
@@ -25,6 +32,12 @@ class HashedMedia:
     content_type: Optional[str]
     local_path: Path
     source_url: str
+    # Perceptual (difference) hash of the decoded image. Profile-picture change
+    # detection compares THIS, not sha256: Instagram's CDN re-encodes the same
+    # avatar at different sizes/qualities per signed URL, so the raw bytes (and
+    # thus sha256) differ on every fetch even when the picture is unchanged.
+    # None when the payload isn't a decodable image.
+    phash: Optional[str] = None
 
 
 def _strip_cdn_size(url: str) -> Optional[str]:
@@ -65,6 +78,31 @@ def _strip_cdn_size(url: str) -> Optional[str]:
             url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
 
     return url if modified else None
+
+
+def perceptual_hash(data: bytes, *, size: int = 8) -> Optional[str]:
+    """Difference hash (dHash) of an image's bytes, as a prefixed hex string.
+
+    Decodes the image, downscales to grayscale (size+1 × size), and encodes the
+    sign of each left→right pixel gradient into a `size*size`-bit value. The
+    result is invariant to resolution and JPEG re-encoding — two CDN variants of
+    the same avatar hash identically — while genuinely different pictures land
+    far apart in Hamming distance. Returns None for non-image payloads.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            small = img.convert("L").resize((size + 1, size), Image.LANCZOS)
+        pixels = list(small.getdata())
+        bits = 0
+        for row in range(size):
+            base = row * (size + 1)
+            for col in range(size):
+                bits = (bits << 1) | int(pixels[base + col] > pixels[base + col + 1])
+        width = (size * size + 3) // 4  # hex digits needed for size*size bits
+        return f"{PHASH_PREFIX}{bits:0{width}x}"
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        logger.warning("Could not perceptually hash image ({} bytes): {}", len(data), exc)
+        return None
 
 
 class MediaHasher:
@@ -155,6 +193,7 @@ class MediaHasher:
             content_type=response.headers.get("Content-Type"),
             local_path=path,
             source_url=url,
+            phash=perceptual_hash(response.content),
         )
 
 
