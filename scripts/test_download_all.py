@@ -8,6 +8,7 @@ the whole keyboard -> callback -> service pipeline runs without a live bot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -89,9 +90,22 @@ def make_context(service=None) -> SimpleNamespace:
     )
 
 
+@contextlib.asynccontextmanager
+async def _noop_scope():
+    """Stand-in for MonitorService.download_scope — the bundle wraps its work in
+    one, but the mock has nothing to track, so it's a no-op."""
+    yield
+
+
 def make_service_mock(items=None) -> SimpleNamespace:
     items = items if items is not None else [("1", "Trips"), ("2", "Food"), ("3", "Cats")]
     return SimpleNamespace(
+        # /kill interface the bundle download relies on. is_cancelling stays
+        # False (no kill in these flows); download_scope is a no-op CM.
+        download_scope=_noop_scope,
+        is_cancelling=lambda: False,
+        request_kill=lambda: False,
+        download_active=False,
         get_download_overview=AsyncMock(
             return_value={
                 "ok": True,

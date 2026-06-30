@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -69,6 +70,57 @@ class MonitorService:
         # Latched True once topic creation fails (chat isn't a forum / no
         # manage-topics right) so we don't re-attempt on every message.
         self._topics_unavailable: bool = False
+        # /kill cooperative cancellation for ON-DEMAND downloads. A huge
+        # highlight grab can take minutes; _download_cancel lets the user abort
+        # it mid-flight. _active_downloads counts the on-demand operations
+        # currently running so /kill knows whether there's anything to stop
+        # (and so a sweep's auto-download is never affected). The delivery and
+        # gather loops poll the event between items, so already-sent media stays
+        # and nothing is left half-written.
+        self._active_downloads: int = 0
+        self._download_cancel = asyncio.Event()
+
+    # ---------- On-demand download cancellation (/kill) ----------
+
+    @contextlib.asynccontextmanager
+    async def download_scope(self):
+        """Mark an on-demand download as active for the duration of the block.
+
+        Nests safely (the bundle download wraps several inner downloads in one
+        outer scope): the cancel flag is cleared when the FIRST scope opens — so
+        a stale /kill from a finished download can't abort a fresh one — and
+        again when the LAST scope closes. While any scope is open, /kill knows a
+        download is running and the loops honor the cancel signal.
+        """
+        if self._active_downloads == 0:
+            self._download_cancel.clear()
+        self._active_downloads += 1
+        try:
+            yield
+        finally:
+            self._active_downloads -= 1
+            if self._active_downloads <= 0:
+                self._active_downloads = 0
+                self._download_cancel.clear()
+
+    def request_kill(self) -> bool:
+        """Signal every in-flight on-demand download to stop. Returns True when
+        something was actually running (so the caller can say so)."""
+        if self._active_downloads > 0:
+            self._download_cancel.set()
+            logger.info(
+                "/kill — cancelling {} active download op(s)", self._active_downloads
+            )
+            return True
+        return False
+
+    @property
+    def download_active(self) -> bool:
+        return self._active_downloads > 0
+
+    def is_cancelling(self) -> bool:
+        """True once /kill has been requested while a download is running."""
+        return self._download_cancel.is_set()
 
     async def topic_for(
         self, account_id: Optional[int], username: str
@@ -1037,23 +1089,51 @@ class MonitorService:
         return {}
 
     async def _gather_highlight_items(
-        self, username: str, catalog: dict[str, str]
+        self, username: str, catalog: dict[str, str], *, cancellable: bool = False
     ) -> list:
         """Download story items across every highlight reel in the catalog.
 
         The reel ids come from Instagram's graphql query (anonymous); the media
         itself comes from saveinsta.to per reel. Failures on individual reels are
-        swallowed so one bad reel never sinks the rest.
+        swallowed so one bad reel never sinks the rest. When `cancellable`, a
+        /kill aborts the in-flight reel fetches and returns nothing — so a huge
+        catalog can be stopped before the (longer) delivery phase even begins.
         """
         if self.stories is None or not catalog:
             return []
-        results = await asyncio.gather(
-            *(
+        if cancellable and self._download_cancel.is_set():
+            return []
+
+        tasks = [
+            asyncio.ensure_future(
                 self.stories.fetch_highlight_items(username, hid, title)
-                for hid, title in catalog.items()
-            ),
-            return_exceptions=True,
-        )
+            )
+            for hid, title in catalog.items()
+        ]
+        gather = asyncio.gather(*tasks, return_exceptions=True)
+
+        if cancellable:
+            cancel_wait = asyncio.ensure_future(self._download_cancel.wait())
+            done, _ = await asyncio.wait(
+                {gather, cancel_wait}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if gather not in done:
+                # /kill won the race — drop the outstanding reel fetches.
+                for t in tasks:
+                    t.cancel()
+                gather.cancel()
+                # Awaiting a cancelled gather re-raises CancelledError (a
+                # BaseException, so plain `suppress(Exception)` misses it) —
+                # swallow it; we're intentionally tearing the gather down.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await gather
+                logger.info("/kill — aborted highlight gather for @{}", username)
+                return []
+            cancel_wait.cancel()
+            results = gather.result()
+        else:
+            results = await gather
+
         items: list = []
         for r in results:
             if isinstance(r, list):
@@ -1324,6 +1404,7 @@ class MonitorService:
         seen_pks: set[str],
         *,
         message_thread_id: Optional[int] = None,
+        cancellable: bool = False,
     ) -> int:
         """Download and send each item; record it as seen. Returns the number sent.
 
@@ -1332,10 +1413,19 @@ class MonitorService:
         seen, since there's no account row to dedup against on later sweeps.
         `message_thread_id` routes the media to a per-account forum topic when
         set (sweep path); on-demand callers leave it None for the General thread.
+        `cancellable` (on-demand downloads only) makes the loop stop between
+        items as soon as /kill is requested — already-sent media stays, the rest
+        is skipped. Sweep deliveries leave it False so /kill never touches them.
         """
         assert self.stories is not None
         sent = 0
         for item in items:
+            if cancellable and self._download_cancel.is_set():
+                logger.info(
+                    "/kill — stopped delivering to @{} after {} item(s)",
+                    username, sent,
+                )
+                break
             if not item.pk or item.pk in seen_pks:
                 continue
             path = await self.stories.download(item, username)
@@ -1506,7 +1596,10 @@ class MonitorService:
             stories = []
 
         if stories:
-            sent = await self._deliver_story_items(account_id, username, stories, set())
+            async with self.download_scope():
+                sent = await self._deliver_story_items(
+                    account_id, username, stories, set(), cancellable=True
+                )
             return {"ok": True, "count": sent, "error": None}
 
         if has_story is False:
@@ -1604,7 +1697,10 @@ class MonitorService:
         if not story_items:
             return {"ok": False, "count": 0, "title": title, "error": _DOWNLOAD_UNAVAILABLE_MSG}
 
-        sent = await self._deliver_story_items(account_id, username, story_items, set())
+        async with self.download_scope():
+            sent = await self._deliver_story_items(
+                account_id, username, story_items, set(), cancellable=True
+            )
         return {"ok": True, "count": sent, "title": title, "error": None}
 
     async def download_all_highlights(self, username: str) -> dict:
@@ -1626,14 +1722,18 @@ class MonitorService:
             return {"ok": True, "count": 0, "reels": 0, "error": None}
 
         catalog = {hid: title for hid, title in items}
-        story_items = await self._gather_highlight_items(username, catalog)
-        if not story_items:
-            return {
-                "ok": False, "count": 0, "reels": len(items),
-                "error": _DOWNLOAD_UNAVAILABLE_MSG,
-            }
-
-        sent = await self._deliver_story_items(account_id, username, story_items, set())
+        async with self.download_scope():
+            story_items = await self._gather_highlight_items(
+                username, catalog, cancellable=True
+            )
+            if not story_items:
+                return {
+                    "ok": False, "count": 0, "reels": len(items),
+                    "error": _DOWNLOAD_UNAVAILABLE_MSG,
+                }
+            sent = await self._deliver_story_items(
+                account_id, username, story_items, set(), cancellable=True
+            )
         return {"ok": True, "count": sent, "reels": len(items), "error": None}
 
     async def download_highlights_from_catalog(
@@ -1660,14 +1760,18 @@ class MonitorService:
             account = await crud.get_account(session, username)
         account_id = account.id if account else None
 
-        story_items = await self._gather_highlight_items(username, catalog)
-        if not story_items:
-            return {
-                "ok": False, "count": 0, "reels": len(catalog),
-                "error": _DOWNLOAD_UNAVAILABLE_MSG,
-            }
-
-        sent = await self._deliver_story_items(account_id, username, story_items, set())
+        async with self.download_scope():
+            story_items = await self._gather_highlight_items(
+                username, catalog, cancellable=True
+            )
+            if not story_items:
+                return {
+                    "ok": False, "count": 0, "reels": len(catalog),
+                    "error": _DOWNLOAD_UNAVAILABLE_MSG,
+                }
+            sent = await self._deliver_story_items(
+                account_id, username, story_items, set(), cancellable=True
+            )
         return {"ok": True, "count": sent, "reels": len(catalog), "error": None}
 
     async def download_posts(
@@ -1715,15 +1819,16 @@ class MonitorService:
         video_items = [p for p in posts if p.media_type == "video"] if videos else []
 
         sent_photos = 0
-        if photo_items:
-            sent_photos = await self._deliver_story_items(
-                account_id, username, photo_items, set()
-            )
         sent_videos = 0
-        if video_items:
-            sent_videos = await self._deliver_story_items(
-                account_id, username, video_items, set()
-            )
+        async with self.download_scope():
+            if photo_items:
+                sent_photos = await self._deliver_story_items(
+                    account_id, username, photo_items, set(), cancellable=True
+                )
+            if video_items:
+                sent_videos = await self._deliver_story_items(
+                    account_id, username, video_items, set(), cancellable=True
+                )
 
         return {
             "ok": True,

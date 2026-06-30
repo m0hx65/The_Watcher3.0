@@ -8,12 +8,41 @@ from typing import Any, List, Optional
 from app.database.models import AccountSnapshot
 from app.monitor.media_hasher import PHASH_PREFIX
 
-# Max Hamming distance between two profile-picture perceptual hashes that still
-# counts as "the same picture". CDN re-encodes of one avatar measure 0 apart;
-# different pictures sit ~30 apart — so anything up to this is noise, not a
-# change. Comfortably between the two so re-encodes never alarm and real swaps
-# always do.
-PHASH_HAMMING_THRESHOLD = 10
+# A v2 fingerprint is "p2:<dhash>:<ahash>:<mean>" — two independent 256-bit
+# perceptual hashes plus the brightness mean of one normalized image. They have
+# complementary strengths, measured across a spread of avatars × CDN re-encodes:
+#   * aHash (overall light/dark layout) is rock-solid stable across re-encodes
+#     (same avatar ≤ ~2 bits) but a softer discriminator (distinct avatars ≥ ~10).
+#   * dHash (gradient structure) separates distinct avatars strongly (≥ ~45) but
+#     is noisier on flat re-encodes (same avatar up to ~24 bits).
+#   * mean (brightness) barely moves across re-encodes (≤3 levels) and is the
+#     only signal that sees a flat solid-color swap (where both hashes are 0).
+#
+# The decision below plays each to its strength so the result is bulletproof in
+# both directions:
+#   changed = (dHash ≥ DHASH_CHANGE_MIN  AND  aHash ≥ AHASH_CHANGE_MIN)
+#             OR dHash ≥ DHASH_CHANGE_STRONG
+#             OR |Δmean| ≥ BRIGHTNESS_CHANGE_MIN
+# The AND branch needs the STABLE aHash to also move, so dHash's flat-region
+# noise can never raise a false "changed" on a re-encode (the aHash vetoes it).
+# The OR branches catch a structurally very different picture even when its
+# layout happens to be similar, and a solid-color swap the hashes can't see.
+# Every floor sits in the wide no-man's-land between the two distributions
+# (verified, with margin, by scripts/test_profile_pic_change.py).
+PHASH_BITS = 256
+DHASH_CHANGE_MIN = 32     # AND-branch dHash floor (re-encode ≤24, distinct ≥45)
+AHASH_CHANGE_MIN = 6      # AND-branch aHash floor (re-encode ≤2,  distinct ≥10)
+DHASH_CHANGE_STRONG = 40  # OR-branch: structural change strong enough on its own
+# OR-branch on overall brightness. Re-encodes jitter ≤3 grayscale levels; a swap
+# between two different solid-color avatars (whose structural hashes are an
+# uninformative all-zero) shifts the mean far more. The floor sits well above
+# re-encode jitter so it never false-positives, yet catches the flat-image swap
+# the two bit-hashes are blind to.
+BRIGHTNESS_CHANGE_MIN = 12
+
+# Back-compat alias: the old single-threshold name a couple of call sites/tests
+# referenced. The v2 decision uses the floors above instead.
+PHASH_HAMMING_THRESHOLD = DHASH_CHANGE_MIN
 
 
 @dataclass
@@ -115,23 +144,49 @@ def detect_changes(
     return changeset
 
 
-def _pic_changed(old_hash: str, new_hash: str) -> bool:
-    """True only when two profile-picture hashes are a real, visible change.
+def _parse_fingerprint(value: str) -> Optional[tuple[int, int, int]]:
+    """Parse "p2:<dhash>:<ahash>:<mean>" into (dhash_bits, ahash_bits, mean).
 
-    Both perceptual: compare by Hamming distance against PHASH_HAMMING_THRESHOLD.
-    Anything else (a legacy raw-SHA256 on one side after the upgrade, or a
-    payload we couldn't perceptually hash) is treated as a silent baseline — the
-    new value is recorded but no change is reported — so the format switch never
-    fires a one-off false alarm.
+    Returns None for anything that isn't a v2 fingerprint — a legacy raw-SHA256
+    baseline, the old 64-bit "p:" dHash, or a malformed value. Callers treat a
+    None on either side as a silent baseline so the one-time format upgrade never
+    fires a spurious "changed" on the first post-deploy sweep.
     """
-    if not (old_hash.startswith(PHASH_PREFIX) and new_hash.startswith(PHASH_PREFIX)):
-        return False
+    if not value.startswith(PHASH_PREFIX):
+        return None
+    parts = value[len(PHASH_PREFIX):].split(":")
+    if len(parts) != 3:
+        return None
     try:
-        old_bits = int(old_hash[len(PHASH_PREFIX):], 16)
-        new_bits = int(new_hash[len(PHASH_PREFIX):], 16)
+        return int(parts[0], 16), int(parts[1], 16), int(parts[2], 16)
     except ValueError:
+        return None
+
+
+def _pic_changed(old_hash: str, new_hash: str) -> bool:
+    """True only when two profile-picture fingerprints are a real, visible change.
+
+    Each fingerprint carries a dHash (gradient structure), an aHash (light/dark
+    layout), and a brightness mean. A change is reported when the structural
+    evidence is strong on both bit-hashes, OR overwhelming on the dHash alone, OR
+    the overall brightness shifts well past CDN re-encode jitter (the flat
+    solid-color swap the bit-hashes can't see). A single noisy signal can never
+    raise a false alarm, while a real swap clears one of these comfortably. Any
+    non-v2 value on either side (legacy hash, format upgrade, unhashable payload)
+    is a silent baseline: recorded, but not reported as a change.
+    """
+    old = _parse_fingerprint(old_hash)
+    new = _parse_fingerprint(new_hash)
+    if old is None or new is None:
         return False
-    return bin(old_bits ^ new_bits).count("1") > PHASH_HAMMING_THRESHOLD
+    dhash_dist = bin(old[0] ^ new[0]).count("1")
+    ahash_dist = bin(old[1] ^ new[1]).count("1")
+    brightness_dist = abs(old[2] - new[2])
+    return (
+        (dhash_dist >= DHASH_CHANGE_MIN and ahash_dist >= AHASH_CHANGE_MIN)
+        or dhash_dist >= DHASH_CHANGE_STRONG
+        or brightness_dist >= BRIGHTNESS_CHANGE_MIN
+    )
 
 
 def _is_meaningful_change(field_name: str, old: Any, new: Any) -> bool:

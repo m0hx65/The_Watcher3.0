@@ -66,6 +66,32 @@ async def init_db() -> None:
                 )
             )
             logger.info("Added stored_highlights.tracked column")
+
+        # Widen account_snapshots.profile_pic_hash for the v2 perceptual
+        # fingerprint (~132 chars vs the old VARCHAR(64)). Postgres enforces the
+        # length, so an existing bounded column must be altered or every store
+        # would error/truncate; SQLite stores TEXT regardless, so it needs
+        # nothing. Only run the ALTER when the column is still length-bounded, so
+        # this is a no-op on every boot after the first.
+        if not settings.database_url.startswith("sqlite"):
+            pic_hash_len = await conn.run_sync(
+                lambda sync_conn: next(
+                    (
+                        getattr(c["type"], "length", None)
+                        for c in inspect(sync_conn).get_columns("account_snapshots")
+                        if c["name"] == "profile_pic_hash"
+                    ),
+                    None,
+                )
+            )
+            if pic_hash_len is not None:
+                await conn.execute(
+                    text(
+                        "ALTER TABLE account_snapshots "
+                        "ALTER COLUMN profile_pic_hash TYPE TEXT"
+                    )
+                )
+                logger.info("Widened account_snapshots.profile_pic_hash to TEXT")
     logger.info("Database schema verified")
 
 

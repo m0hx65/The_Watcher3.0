@@ -1,9 +1,15 @@
-"""Regression tests for the two profile-picture bugs.
+"""Regression tests for the profile-picture detection + delivery bugs.
 
-Bug 1 (false "profile picture changed" every sweep): Instagram's CDN serves
-byte-different re-encodes of the SAME avatar on each signed URL, so the old
-raw-SHA256 comparison flip-flopped constantly. Change detection now runs on a
-perceptual hash (dHash), which is stable across re-encodes.
+Bug 1 (false "profile picture changed", and missed real changes): Instagram's
+CDN serves byte-different re-encodes of the SAME avatar on each signed URL, at
+varying resolutions and JPEG qualities. The old detector hashed whatever
+resolution it happened to fetch with a coarse 8×8 dHash, so flat-region JPEG
+noise faked changes while genuinely different (similarly-composed) avatars slid
+under the threshold. Detection now NORMALIZES every image to one canonical
+grayscale before hashing and compares TWO independent 256-bit perceptual hashes
+(dHash structure + aHash layout): a change is reported only when the evidence is
+strong on both — or overwhelming on dHash alone. See media_hasher.perceptual_hash
+and change_detector._pic_changed.
 
 Bug 2 (the promised photo never arrived): the notifier's media senders opened
 the file inside a `with` block and returned the coroutine, so the handle was
@@ -48,7 +54,11 @@ from app.database.models import (  # noqa: E402
 )
 from app.database.session import engine, get_session  # noqa: E402
 from app.monitor.change_detector import (  # noqa: E402
-    PHASH_HAMMING_THRESHOLD,
+    AHASH_CHANGE_MIN,
+    DHASH_CHANGE_MIN,
+    DHASH_CHANGE_STRONG,
+    _parse_fingerprint,
+    _pic_changed,
     detect_changes,
 )
 from app.monitor.instagram import ProfileFetchResult  # noqa: E402
@@ -73,61 +83,135 @@ def expect(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def _hamming_phash(a: str, b: str) -> int:
-    return bin(
-        int(a[len(PHASH_PREFIX):], 16) ^ int(b[len(PHASH_PREFIX):], 16)
-    ).count("1")
+def _dist(a: str, b: str) -> tuple[int, int]:
+    pa, pb = _parse_fingerprint(a), _parse_fingerprint(b)
+    return bin(pa[0] ^ pb[0]).count("1"), bin(pa[1] ^ pb[1]).count("1")
 
 
 def _encode(img: Image.Image, *, size: int, quality: int) -> bytes:
     buf = io.BytesIO()
-    img.resize((size, size)).save(buf, format="JPEG", quality=quality)
+    img.resize((size, size), Image.LANCZOS).save(buf, format="JPEG", quality=quality)
     return buf.getvalue()
 
 
-# ---------- Part A: perceptual hash is stable across re-encodes ----------
+# A spread of avatars chosen to stress BOTH failure modes:
+#  * #2 is mostly flat (the false-positive trap — flat regions flap under JPEG).
+#  * #4/#5 are deliberately similar headshots (the false-negative trap — a real
+#    swap with near-identical composition).
+def _make_avatars() -> list[Image.Image]:
+    out: list[Image.Image] = []
+
+    a = Image.new("RGB", (512, 512), (30, 60, 120))
+    d = ImageDraw.Draw(a)
+    for y in range(512):
+        d.line([(0, y), (512, y)], fill=(y % 256, (2 * y) % 256, (120 + y) % 256))
+    d.ellipse([150, 150, 360, 360], fill=(240, 230, 40))
+    out.append(a)
+
+    b = Image.new("RGB", (512, 512), (245, 245, 245))
+    ImageDraw.Draw(b).rectangle([210, 210, 300, 300], fill=(20, 20, 20))
+    out.append(b)
+
+    c = Image.new("RGB", (512, 512), (255, 255, 255))
+    d = ImageDraw.Draw(c)
+    d.rectangle([0, 0, 256, 512], fill=(15, 15, 15))
+    d.ellipse([320, 60, 470, 210], fill=(200, 30, 30))
+    out.append(c)
+
+    e = Image.new("RGB", (512, 512), (180, 200, 210))
+    d = ImageDraw.Draw(e)
+    d.ellipse([140, 120, 372, 440], fill=(225, 190, 165))
+    d.chord([140, 90, 372, 320], 180, 360, fill=(60, 40, 30))
+    d.ellipse([210, 250, 240, 280], fill=(40, 40, 40))
+    d.ellipse([300, 250, 330, 280], fill=(40, 40, 40))
+    out.append(e)
+
+    f = Image.new("RGB", (512, 512), (180, 200, 210))
+    d = ImageDraw.Draw(f)
+    d.ellipse([120, 130, 392, 450], fill=(235, 205, 180))
+    d.chord([120, 100, 392, 340], 180, 360, fill=(150, 110, 60))
+    d.ellipse([205, 260, 240, 295], fill=(30, 30, 30))
+    d.ellipse([305, 260, 340, 295], fill=(30, 30, 30))
+    out.append(f)
+
+    return out
+
+
+def _reencodes(img: Image.Image) -> list[bytes]:
+    """Same picture as the CDN serves it: many sizes × JPEG qualities."""
+    out: list[bytes] = []
+    for size in (1440, 640, 320, 150, 96):
+        for q in (95, 80, 60, 40, 20):
+            out.append(_encode(img, size=size, quality=q))
+    return out
+
+
+# ---------- Part A: the fingerprint + decision are bulletproof both ways ------
 
 def test_perceptual_hash() -> None:
-    # A picture with structure (gradient + a shape) so the dHash isn't trivial.
-    avatar = Image.new("RGB", (400, 400), (30, 60, 120))
-    d = ImageDraw.Draw(avatar)
-    for y in range(400):
-        d.line([(0, y), (400, y)], fill=(y % 256, (2 * y) % 256, (120 + y) % 256))
-    d.ellipse([120, 120, 280, 280], fill=(240, 230, 40))
+    avatars = _make_avatars()
+    groups = [[perceptual_hash(b) for b in _reencodes(im)] for im in avatars]
 
-    # Same avatar, the way the CDN actually varies it: different size + quality.
-    big = _encode(avatar, size=320, quality=90)
-    small = _encode(avatar, size=150, quality=30)
-    tiny = _encode(avatar, size=96, quality=20)
-
-    hb, hs, ht = perceptual_hash(big), perceptual_hash(small), perceptual_hash(tiny)
-    expect("re-encode hashes are non-None", all([hb, hs, ht]))
-    expect("phash carries the p: marker", hb.startswith(PHASH_PREFIX), repr(hb))
-    expect(
-        "same avatar, 320q90 vs 150q30 within threshold",
-        _hamming_phash(hb, hs) <= PHASH_HAMMING_THRESHOLD,
-        f"distance={_hamming_phash(hb, hs)}",
-    )
-    expect(
-        "same avatar, 320q90 vs 96q20 within threshold",
-        _hamming_phash(hb, ht) <= PHASH_HAMMING_THRESHOLD,
-        f"distance={_hamming_phash(hb, ht)}",
-    )
-
-    # A genuinely different picture must land far away.
-    other = Image.new("RGB", (400, 400), (255, 255, 255))
-    od = ImageDraw.Draw(other)
-    od.rectangle([0, 0, 200, 400], fill=(10, 10, 10))
-    od.ellipse([250, 40, 380, 170], fill=(200, 30, 30))
-    ho = perceptual_hash(_encode(other, size=320, quality=90))
-    expect(
-        "different picture exceeds threshold",
-        _hamming_phash(hb, ho) > PHASH_HAMMING_THRESHOLD,
-        f"distance={_hamming_phash(hb, ho)}",
-    )
-
-    # Non-image payload (e.g. a CDN error page) → no hash, never alarms.
+    expect("every re-encode hashes to a fingerprint",
+           all(all(g) for g in groups))
+    expect("fingerprint carries the p2: marker",
+           groups[0][0].startswith(PHASH_PREFIX), repr(groups[0][0]))
     expect("non-image payload yields None", perceptual_hash(b"not an image") is None)
+
+    # The decisive checks: run the ACTUAL decision over every pair.
+    # 1) No re-encode pair of the SAME avatar may read as a change (false pos).
+    worst_same = (0, 0)
+    fp = 0
+    for g in groups:
+        for i in range(len(g)):
+            for j in range(i + 1, len(g)):
+                dd, ad = _dist(g[i], g[j])
+                worst_same = (max(worst_same[0], dd), max(worst_same[1], ad))
+                if _pic_changed(g[i], g[j]):
+                    fp += 1
+    expect("ZERO false positives across all re-encode pairs", fp == 0, f"{fp} flagged")
+
+    # 2) Every distinct-avatar pair MUST read as a change (false neg).
+    best_diff = (10**9, 10**9)
+    fn = 0
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            dd, ad = _dist(groups[i][0], groups[j][0])
+            best_diff = (min(best_diff[0], dd), min(best_diff[1], ad))
+            if not _pic_changed(groups[i][0], groups[j][0]):
+                fn += 1
+    expect("ZERO false negatives across all distinct pairs", fn == 0, f"{fn} missed")
+
+    # Margin report — the floors must sit clear of both distributions.
+    print(f"   margins: same(dd<={worst_same[0]}, ad<={worst_same[1]}) "
+          f"diff(dd>={best_diff[0]}, ad>={best_diff[1]}) "
+          f"floors(dd_min={DHASH_CHANGE_MIN}, ad_min={AHASH_CHANGE_MIN}, "
+          f"dd_strong={DHASH_CHANGE_STRONG})")
+    expect("same-image dHash noise stays under the floor",
+           worst_same[0] < DHASH_CHANGE_MIN, f"worst same dd={worst_same[0]}")
+    expect("same-image aHash noise stays under the floor",
+           worst_same[1] < AHASH_CHANGE_MIN, f"worst same ad={worst_same[1]}")
+
+    # The HD-vs-thumbnail flip (1440px stripped URL one sweep, 320px the next)
+    # was the live flapping source — it must read identical now.
+    big = perceptual_hash(_encode(avatars[0], size=1440, quality=85))
+    thumb = perceptual_hash(_encode(avatars[0], size=320, quality=60))
+    expect("HD vs 320px of one avatar is NOT a change",
+           not _pic_changed(big, thumb), f"dist={_dist(big, thumb)}")
+
+    # Flat solid-color avatars: the gradient/layout hashes are an uninformative
+    # all-zero, so the brightness signal has to carry the decision. Same color
+    # across re-encodes is NOT a change; a swap to a different solid color IS.
+    red1 = perceptual_hash(_encode(Image.new("RGB", (512, 512), (200, 40, 40)),
+                                   size=320, quality=80))
+    red2 = perceptual_hash(_encode(Image.new("RGB", (512, 512), (200, 40, 40)),
+                                   size=150, quality=25))
+    blue = perceptual_hash(_encode(Image.new("RGB", (512, 512), (40, 40, 200)),
+                                   size=320, quality=80))
+    expect("same solid color across re-encodes is NOT a change",
+           not _pic_changed(red1, red2), f"dist={_dist(red1, red2)}")
+    expect("solid-color swap IS a change",
+           _pic_changed(red1, blue), f"dist={_dist(red1, blue)}")
 
 
 # ---------- Part A2: detect_changes uses the perceptual comparison ----------
@@ -137,10 +221,12 @@ def _snap(phash):
 
 
 def test_detect_changes() -> None:
-    a = "p:4cb27169b271e8d4"
-    a_reencode = a  # CDN re-encode hashes identically
-    different = "p:0069d4a8e8d46800"  # measured ~29 bits from `a`
+    avatars = _make_avatars()
+    a = perceptual_hash(_encode(avatars[0], size=320, quality=80))
+    a_reencode = perceptual_hash(_encode(avatars[0], size=150, quality=30))
+    different = perceptual_hash(_encode(avatars[2], size=320, quality=80))
     legacy_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    legacy_dhash = "p:4cb27169b271e8d4"  # the old 64-bit single-hash format
 
     cs = detect_changes(_snap(a), _snap(a_reencode), new_pic_hash=a_reencode)
     expect("re-encode is NOT a change", cs.profile_pic_changed is False)
@@ -150,10 +236,15 @@ def test_detect_changes() -> None:
     expect("change records both fingerprints",
            cs.old_pic_hash == a and cs.new_pic_hash == different)
 
-    # Legacy raw-SHA256 baseline (pre-upgrade) vs a new perceptual hash: silent
+    # Legacy raw-SHA256 baseline (pre-upgrade) vs a new fingerprint: silent
     # baseline, never a one-off false alarm on the first post-deploy sweep.
     cs = detect_changes(_snap(legacy_sha), _snap(a), new_pic_hash=a)
-    expect("legacy->perceptual is a silent baseline", cs.profile_pic_changed is False)
+    expect("legacy sha256 -> v2 is a silent baseline", cs.profile_pic_changed is False)
+
+    # Legacy 64-bit "p:" dHash baseline vs a new v2 fingerprint: also silent —
+    # the formats aren't comparable, so the upgrade must not cry wolf once.
+    cs = detect_changes(_snap(legacy_dhash), _snap(a), new_pic_hash=a)
+    expect("legacy p: dHash -> v2 is a silent baseline", cs.profile_pic_changed is False)
 
     # No prior hash → baseline recorded, no alert.
     cs = detect_changes(_snap(None), _snap(a), new_pic_hash=a)
@@ -262,9 +353,13 @@ async def test_full_sweep() -> None:
         pic = Path(tmp) / "pic.jpg"
         pic.write_bytes(b"\xff\xd8\xfffake")
 
-        same = "p:4cb27169b271e8d4"
-        reencode = same                 # sweep 2: identical fingerprint
-        swapped = "p:0069d4a8e8d46800"  # sweep 3: a real new picture
+        avatars = _make_avatars()
+        # Real v2 fingerprints: sweep 1 baselines, sweep 2 is a CDN re-encode of
+        # the SAME avatar (different size/quality), sweep 3 is a genuinely
+        # different avatar.
+        same = perceptual_hash(_encode(avatars[0], size=320, quality=85))
+        reencode = perceptual_hash(_encode(avatars[0], size=150, quality=35))
+        swapped = perceptual_hash(_encode(avatars[2], size=320, quality=85))
         hasher = SeqHasher([same, reencode, swapped], pic)
 
         notifier = AsyncMock()

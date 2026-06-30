@@ -92,7 +92,7 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 ### Change Detection
 - Tracks 10+ profile fields: followers, following, posts, reels, highlights, biography, full name, username, external link, verification badge, business flag, public/private status
 - **Works on private accounts** — all profile-level fields above are tracked for private targets, including an alert the moment an account goes private or public
-- Profile-picture change detection — every avatar is SHA-256 hashed and archived to disk
+- Profile-picture change detection — avatars are compared by a perceptual fingerprint that ignores Instagram's per-URL re-encodes (so it never cries wolf) yet catches real swaps, and archived to disk
 - Story & live status surfaced on every sweep and live-checked when you open an account card
 - Highlight catalog tracking — detects added, renamed, and removed highlights by name
 - Sweep-complete summary after every run, so you always know the bot is alive
@@ -323,6 +323,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `/fetchphoto <user>` | Download the current profile picture in max quality — works for any public account |
 | `/story <user>` | Download any public user's **current story** — no monitoring required |
 | `/highlights <user>` | List any public user's highlights with per-item download buttons |
+| `/kill` | Stop an in-progress on-demand download (story / highlights / posts / bulk). Already-sent media stays; the rest is skipped (`/stop` is an alias) |
 | `/export` | Full notification history as CSV |
 | `/help` | Command reference |
 

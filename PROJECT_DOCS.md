@@ -43,7 +43,7 @@ known snapshot, and sends a rich Telegram notification listing exactly what chan
 | Biography | Full before/after text |
 | Full name | |
 | External link | |
-| Profile picture | Downloaded locally, SHA-256 hash compared |
+| Profile picture | Downloaded locally, compared by perceptual fingerprint (resolution/JPEG-proof) |
 | `is_private` flag | Public ↔ Private transitions |
 | `is_verified` badge | |
 | `is_business` flag | |
@@ -193,7 +193,7 @@ One row per detected change (not per sweep — see §11 Fix #4).
 | `followers_count`, `following_count`, `posts_count`, `reels_count`, `story_count` | int | |
 | `is_private`, `is_verified`, `is_business` | bool | |
 | `profile_pic_url` | text | Raw CDN URL |
-| `profile_pic_hash` | varchar(64) | SHA-256 of downloaded image |
+| `profile_pic_hash` | text | Perceptual fingerprint `p2:<dhash>:<ahash>:<mean>` for change detection |
 | `http_status` | int | 200 = success |
 | `raw_response` | JSONB | Nulled after `RAW_RESPONSE_RETENTION_DAYS` |
 | `error` | text | Set on failures |

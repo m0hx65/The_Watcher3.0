@@ -67,6 +67,7 @@ HELP_TEXT = (
     "<code>/fetchphoto @user</code> — download current profile picture on demand\n"
     "<code>/story @user</code> — download any user's current story (no monitoring needed)\n"
     "<code>/highlights @user</code> — list any user's highlights to download\n"
+    "<code>/kill</code> — stop an in-progress download (story/highlights/posts)\n"
     "<code>/export</code> — download CSV\n\n"
     "<b>🔎 Any user</b> on the menu does the same as /story and /highlights for "
     "any public account, without adding it to monitoring.\n\n"
@@ -88,6 +89,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("recheck", "Force a check for a username"),
     BotCommand("stakeout", "Watch one target closely for a while"),
     BotCommand("unstakeout", "Stop a stakeout early"),
+    BotCommand("kill", "Stop the current download"),
     BotCommand("rhythm", "Show a target's posting-time rhythm"),
     BotCommand("darkradar", "List accounts that have gone quiet"),
     BotCommand("synctopics", "Give each account its own forum topic"),
@@ -1272,6 +1274,7 @@ def _render_download_panel(
         "⚡ <b>Download EVERYTHING</b> (story + photos + reels + profile pic "
         "+ all highlights)."
     )
+    lines.append("<i>Big grab? Send /kill any time to stop it.</i>")
     if selected:
         lines.append("")
         lines.append(f"Selected: <b>{len(selected)}</b>")
@@ -1373,103 +1376,118 @@ async def _run_bundle_download(
             f"📦 <b>@{esc(username)}</b> — bulk download\n\n" + "\n".join(body),
         )
 
-    if want_pic:
-        await progress("profile picture")
-        r = await service.fetch_and_send_profile_picture(username)
-        if r.get("ok"):
-            lines.append("👤 Profile picture — sent ✓")
-        else:
-            lines.append(
-                f"👤 Profile picture — ✗ <code>{esc(str(r.get('error')))}</code>"
-            )
-
-    if want_story:
-        await progress("current story")
-        r = await service.fetch_and_send_stories(
-            username, instagram_id=instagram_id
-        )
-        if r.get("ok"):
-            count = r.get("count", 0)
-            if count:
-                noun = "item" if count == 1 else "items"
-                lines.append(f"📖 Story — {count} {noun} ✓")
+    # One scope around the whole bundle so a /kill pressed during any category
+    # keeps stopping the rest — the cancel flag survives between the inner
+    # downloads (each of which also opens its own nested scope).
+    stopped = False
+    async with service.download_scope():
+        if want_pic and not service.is_cancelling():
+            await progress("profile picture")
+            r = await service.fetch_and_send_profile_picture(username)
+            if r.get("ok"):
+                lines.append("👤 Profile picture — sent ✓")
             else:
-                lines.append("📖 Story — no active story")
-        else:
-            lines.append(f"📖 Story — ✗ <code>{esc(str(r.get('error')))}</code>")
-
-    if want_photos or want_reels:
-        if want_photos and want_reels:
-            label = "photos & reels"
-        elif want_photos:
-            label = "photos"
-        else:
-            label = "reels"
-        await progress(label)
-        r = await service.download_posts(
-            username, photos=want_photos, videos=want_reels
-        )
-        if r.get("ok"):
-            if want_photos:
-                lines.append(f"🖼 Photos — {r.get('photos', 0)} sent ✓")
-            if want_reels:
-                lines.append(f"🎬 Reels/videos — {r.get('videos', 0)} sent ✓")
-        else:
-            lines.append(
-                f"🖼🎬 Posts & reels — ✗ <code>{esc(str(r.get('error')))}</code>"
-            )
-
-    if want_all_highlights:
-        if panel_items:
-            # The panel already knows every (id, title) — download straight
-            # from saveinsta without touching Instagram again.
-            await progress("all highlights (this can take a while)")
-            r = await service.download_highlights_from_catalog(
-                username, dict(panel_items)
-            )
-        elif state_ok:
-            # Panel state exists and genuinely has zero highlights.
-            r = {"ok": True, "count": 0, "reels": 0, "error": None}
-        else:
-            # Cold press without panel state — resolve the catalog fresh.
-            await progress("all highlights (this can take a while)")
-            r = await service.download_all_highlights(username)
-        if r.get("ok"):
-            reels = r.get("reels", 0)
-            if reels:
                 lines.append(
-                    f"✨ Highlights — {r.get('count', 0)} items "
-                    f"from {reels} reel{'s' if reels != 1 else ''} ✓"
+                    f"👤 Profile picture — ✗ <code>{esc(str(r.get('error')))}</code>"
                 )
-            else:
-                lines.append("✨ Highlights — none to download")
-        else:
-            lines.append(
-                f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
-            )
-    elif hl_indexes:
-        noun = "highlight" if len(hl_indexes) == 1 else "highlights"
-        await progress(f"{len(hl_indexes)} {noun} (this can take a while)")
-        catalog = {
-            panel_items[i][0]: panel_items[i][1]
-            for i in hl_indexes
-            if 0 <= i < len(panel_items)
-        }
-        r = await service.download_highlights_from_catalog(username, catalog)
-        if r.get("ok"):
-            lines.append(
-                f"✨ Highlights — {r.get('count', 0)} items "
-                f"from {r.get('reels', 0)} reel{'s' if r.get('reels', 0) != 1 else ''} ✓"
-            )
-        else:
-            lines.append(
-                f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
-            )
 
+        if want_story and not service.is_cancelling():
+            await progress("current story")
+            r = await service.fetch_and_send_stories(
+                username, instagram_id=instagram_id
+            )
+            if r.get("ok"):
+                count = r.get("count", 0)
+                if count:
+                    noun = "item" if count == 1 else "items"
+                    lines.append(f"📖 Story — {count} {noun} ✓")
+                else:
+                    lines.append("📖 Story — no active story")
+            else:
+                lines.append(f"📖 Story — ✗ <code>{esc(str(r.get('error')))}</code>")
+
+        if (want_photos or want_reels) and not service.is_cancelling():
+            if want_photos and want_reels:
+                label = "photos & reels"
+            elif want_photos:
+                label = "photos"
+            else:
+                label = "reels"
+            await progress(label)
+            r = await service.download_posts(
+                username, photos=want_photos, videos=want_reels
+            )
+            if r.get("ok"):
+                if want_photos:
+                    lines.append(f"🖼 Photos — {r.get('photos', 0)} sent ✓")
+                if want_reels:
+                    lines.append(f"🎬 Reels/videos — {r.get('videos', 0)} sent ✓")
+            else:
+                lines.append(
+                    f"🖼🎬 Posts & reels — ✗ <code>{esc(str(r.get('error')))}</code>"
+                )
+
+        if not service.is_cancelling():
+            if want_all_highlights:
+                if panel_items:
+                    # The panel already knows every (id, title) — download
+                    # straight from saveinsta without touching Instagram again.
+                    await progress("all highlights (this can take a while)")
+                    r = await service.download_highlights_from_catalog(
+                        username, dict(panel_items)
+                    )
+                elif state_ok:
+                    # Panel state exists and genuinely has zero highlights.
+                    r = {"ok": True, "count": 0, "reels": 0, "error": None}
+                else:
+                    # Cold press without panel state — resolve the catalog fresh.
+                    await progress("all highlights (this can take a while)")
+                    r = await service.download_all_highlights(username)
+                if r.get("ok"):
+                    reels = r.get("reels", 0)
+                    if reels:
+                        lines.append(
+                            f"✨ Highlights — {r.get('count', 0)} items "
+                            f"from {reels} reel{'s' if reels != 1 else ''} ✓"
+                        )
+                    else:
+                        lines.append("✨ Highlights — none to download")
+                else:
+                    lines.append(
+                        f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
+                    )
+            elif hl_indexes:
+                noun = "highlight" if len(hl_indexes) == 1 else "highlights"
+                await progress(f"{len(hl_indexes)} {noun} (this can take a while)")
+                catalog = {
+                    panel_items[i][0]: panel_items[i][1]
+                    for i in hl_indexes
+                    if 0 <= i < len(panel_items)
+                }
+                r = await service.download_highlights_from_catalog(username, catalog)
+                if r.get("ok"):
+                    lines.append(
+                        f"✨ Highlights — {r.get('count', 0)} items "
+                        f"from {r.get('reels', 0)} reel{'s' if r.get('reels', 0) != 1 else ''} ✓"
+                    )
+                else:
+                    lines.append(
+                        f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
+                    )
+
+        # Capture inside the scope: the flag is cleared on scope exit.
+        stopped = service.is_cancelling()
+
+    if stopped:
+        lines.append("\n🛑 <b>Stopped by /kill</b> — remaining items skipped.")
+    header = (
+        f"📦 <b>@{esc(username)}</b> — bulk download stopped"
+        if stopped
+        else f"📦 <b>@{esc(username)}</b> — bulk download finished"
+    )
     await _safe_edit_text(
         query,
-        f"📦 <b>@{esc(username)}</b> — bulk download finished\n\n"
-        + "\n".join(lines),
+        f"{header}\n\n" + "\n".join(lines),
         reply_markup=keyboards.download_result(username),
     )
 
@@ -1901,6 +1919,32 @@ async def cmd_unstakeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         msg, parse_mode=ParseMode.HTML, reply_markup=keyboards.back_to_menu()
     )
+
+
+async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/kill — abort an in-progress on-demand download (story/highlights/posts).
+
+    For when a download turns out to be huge (e.g. an account with a mountain of
+    highlight stories): typing /kill stops it as soon as the current item
+    finishes. Already-sent media stays; the rest is skipped. Scheduled sweeps are
+    never affected.
+    """
+    if await _reject_if_unauthorized(update):
+        return
+    service: MonitorService = context.application.bot_data["monitor"]
+    if service.request_kill():
+        await update.message.reply_text(
+            "🛑 <b>Stopping the current download…</b>\n"
+            "Already-sent items stay; the rest is skipped.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+    else:
+        await update.message.reply_text(
+            "Nothing is downloading right now.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
 
 
 async def cmd_rhythm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2777,6 +2821,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("recheck", cmd_recheck))
     app.add_handler(CommandHandler("stakeout", cmd_stakeout))
     app.add_handler(CommandHandler("unstakeout", cmd_unstakeout))
+    app.add_handler(CommandHandler("kill", cmd_kill))
+    app.add_handler(CommandHandler("stop", cmd_kill))
     app.add_handler(CommandHandler("rhythm", cmd_rhythm))
     app.add_handler(CommandHandler("darkradar", cmd_darkradar))
     app.add_handler(CommandHandler("synctopics", cmd_synctopics))
