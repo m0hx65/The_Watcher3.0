@@ -137,11 +137,32 @@ async def get_latest_snapshot(
     stmt = (
         select(AccountSnapshot)
         .where(AccountSnapshot.account_id == account_id)
-        .order_by(desc(AccountSnapshot.created_at))
+        # id tiebreaker: created_at can collide (SQLite stores whole seconds),
+        # and returning the older row would silently rewind the baseline.
+        .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
         .limit(1)
     )
     if successful_only:
         stmt = stmt.where(AccountSnapshot.http_status == 200)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_latest_pic_hash(
+    session: AsyncSession, account_id: int
+) -> Optional[str]:
+    """Just the newest successful snapshot's profile_pic_hash — one indexed
+    scalar read, for the pic-change confirmation pass that runs before the
+    full snapshot is loaded."""
+    stmt = (
+        select(AccountSnapshot.profile_pic_hash)
+        .where(
+            AccountSnapshot.account_id == account_id,
+            AccountSnapshot.http_status == 200,
+        )
+        .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
+        .limit(1)
+    )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
@@ -391,15 +412,20 @@ async def mark_story_items_seen(
     account_id: int,
     items: Iterable[Any],
 ) -> None:
-    """Mark multiple story/highlight items as seen (skips duplicates)."""
+    """Mark multiple story/highlight items as seen (skips duplicates).
+
+    The seen-set is loaded ONCE and rows are added in bulk with a single
+    flush — the old per-item mark_story_seen path cost two round-trips per
+    item, which made baselining a large highlight catalog crawl on a remote
+    Postgres."""
     seen = await get_seen_story_pks(session, account_id)
+    added = False
     for item in items:
         pk = getattr(item, "pk", None) or (item.get("pk") if isinstance(item, dict) else None)
         if not pk or str(pk) in seen:
             continue
         source = getattr(item, "source", None) or (item.get("source") if isinstance(item, dict) else "story")
-        await mark_story_seen(
-            session,
+        session.add(SeenStory(
             account_id=account_id,
             story_pk=str(pk),
             source=str(source),
@@ -415,8 +441,11 @@ async def mark_story_items_seen(
                 getattr(item, "taken_at", None)
                 or (item.get("taken_at") if isinstance(item, dict) else 0)
             ),
-        )
+        ))
         seen.add(str(pk))
+        added = True
+    if added:
+        await session.flush()
 
 async def get_seen_story_pks(session: AsyncSession, account_id: int) -> set[str]:
     """Return the set of story PKs already delivered for this account."""
@@ -499,6 +528,26 @@ async def last_activity_at(
     return ts
 
 
+async def last_activity_map(session: AsyncSession) -> dict[int, datetime]:
+    """account_id -> most recent delivered-item time, for EVERY account at once.
+
+    One grouped query instead of a per-account last_activity_at loop — the
+    dark radar runs at the end of every sweep, so this is on the hot path."""
+    result = await session.execute(
+        select(SeenStory.account_id, func.max(SeenStory.seen_at)).group_by(
+            SeenStory.account_id
+        )
+    )
+    out: dict[int, datetime] = {}
+    for account_id, ts in result.all():
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        out[account_id] = ts
+    return out
+
+
 async def first_activity_at(
     session: AsyncSession, account_id: int
 ) -> Optional[datetime]:
@@ -522,6 +571,19 @@ async def get_setting(session: AsyncSession, key: str) -> Optional[str]:
     result = await session.execute(select(AppSetting).where(AppSetting.key == key))
     row = result.scalar_one_or_none()
     return row.value if row else None
+
+
+async def get_settings_by_prefix(
+    session: AsyncSession, prefix: str
+) -> dict[str, str]:
+    """All settings whose key starts with `prefix`, as one query.
+
+    Used to load every per-account flag of one kind (e.g. "dark_state:") in a
+    single round-trip instead of N get_setting calls."""
+    result = await session.execute(
+        select(AppSetting).where(AppSetting.key.like(f"{prefix}%"))
+    )
+    return {row.key: row.value for row in result.scalars().all()}
 
 
 async def set_setting(session: AsyncSession, key: str, value: str) -> None:

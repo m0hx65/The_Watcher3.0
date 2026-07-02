@@ -19,7 +19,11 @@ from app.config import settings
 from app.database import crud
 from app.database.models import AccountSnapshot, MonitoredAccount, ProfileMediaHash
 from app.database.session import get_session
-from app.monitor.change_detector import ChangeSet, detect_changes
+from app.monitor.change_detector import (
+    ChangeSet,
+    detect_changes,
+    pic_fingerprints_differ,
+)
 from app.monitor.instagram import InstagramClient, ProfileFetchResult, extract_instagram_id
 from app.monitor.media_hasher import HashedMedia, MediaHasher
 from app.monitor.stories import StoriesClient
@@ -400,13 +404,18 @@ class MonitorService:
             if r.get("crashed"):
                 continue
             result_username = r.get("username", uname)
-            meta = await self._load_account_story_meta(target_account_id)
+            # A successful check already knows privacy and the numeric id —
+            # only fall back to the two-query DB lookup when the result
+            # doesn't (failed fetches), instead of paying it for every
+            # account on every sweep.
             is_private = r.get("is_private")
-            if is_private is None:
-                is_private = meta["is_private"]
-            else:
-                is_private = bool(is_private)
-            instagram_id = r.get("instagram_id") or meta["instagram_id"]
+            instagram_id = r.get("instagram_id")
+            if is_private is None or not instagram_id:
+                meta = await self._load_account_story_meta(target_account_id)
+                if is_private is None:
+                    is_private = meta["is_private"]
+                instagram_id = instagram_id or meta["instagram_id"]
+            is_private = bool(is_private)
             if not is_private:
                 story_targets.append(
                     (target_account_id, result_username, instagram_id)
@@ -522,16 +531,17 @@ class MonitorService:
         threshold = timedelta(days=threshold_days)
         now = datetime.now(timezone.utc)
 
+        # Three batched queries for the whole radar instead of two per account
+        # per sweep — activity times and dark flags come back as maps.
         async with get_session() as session:
             accounts = await crud.list_accounts(session, only_active=True)
+            activity = await crud.last_activity_map(session)
+            flagged_keys = await crud.get_settings_by_prefix(session, "dark_state:")
 
         for account in accounts:
-            async with get_session() as session:
-                last = await crud.last_activity_at(session, account.id)
-                state_key = self._dark_state_key(account.id)
-                currently_flagged = (
-                    await crud.get_setting(session, state_key)
-                ) is not None
+            last = activity.get(account.id)
+            state_key = self._dark_state_key(account.id)
+            currently_flagged = state_key in flagged_keys
             if last is None:
                 continue  # no activity baseline — can't judge
             silent = now - last
@@ -583,10 +593,8 @@ class MonitorService:
         now = datetime.now(timezone.utc)
         async with get_session() as session:
             accounts = await crud.list_accounts(session, only_active=True)
-            rows = []
-            for account in accounts:
-                last = await crud.last_activity_at(session, account.id)
-                rows.append((account.username, last))
+            activity = await crud.last_activity_map(session)
+        rows = [(a.username, activity.get(a.id)) for a in accounts]
         threshold_days = settings.dark_radar_days
         report = []
         for username, last in rows:
@@ -823,6 +831,44 @@ class MonitorService:
         # (The sha256 + file still feed the ProfileMediaHash dedup ledger below.)
         new_pic_hash = hashed.phash if hashed else None
 
+        # Confirmation pass — check the pic AGAIN before it can alert. A
+        # tentative change (fresh fingerprint differs from the stored baseline)
+        # must be confirmed by a SECOND independent download whose fingerprint
+        # (a) also differs from the baseline and (b) agrees with the first —
+        # i.e. two downloads both saw the same NEW picture. A one-off corrupt/
+        # truncated payload or a mid-swap CDN flicker fails (b) and is
+        # suppressed; a real change that got suppressed re-confirms and alerts
+        # on the very next sweep, so nothing is ever lost — only delayed past
+        # the glitch. Costs one extra CDN download only when a change is
+        # tentatively detected, i.e. almost never.
+        if new_pic_hash and pic_url:
+            async with get_session() as session:
+                baseline_hash = await crud.get_latest_pic_hash(session, account_id)
+            if baseline_hash and pic_fingerprints_differ(baseline_hash, new_pic_hash):
+                second = await self.hasher.hash_url(pic_url, username)
+                second_hash = second.phash if second else None
+                confirmed = bool(
+                    second_hash
+                    and pic_fingerprints_differ(baseline_hash, second_hash)
+                    and not pic_fingerprints_differ(new_pic_hash, second_hash)
+                )
+                if confirmed:
+                    logger.info(
+                        "Profile-pic change for @{} confirmed by second download",
+                        username,
+                    )
+                else:
+                    logger.warning(
+                        "Profile-pic change for @{} NOT confirmed on re-download "
+                        "(second={}) — suppressing this sweep; a real change "
+                        "re-confirms next sweep",
+                        username,
+                        "unhashable" if not second_hash else "disagrees",
+                    )
+                    # Treat as if this fetch produced no usable fingerprint:
+                    # the stored baseline carries forward and no alert fires.
+                    new_pic_hash = None
+
         # For public accounts with instagram_id, fetch reel data (stories/highlights/live status)
         # This will be stored in the snapshot for future reference
         reel_data_response = None
@@ -930,6 +976,7 @@ class MonitorService:
                     )
 
             # Update Instagram ID & last-checked
+            stored_id: Optional[str] = None
             account = await session.get(MonitoredAccount, account_id)
             if account is not None:
                 parsed_username = (parsed.get("username") or username).lower()
@@ -958,7 +1005,8 @@ class MonitorService:
                             parsed_username,
                             existing.id,
                         )
-            
+                stored_id = account.instagram_id
+
             await crud.mark_checked(session, account_id, 200, success=True)
 
         await self._dispatch_changes(
@@ -977,12 +1025,6 @@ class MonitorService:
             await self._handle_new_posts(
                 account_id, username, changeset, first_seen=previous is None
             )
-
-        stored_id = None
-        async with get_session() as session:
-            account_row = await session.get(MonitoredAccount, account_id)
-            if account_row is not None:
-                stored_id = account_row.instagram_id
 
         return {
             "ok": True,

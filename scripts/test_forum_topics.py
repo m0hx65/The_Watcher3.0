@@ -142,7 +142,7 @@ async def main() -> int:
     service2 = MonitorService(
         instagram=AsyncMock(), hasher=AsyncMock(), notifier=notifier2, stories=None
     )
-    expect("failed create → None", await service2.topic_for(3, "gamma") is None)
+    expect("failed create -> None", await service2.topic_for(3, "gamma") is None)
     expect("latched unavailable", service2._topics_unavailable is True)
 
     await dispose_engine()

@@ -163,6 +163,12 @@ def _parse_fingerprint(value: str) -> Optional[tuple[int, int, int]]:
         return None
 
 
+def pic_fingerprints_differ(old_hash: str, new_hash: str) -> bool:
+    """Public entry to the fingerprint comparison, for callers outside the
+    snapshot diff — e.g. the service's second-download confirmation pass."""
+    return _pic_changed(old_hash, new_hash)
+
+
 def _pic_changed(old_hash: str, new_hash: str) -> bool:
     """True only when two profile-picture fingerprints are a real, visible change.
 

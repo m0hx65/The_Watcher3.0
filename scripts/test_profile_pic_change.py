@@ -356,11 +356,14 @@ async def test_full_sweep() -> None:
         avatars = _make_avatars()
         # Real v2 fingerprints: sweep 1 baselines, sweep 2 is a CDN re-encode of
         # the SAME avatar (different size/quality), sweep 3 is a genuinely
-        # different avatar.
+        # different avatar. Sweep 3's tentative change triggers the
+        # confirmation re-download, which sees a re-encode of the SAME new
+        # avatar — so the change is confirmed and alerts.
         same = perceptual_hash(_encode(avatars[0], size=320, quality=85))
         reencode = perceptual_hash(_encode(avatars[0], size=150, quality=35))
         swapped = perceptual_hash(_encode(avatars[2], size=320, quality=85))
-        hasher = SeqHasher([same, reencode, swapped], pic)
+        swapped_reencode = perceptual_hash(_encode(avatars[2], size=150, quality=35))
+        hasher = SeqHasher([same, reencode, swapped, swapped_reencode], pic)
 
         notifier = AsyncMock()
         notifier.send_text = AsyncMock(return_value=True)
@@ -400,6 +403,97 @@ async def test_full_sweep() -> None:
         expect("latest snapshot stores the new fingerprint",
                snaps[-1].profile_pic_hash == swapped,
                repr(snaps[-1].profile_pic_hash))
+        expect(
+            "sweep3 confirmed via a second download (4 downloads total)",
+            hasher.i == 4, f"hash_url called {hasher.i}x",
+        )
+
+
+# ---------- Part D: the confirmation re-check ("check the pic again") --------
+# A tentative change must survive a SECOND independent download before it may
+# alert. A one-off glitch (corrupt payload / CDN flicker that reads as a
+# different picture once) is suppressed; a real swap still alerts, one sweep
+# later at worst.
+
+async def test_confirmation_recheck() -> None:
+    parsed = {
+        "username": "glitchy", "full_name": "G", "biography": "",
+        "followers_count": 10, "following_count": 5, "posts_count": 0,
+        "reels_count": 0, "story_count": 0, "is_private": True,
+        "is_verified": False, "is_business": False,
+        "profile_pic_url": "http://cdn/pic.jpg", "external_url": None,
+        "instagram_id": "1000",
+    }
+    async with get_session() as session:
+        session.add(MonitoredAccount(username="glitchy", active=True))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pic = Path(tmp) / "pic.jpg"
+        pic.write_bytes(b"\xff\xd8\xfffake")
+
+        avatars = _make_avatars()
+        baseline = perceptual_hash(_encode(avatars[0], size=320, quality=85))
+        baseline_re = perceptual_hash(_encode(avatars[0], size=150, quality=35))
+        glitch = perceptual_hash(_encode(avatars[1], size=320, quality=85))
+        swapped = perceptual_hash(_encode(avatars[2], size=320, quality=85))
+        swapped_re = perceptual_hash(_encode(avatars[2], size=150, quality=35))
+
+        # sweep1: baseline. sweep2: first download GLITCHES to a different
+        # picture, the confirmation re-download sees the real (unchanged)
+        # avatar → suppressed. sweep3: both downloads agree on a new avatar
+        # → confirmed change.
+        hasher = SeqHasher(
+            [baseline, glitch, baseline_re, swapped, swapped_re], pic
+        )
+
+        notifier = AsyncMock()
+        notifier.send_text = AsyncMock(return_value=True)
+        notifier.send_document = AsyncMock(return_value=True)
+        notifier.create_forum_topic = AsyncMock(return_value=None)
+
+        service = MonitorService(
+            instagram=FakeInstagram(parsed), hasher=hasher,
+            notifier=notifier, stories=None,
+        )
+
+        r1 = await service.check_username("glitchy")
+        expect("recheck sweep1 baselines", r1.get("first_seen") is True, repr(r1))
+
+        r2 = await service.check_username("glitchy")
+        expect(
+            "one-off glitch is SUPPRESSED (no change reported)",
+            r2.get("changed") is False, repr(r2),
+        )
+        expect(
+            "glitch sends no photo",
+            notifier.send_document.call_count == 0,
+            f"send_document called {notifier.send_document.call_count}x",
+        )
+        expect("glitch consumed the confirmation download", hasher.i == 3)
+
+        # The baseline must have survived the glitch (carried forward, not
+        # overwritten with the glitch fingerprint).
+        async with get_session() as session:
+            from sqlalchemy import select
+            snaps = (await session.execute(
+                select(AccountSnapshot)
+                .where(AccountSnapshot.username == "glitchy")
+                .order_by(AccountSnapshot.id)
+            )).scalars().all()
+        expect("baseline survives the glitch",
+               snaps[-1].profile_pic_hash == baseline,
+               repr(snaps[-1].profile_pic_hash))
+
+        r3 = await service.check_username("glitchy")
+        expect(
+            "real swap confirmed by second download - change reported",
+            r3.get("changed") is True, repr(r3),
+        )
+        expect(
+            "confirmed swap sends the photo exactly once",
+            notifier.send_document.call_count == 1,
+            f"send_document called {notifier.send_document.call_count}x",
+        )
 
 
 async def main() -> int:
@@ -410,6 +504,7 @@ async def main() -> int:
     test_detect_changes()
     await test_media_send_file_lifecycle()
     await test_full_sweep()
+    await test_confirmation_recheck()
 
     print()
     if FAILURES:
