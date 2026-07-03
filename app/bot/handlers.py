@@ -69,8 +69,10 @@ HELP_TEXT = (
     "<code>/highlights @user</code> — list any user's highlights to download\n"
     "<code>/kill</code> — stop an in-progress download (story/highlights/posts)\n"
     "<code>/export</code> — download CSV\n\n"
-    "<b>🔎 Any user</b> on the menu does the same as /story and /highlights for "
-    "any public account, without adding it to monitoring.\n\n"
+    "<b>🔎 Any user</b> on the menu grabs media from any public account without "
+    "adding it to monitoring. Send a <b>story link</b> and it downloads that "
+    "exact story straight away; send a <b>username</b> or <b>profile URL</b> and "
+    "it asks whether you want the profile picture, story, or highlights.\n\n"
     "<b>📦 Download all</b> grabs a whole account at once — story, photos, "
     "reels, highlights, and the profile picture. Pick a monitored account or "
     "type any username, tick what you want (or hit ⚡ EVERYTHING), and the "
@@ -126,6 +128,16 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 _INSTAGRAM_ID_RE = re.compile(r"^\d{1,64}$")
 _INSTAGRAM_URL_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9._]{1,30})(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+# Story permalink: instagram.com/stories/<username>[/<story_pk>][/…?…]. The pk
+# group is optional so a bare /stories/<username>/ page routes to that account's
+# action menu instead of being misread as a user literally named "stories". The
+# negative lookahead keeps highlight links (/stories/highlights/<id>/) out —
+# those aren't a single user story and are handled separately.
+_INSTAGRAM_STORY_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?instagram\.com/stories/"
+    r"(?!highlights(?:/|$))([A-Za-z0-9._]{1,30})(?:/(\d+))?",
     re.IGNORECASE,
 )
 # "30m", "1h", "1800s", "1h30m", or a bare integer (seconds).
@@ -1012,6 +1024,47 @@ async def _send_story_on_demand(
         noun = "item" if count == 1 else "items"
         text = f"📖 Sent {count} story {noun} for <b>@{esc(username)}</b>."
     await _safe_edit_text(query, text, reply_markup=keyboard)
+
+
+async def _send_story_url_on_demand(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    story_url: str,
+    pk: Optional[str],
+) -> None:
+    """Download the specific story item behind a direct story link and send it.
+
+    Command-flow only (the user typed a story URL), so this replies with a
+    status message and edits it in place with the outcome.
+    """
+    status = await update.message.reply_text(
+        f"⏳ Downloading that story from <b>@{esc(username)}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    result = await service.fetch_and_send_story_url(username, story_url, pk=pk)
+    keyboard = keyboards.fetch_actions(username)
+    if not result.get("ok"):
+        await status.edit_text(
+            f"Couldn't download that story: "
+            f"<code>{esc(str(result.get('error')))}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+    count = result.get("count", 0)
+    if count == 0:
+        text = (
+            "That story couldn't be downloaded — it may have expired, "
+            "or the account is private."
+        )
+    else:
+        noun = "item" if count == 1 else "items"
+        text = f"📖 Sent {count} story {noun} from <b>@{esc(username)}</b>."
+    await status.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+    )
 
 
 async def _show_highlights(
@@ -2250,17 +2303,54 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if context.user_data.get(_AWAITING_FETCH_USERNAME):
         context.user_data.pop(_AWAITING_FETCH_USERNAME, None)
         await _consume_prompt_message(update, context)
-        username = _normalize_username((update.message.text or "").strip())
-        if not username:
+        raw = (update.message.text or "").strip()
+
+        username: Optional[str] = None
+        story_match = _INSTAGRAM_STORY_URL_RE.match(raw)
+        if story_match:
+            story_user = _normalize_username(story_match.group(1))
+            story_pk = story_match.group(2)
+            if story_user and story_pk:
+                # Direct story permalink → download that one story right away.
+                await _send_story_url_on_demand(
+                    update, context, story_user, raw, story_pk
+                )
+                return
+            # A /stories/<username>/ page with no specific item → treat the
+            # username as an ordinary lookup and offer the action menu below.
+            username = story_user
+        elif "instagram.com/stories/highlights/" in raw.lower():
+            # A highlight story link can't be tied to a single account here —
+            # point the user at the username-based flow.
             await update.message.reply_text(
-                "That doesn't look like a valid Instagram username. "
-                "Letters, numbers, dots, and underscores only.",
+                "That's a highlights link. Send the account's <b>username</b> or "
+                "profile URL instead, then tap ✨ Highlights to pick one.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.main_menu(),
             )
             return
+        else:
+            # A username, profile URL, or numeric id.
+            parsed_user, instagram_id = _parse_add_target(raw)
+            if instagram_id and not parsed_user:
+                parsed_user = await _resolve_username_for_instagram_id(
+                    context, instagram_id
+                )
+            username = parsed_user
+
+        if not username:
+            await update.message.reply_text(
+                "That doesn't look like an Instagram <b>username</b>, "
+                "<b>profile URL</b>, or <b>story link</b>. Send one of those to "
+                "grab a profile picture, story, or highlights.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.main_menu(),
+            )
+            return
+
         await update.message.reply_text(
-            f"<b>@{esc(username)}</b> — grab its public story or highlights:",
+            f"<b>@{esc(username)}</b> — grab its profile picture, story, "
+            "or highlights:",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboards.fetch_actions(username),
         )
@@ -2518,9 +2608,11 @@ async def _handle_menu(
             context.user_data[_PROMPT_MSG_ID] = query.message.message_id
         await _safe_edit_text(
             query,
-            "Send any public Instagram <b>username</b> to grab its current "
-            "<b>story</b> or <b>highlights</b>.\n\n"
-            "<i>It won't be added to monitoring.</i>",
+            "Send any of these for a public account:\n"
+            "• a <b>story link</b> — I'll download and send that story right away\n"
+            "• a <b>username</b> or <b>profile URL</b> — then pick profile "
+            "picture, story, or highlights\n\n"
+            "<i>Nothing is added to monitoring.</i>",
             reply_markup=keyboards.cancel_only(),
         )
         return

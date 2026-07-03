@@ -1650,6 +1650,50 @@ class MonitorService:
         # Either there IS a story we can't fetch anonymously, or status unknown.
         return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
 
+    async def fetch_and_send_story_url(
+        self, username: str, story_url: str, *, pk: Optional[str] = None
+    ) -> dict:
+        """Download the single story item behind a direct story link and send it.
+
+        `story_url` is a full instagram.com/stories/<username>/<pk>/ permalink.
+        The exact URL is handed to saveinsta so only that item comes back; when
+        the source returns more than one and the URL's numeric `pk` matches a
+        returned item, the result is narrowed to just that story. Works for any
+        public account; monitored accounts still record the item as seen so the
+        next sweep won't re-send it.
+        Returns {"ok": bool, "count": int, "error": Optional[str]}.
+        """
+        if self.stories is None:
+            return {"ok": False, "count": 0, "error": "Stories client unavailable"}
+        username = username.strip().lstrip("@").lower()
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+        account_id = account.id if account else None
+
+        try:
+            items = await self.stories.fetch_story_by_url(story_url)
+        except Exception as exc:  # pragma: no cover - network failure path
+            logger.warning("Direct story fetch failed for {}: {}", story_url, exc)
+            items = []
+
+        # Narrow to the requested item when its pk is present; otherwise deliver
+        # whatever the permalink resolved to (already just that story in the
+        # common case). saveinsta derives pk from the CDN filename's media id,
+        # which matches the pk in the story URL when both are available.
+        if pk and items:
+            matched = [it for it in items if it.pk == pk]
+            if matched:
+                items = matched
+
+        if not items:
+            return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+
+        async with self.download_scope():
+            sent = await self._deliver_story_items(
+                account_id, username, items, set(), cancellable=True
+            )
+        return {"ok": True, "count": sent, "error": None}
+
     async def list_highlights(self, username: str) -> dict:
         """Return the current highlight reels (id + title) for any public account.
 

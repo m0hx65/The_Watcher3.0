@@ -5,7 +5,8 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   menu:list:<page>         — show accounts list, page index (0-based)
   menu:status              — show monitoring stats
   menu:add                 — prompt user for a username to add
-  menu:fetch               — prompt for any username to grab its story/highlights
+  menu:fetch               — prompt for a story URL, or a username/URL to grab
+                             its profile pic / story / highlights
   menu:export              — send CSV export
   menu:help                — show help
   menu:interval            — show interval preset chooser
@@ -241,9 +242,16 @@ def download_result(username: str) -> InlineKeyboardMarkup:
 
 
 def fetch_actions(username: str) -> InlineKeyboardMarkup:
-    """Story/Highlights actions for an arbitrary (possibly non-monitored) user."""
+    """Profile-pic / Story / Highlights actions for an arbitrary (possibly
+    non-monitored) user. `acc:photo` fetches the current picture live, so it
+    works even when the account isn't being monitored."""
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "🖼 Profile pic", callback_data=f"acc:photo:{username}"
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     "📖 Story", callback_data=f"acc:story:{username}"

@@ -99,6 +99,17 @@ class StoriesClient:
         data = await self._fetch_media_html(url)
         return self._parse_items(data, source="story")
 
+    async def fetch_story_by_url(self, story_url: str) -> list[StoryItem]:
+        """Return the story item(s) for one direct story permalink (login-free).
+
+        `story_url` is a full `instagram.com/stories/<username>/<pk>/` link.
+        saveinsta resolves the specific item behind that URL, so this usually
+        yields just the requested story; the caller can still narrow by pk when
+        more than one comes back.
+        """
+        data = await self._fetch_media_html(story_url)
+        return self._parse_items(data, source="story")
+
     async def fetch_highlight_items(
         self, username: str, highlight_id: str, title: str
     ) -> list[StoryItem]:
