@@ -6,9 +6,8 @@ notification dispatcher, change detection engine, and APScheduler-driven worker.
 
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -16,10 +15,9 @@ from telegram import Bot
 from telegram.ext import Application as TgApplication
 
 from app.api.routes import router as api_router
-from app.bot import keyboards
 from app.bot.handlers import BOT_COMMANDS, PANEL_CHAT_ID, PANEL_MSG_ID, register_handlers
-from app.bot.handlers import WELCOME_TEXT
 from app.bot.notifications import build_dispatcher
+from app.bot.panel_bump import PanelBumper
 from app.config import settings
 from app.database import crud
 from app.database.session import dispose_engine, get_session, init_db
@@ -73,45 +71,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tg_app.bot_data[PANEL_MSG_ID] = int(_saved_mid)
         tg_app.bot_data[PANEL_CHAT_ID] = int(_saved_cid)
 
-    _pending_bump: Optional[asyncio.Task] = None
+    async def _persist_panel(msg_id: int, chat_id: int) -> None:
+        async with get_session() as session:
+            await crud.set_setting(session, "panel_msg_id", str(msg_id))
+            await crud.set_setting(session, "panel_chat_id", str(chat_id))
 
-    async def _do_bump() -> None:
-        from telegram.constants import ParseMode
-        from telegram.error import BadRequest, Forbidden, TelegramError
-
-        # 2-second debounce: let concurrent sweep notifications all land first.
-        await asyncio.sleep(2)
-        msg_id = tg_app.bot_data.get(PANEL_MSG_ID)
-        chat_id = tg_app.bot_data.get(PANEL_CHAT_ID)
-        if msg_id is None or chat_id is None:
-            return
-        try:
-            await tg_app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except (BadRequest, Forbidden, TelegramError):
-            pass
-        tg_app.bot_data.pop(PANEL_MSG_ID, None)
-        try:
-            new_msg = await tg_app.bot.send_message(
-                chat_id=chat_id,
-                text=WELCOME_TEXT,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboards.main_menu(),
-                disable_web_page_preview=True,
-            )
-            tg_app.bot_data[PANEL_MSG_ID] = new_msg.message_id
-            async with get_session() as session:
-                await crud.set_setting(session, "panel_msg_id", str(new_msg.message_id))
-                await crud.set_setting(session, "panel_chat_id", str(chat_id))
-        except Exception as exc:
-            logger.warning("Panel bump failed: {}", exc)
-
-    async def _schedule_bump() -> None:
-        nonlocal _pending_bump
-        if _pending_bump is not None and not _pending_bump.done():
-            return  # A bump is already queued; this notification will be included
-        _pending_bump = asyncio.create_task(_do_bump())
-
-    dispatcher.post_send_hook = _schedule_bump
+    # The bump keeps the menu at the bottom after automated sweep notifications,
+    # but skips while a manual download is running so it never drops a duplicate
+    # menu under an on-demand result (see PanelBumper).
+    panel_bumper = PanelBumper(
+        tg_app.bot,
+        tg_app.bot_data,
+        download_active=lambda: monitor.download_active,
+        persist=_persist_panel,
+    )
+    dispatcher.post_send_hook = panel_bumper.schedule
 
     # Save on app state for HTTP API access
     app.state.monitor = monitor
