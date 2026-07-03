@@ -43,17 +43,21 @@ def flatten(markup) -> list:
 
 
 def make_message_update(text: str) -> SimpleNamespace:
-    reply_msg = SimpleNamespace(message_id=500, edit_text=AsyncMock())
+    reply_msg = SimpleNamespace(
+        message_id=500, edit_text=AsyncMock(), delete=AsyncMock()
+    )
     message = SimpleNamespace(
         text=text,
         reply_text=AsyncMock(return_value=reply_msg),
     )
-    return SimpleNamespace(
+    update = SimpleNamespace(
         callback_query=None,
         message=message,
         effective_chat=SimpleNamespace(id=7),
         effective_user=SimpleNamespace(id=99),
     )
+    update._reply_msg = reply_msg  # keep the status message reachable for asserts
+    return update
 
 
 def make_service_mock() -> SimpleNamespace:
@@ -142,6 +146,54 @@ async def test_story_url_downloads_immediately() -> None:
     expect(
         "awaiting-fetch flag cleared after a story link",
         handlers._AWAITING_FETCH_USERNAME not in context.user_data,
+    )
+    # Media was sent, so the summary must land at the BOTTOM: the "⏳ …" status
+    # message is deleted and the result goes out as a fresh (last) message.
+    expect(
+        "story link: status message deleted after delivery",
+        update._reply_msg.delete.await_count == 1,
+        str(update._reply_msg.delete.await_count),
+    )
+    expect(
+        "story link: summary re-sent fresh, not edited in place",
+        update._reply_msg.edit_text.await_count == 0
+        and update.message.reply_text.await_count == 2,
+        f"edits={update._reply_msg.edit_text.await_count} "
+        f"replies={update.message.reply_text.await_count}",
+    )
+    final = update.message.reply_text.call_args
+    final_markup = final.kwargs.get("reply_markup")
+    expect(
+        "story link: bottom summary carries the action keyboard",
+        final_markup is not None
+        and "acc:photo:shemaa.khalill" in _callbacks(final_markup),
+        str(final),
+    )
+
+
+async def test_story_url_no_media_edits_in_place() -> None:
+    # Nothing was delivered → the status message is still the newest message,
+    # so it must be edited in place (no delete + re-send churn).
+    service = make_service_mock()
+    service.fetch_and_send_story_url = AsyncMock(
+        return_value={"ok": True, "count": 0, "error": None}
+    )
+    context = make_context(service)
+    update = make_message_update(
+        "https://www.instagram.com/stories/shemaa.khalill/3933177616550897519/"
+    )
+    await handlers.on_plain_text(update, context)
+    expect(
+        "no media: status edited in place",
+        update._reply_msg.edit_text.await_count == 1,
+        str(update._reply_msg.edit_text.await_count),
+    )
+    expect(
+        "no media: status not deleted, no extra message",
+        update._reply_msg.delete.await_count == 0
+        and update.message.reply_text.await_count == 1,
+        f"deletes={update._reply_msg.delete.await_count} "
+        f"replies={update.message.reply_text.await_count}",
     )
 
 
@@ -233,6 +285,7 @@ async def test_garbage_input_is_rejected() -> None:
 async def main() -> None:
     test_fetch_actions_buttons()
     await test_story_url_downloads_immediately()
+    await test_story_url_no_media_edits_in_place()
     await test_username_shows_action_menu()
     await test_profile_url_shows_action_menu()
     await test_stories_page_without_pk_shows_menu()

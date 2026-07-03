@@ -345,6 +345,73 @@ async def _delete_callback_message(update: Update) -> None:
         pass
 
 
+async def _conclude_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    sent_any: bool,
+) -> None:
+    """Show a download's result summary as the LAST message in the chat.
+
+    Callback-flow counterpart of _finish_status. When media was delivered, the
+    progress message being edited sits ABOVE the media Telegram just appended,
+    so an in-place edit would leave the summary (and its follow-up buttons)
+    buried mid-chat. Delete the progress message and send the summary fresh so
+    it lands at the bottom. When nothing was sent the progress message is still
+    the newest message — edit it in place instead (no delete/re-send flicker).
+    """
+    query = update.callback_query
+    chat_id = _chat_id(update)
+    if not sent_any or query is None or chat_id is None:
+        if query is not None:
+            await _safe_edit_text(query, text, reply_markup=reply_markup)
+        return
+    await _delete_callback_message(update)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+async def _finish_status(
+    update: Update,
+    status_msg,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    sent_any: bool,
+) -> None:
+    """Command-flow counterpart of _conclude_download.
+
+    `status_msg` is the "⏳ …" reply posted before the download. When media was
+    delivered it now sits above that media, so delete it and send the summary
+    fresh at the bottom; otherwise edit it in place.
+    """
+    if not sent_any:
+        await status_msg.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        return
+    try:
+        await status_msg.delete()
+    except (BadRequest, Forbidden, TelegramError):
+        pass
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
 async def _send_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Delete any existing panel then send a fresh menu at the bottom of the chat."""
     chat_id = _chat_id(update)
@@ -1023,7 +1090,9 @@ async def _send_story_on_demand(
     else:
         noun = "item" if count == 1 else "items"
         text = f"📖 Sent {count} story {noun} for <b>@{esc(username)}</b>."
-    await _safe_edit_text(query, text, reply_markup=keyboard)
+    await _conclude_download(
+        update, context, text, reply_markup=keyboard, sent_any=count > 0
+    )
 
 
 async def _send_story_url_on_demand(
@@ -1035,8 +1104,8 @@ async def _send_story_url_on_demand(
 ) -> None:
     """Download the specific story item behind a direct story link and send it.
 
-    Command-flow only (the user typed a story URL), so this replies with a
-    status message and edits it in place with the outcome.
+    Command-flow only (the user typed a story URL): a status reply tracks
+    progress, and the summary lands at the bottom once media has been sent.
     """
     status = await update.message.reply_text(
         f"⏳ Downloading that story from <b>@{esc(username)}</b>…",
@@ -1062,8 +1131,8 @@ async def _send_story_url_on_demand(
     else:
         noun = "item" if count == 1 else "items"
         text = f"📖 Sent {count} story {noun} from <b>@{esc(username)}</b>."
-    await status.edit_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+    await _finish_status(
+        update, status, text, reply_markup=keyboard, sent_any=count > 0
     )
 
 
@@ -1241,7 +1310,9 @@ async def _download_all_highlights(
             f"✨ Sent {count} {item_noun} from {reels} {reel_noun} "
             f"for <b>@{esc(username)}</b>."
         )
-    await _safe_edit_text(query, text, reply_markup=keyboard)
+    await _conclude_download(
+        update, context, text, reply_markup=keyboard, sent_any=count > 0
+    )
 
 
 async def _send_csv_export(
@@ -1432,13 +1503,18 @@ async def _run_bundle_download(
     # One scope around the whole bundle so a /kill pressed during any category
     # keeps stopping the rest — the cancel flag survives between the inner
     # downloads (each of which also opens its own nested scope).
+    # delivered_any tracks whether any media message actually landed in the
+    # chat — that decides whether the final summary must be re-sent at the
+    # bottom (below the media) instead of edited in place above it.
     stopped = False
+    delivered_any = False
     async with service.download_scope():
         if want_pic and not service.is_cancelling():
             await progress("profile picture")
             r = await service.fetch_and_send_profile_picture(username)
             if r.get("ok"):
                 lines.append("👤 Profile picture — sent ✓")
+                delivered_any = True
             else:
                 lines.append(
                     f"👤 Profile picture — ✗ <code>{esc(str(r.get('error')))}</code>"
@@ -1454,6 +1530,7 @@ async def _run_bundle_download(
                 if count:
                     noun = "item" if count == 1 else "items"
                     lines.append(f"📖 Story — {count} {noun} ✓")
+                    delivered_any = True
                 else:
                     lines.append("📖 Story — no active story")
             else:
@@ -1475,6 +1552,8 @@ async def _run_bundle_download(
                     lines.append(f"🖼 Photos — {r.get('photos', 0)} sent ✓")
                 if want_reels:
                     lines.append(f"🎬 Reels/videos — {r.get('videos', 0)} sent ✓")
+                if r.get("count", 0):
+                    delivered_any = True
             else:
                 lines.append(
                     f"🖼🎬 Posts & reels — ✗ <code>{esc(str(r.get('error')))}</code>"
@@ -1505,6 +1584,8 @@ async def _run_bundle_download(
                         )
                     else:
                         lines.append("✨ Highlights — none to download")
+                    if r.get("count", 0):
+                        delivered_any = True
                 else:
                     lines.append(
                         f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
@@ -1523,6 +1604,8 @@ async def _run_bundle_download(
                         f"✨ Highlights — {r.get('count', 0)} items "
                         f"from {r.get('reels', 0)} reel{'s' if r.get('reels', 0) != 1 else ''} ✓"
                     )
+                    if r.get("count", 0):
+                        delivered_any = True
                 else:
                     lines.append(
                         f"✨ Highlights — ✗ <code>{esc(str(r.get('error')))}</code>"
@@ -1538,10 +1621,12 @@ async def _run_bundle_download(
         if stopped
         else f"📦 <b>@{esc(username)}</b> — bulk download finished"
     )
-    await _safe_edit_text(
-        query,
+    await _conclude_download(
+        update,
+        context,
         f"{header}\n\n" + "\n".join(lines),
         reply_markup=keyboards.download_result(username),
+        sent_any=delivered_any,
     )
 
 
@@ -2155,8 +2240,12 @@ async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         noun = "item" if count == 1 else "items"
         text = f"📖 Sent {count} story {noun} for <b>@{esc(username)}</b>."
-    await status_msg.edit_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=keyboards.fetch_actions(username)
+    await _finish_status(
+        update,
+        status_msg,
+        text,
+        reply_markup=keyboards.fetch_actions(username),
+        sent_any=count > 0,
     )
 
 

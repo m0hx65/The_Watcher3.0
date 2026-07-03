@@ -434,6 +434,29 @@ async def test_all_downloads_everything() -> None:
         "EVERYTHING needs no stored panel state",
         service.download_highlights_from_catalog.await_count == 0,
     )
+    # Media was delivered, so the final summary must land BELOW it: progress
+    # message deleted, summary sent as a fresh message at the bottom.
+    expect(
+        "EVERYTHING deletes the progress message after delivery",
+        update.callback_query.message.delete.await_count == 1,
+        str(update.callback_query.message.delete.await_count),
+    )
+    final = context.bot.send_message.call_args
+    expect(
+        "EVERYTHING sends the final summary as a fresh bottom message",
+        final is not None
+        and "bulk download finished" in final.kwargs.get("text", ""),
+        f"call={final}",
+    )
+    final_markup = final.kwargs.get("reply_markup") if final else None
+    expect(
+        "bottom summary carries the download-result keyboard",
+        final_markup is not None
+        and any(
+            b.callback_data == "dl:open:user" for b in flatten(final_markup)
+        ),
+        str(final_markup),
+    )
 
 
 async def test_all_with_panel_state_skips_relisting() -> None:
