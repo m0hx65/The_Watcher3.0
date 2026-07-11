@@ -32,7 +32,13 @@ from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
-from app.workers.scheduler import MAX_INTERVAL, MIN_INTERVAL, WatcherScheduler
+from app.workers.scheduler import (
+    MAX_INTERVAL,
+    MIN_INTERVAL,
+    SETTING_DIGEST_MODE,
+    SETTING_LAST_SWEEP_AT,
+    WatcherScheduler,
+)
 
 
 # ---------- Static text & bot menu ----------
@@ -576,16 +582,76 @@ def _scheduler(context: ContextTypes.DEFAULT_TYPE) -> Optional[WatcherScheduler]
     return sched if isinstance(sched, WatcherScheduler) else None
 
 
+def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
+    """Parse a stored ISO timestamp, tolerating a missing/blank/bad value."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def _guards_line() -> str:
+    """Compact summary of which protections are currently active."""
+    if settings.sweep_breaker_threshold > 0:
+        breaker = f"401-breaker after {settings.sweep_breaker_threshold}"
+    else:
+        breaker = "401-breaker off"
+    if settings.follower_anomaly_abs_min > 0 and settings.follower_anomaly_pct_min > 0:
+        pct = round(settings.follower_anomaly_pct_min * 100)
+        anomaly = f"anomaly ≥{fmt_number(settings.follower_anomaly_abs_min)} &amp; {pct}%"
+    else:
+        anomaly = "anomaly off"
+    return f"🛡 Guards: {breaker} · {anomaly}"
+
+
 async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     async with get_session() as session:
         stats = await crud.stats_summary(session)
+        accounts = await crud.list_accounts(session, only_active=False)
+        last_sweep_raw = await crud.get_setting(session, SETTING_LAST_SWEEP_AT)
+        digest_raw = await crud.get_setting(session, SETTING_DIGEST_MODE)
+        dark_flags = await crud.get_settings_by_prefix(session, "dark_state:")
 
     scheduler_state = context.application.bot_data.get("scheduler_state", "unknown")
     next_run = context.application.bot_data.get("next_run")
     next_run_str = fmt_timestamp(next_run) if next_run else "—"
 
+    last_sweep = _parse_iso(last_sweep_raw)
+    last_sweep_str = fmt_timestamp(last_sweep) if last_sweep else "—"
+
     sched = _scheduler(context)
     interval = sched.interval_seconds if sched else settings.check_interval
+
+    paused = sum(1 for a in accounts if not a.active)
+    paused_str = f", paused: <b>{paused}</b>" if paused else ""
+
+    # Accounts currently failing (consecutive fetch failures) — the actionable
+    # bit: which targets aren't coming back, and how badly.
+    failing = sorted(
+        (a for a in accounts if (a.consecutive_failures or 0) > 0),
+        key=lambda a: a.consecutive_failures or 0,
+        reverse=True,
+    )
+    attention_line = ""
+    if failing:
+        shown = failing[:5]
+        names = ", ".join(
+            f"@{esc(a.username)} ({a.consecutive_failures}×)" for a in shown
+        )
+        extra = f" +{len(failing) - 5} more" if len(failing) > 5 else ""
+        attention_line = (
+            f"\n⚠️ Needs attention: <b>{len(failing)}</b> — {names}{extra}"
+        )
+
+    dark_line = ""
+    if dark_flags:
+        dark_line = f"\n🌑 Gone dark: <b>{len(dark_flags)}</b>"
+
+    digest_mode = digest_raw if digest_raw in ("off", "daily", "weekly") else "off"
+    digest_line = f"\n🗞 Digest: <b>{digest_mode}</b>"
 
     stakeout_line = ""
     if sched is not None:
@@ -603,14 +669,19 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     return (
         "<b>📊 Watcher status</b>\n\n"
         f"Accounts: <b>{stats['accounts_total']}</b> "
-        f"(active: <b>{stats['accounts_active']}</b>)\n"
+        f"(active: <b>{stats['accounts_active']}</b>{paused_str})"
+        f"{attention_line}\n"
         f"Snapshots stored: <b>{fmt_number(stats['snapshots_total'])}</b>\n"
         f"Notifications sent: <b>{fmt_number(stats['notifications_total'])}</b>\n\n"
         f"Scheduler: <b>{esc(str(scheduler_state))}</b>\n"
         f"Interval: <b>{_format_interval(interval)}</b> "
         f"(±{settings.jitter_seconds}s jitter)\n"
+        f"Last sweep: <b>{last_sweep_str}</b>\n"
         f"Next sweep: <b>{next_run_str}</b>"
-        f"{stakeout_line}"
+        f"{digest_line}"
+        f"{dark_line}"
+        f"{stakeout_line}\n"
+        f"{_guards_line()}"
         f"{health_block}"
     )
 
