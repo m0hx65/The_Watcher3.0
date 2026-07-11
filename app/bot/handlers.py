@@ -196,31 +196,42 @@ def _normalize_username(raw: str) -> Optional[str]:
 
 
 def _parse_add_target(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse an /add target into (username, instagram_id) — at most one set.
+
+    Accepts a bare username, an ``@username``, a numeric id, or an Instagram
+    profile URL (scheme optional). The single anchored ``_INSTAGRAM_URL_RE`` is
+    the ONLY host check: it validates the host is exactly ``instagram.com`` at
+    the very start of the string, so a look-alike like ``evilinstagram.com/x`` or
+    an embedded ``evil.com/instagram.com/x`` never matches. We deliberately do
+    NOT use a ``"instagram.com" in raw`` substring test, which those look-alikes
+    would slip past (see CodeQL "incomplete URL substring sanitization").
+    """
     raw = raw.strip()
     if not raw:
         return None, None
-    if raw.lower().startswith("http://") or raw.lower().startswith("https://"):
-        match = _INSTAGRAM_URL_RE.match(raw)
-        if not match:
-            return None, None
+
+    # Try to interpret the whole string as an Instagram profile URL. The regex
+    # is anchored at ^ and matches the host exactly, so this is safe against
+    # look-alike / embedded hosts.
+    match = _INSTAGRAM_URL_RE.match(raw)
+    if match:
         path = match.group(1)
         if _INSTAGRAM_ID_RE.match(path):
             return None, path
         return _normalize_username(path), None
-    if "instagram.com/" in raw.lower():
-        match = _INSTAGRAM_URL_RE.match(raw)
-        if not match:
-            return None, None
-        path = match.group(1)
-        if _INSTAGRAM_ID_RE.match(path):
-            return None, path
-        return _normalize_username(path), None
-    raw = raw.lstrip("@")
-    if not raw:
+
+    # Anything else that carries URL structure (a scheme or a path separator) is
+    # a URL we did NOT recognize as Instagram — reject it rather than mis-reading
+    # the leftover text as a username.
+    if "://" in raw or "/" in raw:
         return None, None
-    if _INSTAGRAM_ID_RE.match(raw):
-        return None, raw
-    return _normalize_username(raw), None
+
+    candidate = raw.lstrip("@")
+    if not candidate:
+        return None, None
+    if _INSTAGRAM_ID_RE.match(candidate):
+        return None, candidate
+    return _normalize_username(candidate), None
 
 
 def _parse_interval(raw: str) -> Optional[int]:
