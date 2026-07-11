@@ -755,7 +755,10 @@ async def _render_history_message(username: str) -> str:
         else:
             old = payload.get("old")
             new = payload.get("new")
-            detail = truncate(f"{esc(str(old))} → {esc(str(new))}", 200)
+            # Truncate the raw text BEFORE escaping — truncating escaped HTML can
+            # slice an entity (e.g. "&amp;" → "&am") and make Telegram reject the
+            # whole message.
+            detail = esc(truncate(f"{old} → {new}", 200))
         lines.append(f"<code>{ts}</code>\n<b>{esc(n.change_type)}</b>: {detail}\n")
 
     return "\n".join(lines)

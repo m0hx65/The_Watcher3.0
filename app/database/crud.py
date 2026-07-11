@@ -148,6 +148,29 @@ async def get_latest_snapshot(
     return result.scalar_one_or_none()
 
 
+async def get_previous_snapshot(
+    session: AsyncSession, account_id: int, before_id: int
+) -> Optional[AccountSnapshot]:
+    """The most recent snapshot for an account OTHER than `before_id`.
+
+    Used to read the prior sweep's stored reel_data (story/live status) so a
+    "just went live / just posted a story" transition can be detected. Ordered
+    newest-first with the same id tiebreaker as get_latest_snapshot, so
+    colliding whole-second timestamps never return an arbitrary row.
+    """
+    stmt = (
+        select(AccountSnapshot)
+        .where(
+            AccountSnapshot.account_id == account_id,
+            AccountSnapshot.id != before_id,
+        )
+        .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 async def get_latest_pic_baseline(
     session: AsyncSession, account_id: int
 ) -> tuple[Optional[str], Optional[str]]:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Union
 
@@ -456,8 +458,6 @@ def render_digest(
     account and rendered newest-activity-first. Returns a short "nothing to
     report" line when the window is empty.
     """
-    from collections import Counter, defaultdict
-
     per_user: dict[str, Counter] = defaultdict(Counter)
     for note, username in rows:
         change_type = getattr(note, "change_type", None)

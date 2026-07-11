@@ -1526,23 +1526,19 @@ class MonitorService:
                     has_public_story = reel_data.get("has_public_story", False)
                     is_live = reel_data.get("is_live", False)
                     
-                    # Extract previous story/live status from the previous snapshot
+                    # Extract previous story/live status from the snapshot before
+                    # the current one (its stored reel_data).
                     prev_has_story = False
                     prev_is_live = False
                     if previous_snapshot and previous_snapshot.id:
-                        # Get the snapshot before the current one
                         async with get_session() as session:
-                            from sqlalchemy import select, desc
-                            prev_snapshot_query = select(AccountSnapshot).where(
-                                AccountSnapshot.account_id == account_id,
-                                AccountSnapshot.id != previous_snapshot.id
-                            ).order_by(desc(AccountSnapshot.created_at)).limit(1)
-                            prev_snapshot_result = await session.execute(prev_snapshot_query)
-                            prev_snapshot_older = prev_snapshot_result.scalar()
-                            if prev_snapshot_older and prev_snapshot_older.raw_response:
-                                prev_reel = prev_snapshot_older.raw_response.get("reel_data", {})
-                                prev_has_story = prev_reel.get("has_public_story", False)
-                                prev_is_live = prev_reel.get("is_live", False)
+                            prev_snapshot_older = await crud.get_previous_snapshot(
+                                session, account_id, previous_snapshot.id
+                            )
+                        if prev_snapshot_older and prev_snapshot_older.raw_response:
+                            prev_reel = prev_snapshot_older.raw_response.get("reel_data", {})
+                            prev_has_story = prev_reel.get("has_public_story", False)
+                            prev_is_live = prev_reel.get("is_live", False)
                     
                     # One status message per sweep, upgraded to a "just went
                     # live" / "just posted a story" alert only when the status

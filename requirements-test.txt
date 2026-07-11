@@ -1,0 +1,5 @@
+# Test-only dependencies (the app itself runs on Postgres/asyncpg).
+# The offline test suites drive the same models against an in-process SQLite
+# database, which needs the async SQLite driver below.
+-r requirements.txt
+aiosqlite==0.22.1
