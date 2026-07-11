@@ -7,7 +7,7 @@ import csv
 import io
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +28,7 @@ from app.config import settings
 from app.database import crud
 from app.database.session import get_session
 from app.monitor.analytics import compute_rhythm, render_rhythm
+from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
@@ -96,6 +97,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("darkradar", "List accounts that have gone quiet"),
     BotCommand("synctopics", "Give each account its own forum topic"),
     BotCommand("history", "Recent changes for a username"),
+    BotCommand("digest", "Show/set the daily or weekly digest"),
     BotCommand("photo", "Current profile picture"),
     BotCommand("fetchphoto", "Download current profile picture on demand"),
     BotCommand("story", "Download any user's current story"),
@@ -595,6 +597,9 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
             )
             stakeout_line = f"\n🎯 Stakeouts: <b>{len(active)}</b> — {names}"
 
+    health_lines = render_health_lines(fetch_health.snapshot())
+    health_block = ("\n\n" + "\n".join(health_lines)) if health_lines else ""
+
     return (
         "<b>📊 Watcher status</b>\n\n"
         f"Accounts: <b>{stats['accounts_total']}</b> "
@@ -606,6 +611,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"(±{settings.jitter_seconds}s jitter)\n"
         f"Next sweep: <b>{next_run_str}</b>"
         f"{stakeout_line}"
+        f"{health_block}"
     )
 
 
@@ -2173,6 +2179,57 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+_DIGEST_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show, preview, or set the daily/weekly digest.
+
+    /digest                 → current mode + a preview of the recent window
+    /digest daily|weekly|off → change the mode
+    """
+    if await _reject_if_unauthorized(update):
+        return
+    sched = _scheduler(context)
+    service: MonitorService = context.application.bot_data["monitor"]
+    args = [a.strip().lower() for a in (context.args or [])]
+
+    if args and args[0] in ("off", "daily", "weekly"):
+        if sched is None:
+            await update.message.reply_text(
+                "Scheduler isn't ready yet — try again in a moment."
+            )
+            return
+        mode = await sched.set_digest_mode(args[0])
+        hour = f"{settings.digest_hour:02d}:00 UTC"
+        if mode == "off":
+            msg = "🗞 Digest <b>off</b> — per-event alerts only."
+        elif mode == "daily":
+            msg = f"🗞 Digest set to <b>daily</b> — one roll-up every day at {hour}."
+        else:
+            wd = _DIGEST_WEEKDAYS[settings.digest_weekday % 7]
+            msg = f"🗞 Digest set to <b>weekly</b> — every <b>{wd}</b> at {hour}."
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+
+    # No (or unknown) args: show the current mode and a live preview.
+    mode = await sched.get_digest_mode() if sched is not None else "off"
+    window = timedelta(days=7 if mode == "weekly" else 1)
+    since = datetime.now(timezone.utc) - window
+    text, _events, _accounts = await service.compose_digest(since)
+    header = (
+        f"🗞 <b>Digest</b> — currently <b>{esc(mode)}</b>\n"
+        f"Change with <code>/digest daily</code>, <code>/digest weekly</code>, "
+        f"or <code>/digest off</code>.\n\n"
+        f"<i>Preview of the last {'7 days' if mode == 'weekly' else '24 hours'}:</i>\n\n"
+    )
+    await update.message.reply_text(
+        header + text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -3010,6 +3067,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("fetchphoto", cmd_fetchphoto))
     app.add_handler(CommandHandler("story", cmd_story))

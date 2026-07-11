@@ -22,9 +22,13 @@ from app.utils.logger import logger
 
 SWEEP_JOB_ID = "watcher-sweep"
 CLEANUP_JOB_ID = "watcher-cleanup"
+DIGEST_JOB_ID = "watcher-digest"
 SETTING_INTERVAL = "check_interval_seconds"
 SETTING_LAST_SWEEP_AT = "last_sweep_at"
 SETTING_STAKEOUTS = "active_stakeouts"
+SETTING_DIGEST_MODE = "digest_mode"          # "off" | "daily" | "weekly"
+SETTING_DIGEST_LAST_AT = "digest_last_at"    # ISO timestamp of the last digest
+_DIGEST_MODES = ("off", "daily", "weekly")
 
 # Sane bounds enforced wherever interval values are accepted.
 MIN_INTERVAL = 60
@@ -169,6 +173,17 @@ class WatcherScheduler:
             self._cleanup_wrapper,
             trigger=CronTrigger(hour=3, minute=0, timezone="UTC"),
             id=CLEANUP_JOB_ID,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        # Digest fires daily at the configured hour; the wrapper decides whether
+        # to actually send based on the runtime mode (off/daily/weekly).
+        digest_hour = max(0, min(23, settings.digest_hour))
+        self.scheduler.add_job(
+            self._digest_wrapper,
+            trigger=CronTrigger(hour=digest_hour, minute=0, timezone="UTC"),
+            id=DIGEST_JOB_ID,
             max_instances=1,
             coalesce=True,
             misfire_grace_time=3600,
@@ -455,6 +470,69 @@ class WatcherScheduler:
             )
         except Exception as exc:
             logger.exception("Cleanup job crashed: {}", exc)
+
+    # ---------- Digest ----------
+
+    async def get_digest_mode(self) -> str:
+        async with get_session() as session:
+            mode = await crud.get_setting(session, SETTING_DIGEST_MODE)
+        return mode if mode in _DIGEST_MODES else "off"
+
+    async def set_digest_mode(self, mode: str) -> str:
+        """Persist the digest mode (off/daily/weekly). Returns the stored value."""
+        mode = mode.strip().lower()
+        if mode not in _DIGEST_MODES:
+            mode = "off"
+        async with get_session() as session:
+            await crud.set_setting(session, SETTING_DIGEST_MODE, mode)
+        logger.info("Digest mode set to {}", mode)
+        return mode
+
+    async def _digest_since(self, mode: str, now: datetime) -> datetime:
+        """Window start for a digest: the last digest, else a mode-default span."""
+        default = timedelta(days=7 if mode == "weekly" else 1)
+        async with get_session() as session:
+            raw_last = await crud.get_setting(session, SETTING_DIGEST_LAST_AT)
+        if raw_last:
+            try:
+                last = datetime.fromisoformat(raw_last)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                return last
+            except ValueError:
+                pass
+        return now - default
+
+    async def run_digest(self, *, force_mode: Optional[str] = None) -> dict:
+        """Build and broadcast the digest, then advance the last-digest marker.
+
+        `force_mode` (from an on-demand /digest now) bypasses the off check and
+        the weekly-weekday gate; the scheduled path passes None and obeys both.
+        Returns {"sent", "mode", "events", "accounts"}.
+        """
+        now = datetime.now(timezone.utc)
+        mode = force_mode or await self.get_digest_mode()
+        if mode not in ("daily", "weekly"):
+            return {"sent": False, "mode": mode, "events": 0, "accounts": 0}
+        if force_mode is None and mode == "weekly" and now.weekday() != settings.digest_weekday:
+            return {"sent": False, "mode": mode, "events": 0, "accounts": 0}
+
+        since = await self._digest_since(mode, now)
+        text, events, accounts = await self.service.compose_digest(since)
+        await self.service.notifier.send_text(text)
+        async with get_session() as session:
+            await crud.set_setting(session, SETTING_DIGEST_LAST_AT, now.isoformat())
+        logger.info(
+            "Digest ({}) sent: {} event(s) across {} account(s)",
+            mode, events, accounts,
+        )
+        return {"sent": True, "mode": mode, "events": events, "accounts": accounts}
+
+    async def _digest_wrapper(self) -> None:
+        try:
+            await self.run_digest()
+        except Exception as exc:
+            logger.exception("Digest job crashed: {}", exc)
 
     def _emit_state(self, state: str) -> None:
         if self._on_state_change is None:

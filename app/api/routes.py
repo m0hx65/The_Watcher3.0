@@ -11,6 +11,7 @@ from telegram import Update
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
+from app.monitor.health import fetch_health
 from app.monitor.service import MonitorService
 from app.utils.logger import logger
 from app.workers.scheduler import WatcherScheduler
@@ -74,6 +75,7 @@ async def status_endpoint(request: Request) -> dict:
         ),
         "check_interval": settings.check_interval,
         "jitter_seconds": settings.jitter_seconds,
+        "fetch_health": fetch_health.snapshot(),
     }
 
 

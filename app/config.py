@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=20, alias="REQUEST_TIMEOUT")
     max_concurrent_fetches: int = Field(default=3, alias="MAX_CONCURRENT_FETCHES")
 
+    # Sweep pacing + circuit breaker (pacing-on-failure only — never changes a
+    # request). The stagger between account launches widens as consecutive
+    # 401/403 blocks pile up (up to the max), and once this many blocks happen
+    # in a row the breaker opens: the remaining accounts are deferred to the
+    # retry pass / next sweep instead of feeding Instagram's rate limiter.
+    # Set the threshold to 0 to disable the breaker (adaptive stagger still runs).
+    sweep_stagger_max_seconds: float = Field(default=12.0, alias="SWEEP_STAGGER_MAX_SECONDS")
+    sweep_breaker_threshold: int = Field(default=5, alias="SWEEP_BREAKER_THRESHOLD")
+
     # Stakeout mode — temporary high-frequency watch on a single target.
     # The floor sits above the 90s reel-data cache so every tick gets fresh
     # data without hammering Instagram into rate-limit 401s. Kept gentle on
@@ -72,6 +81,22 @@ class Settings(BaseSettings):
     # Went-dark radar: alert when a monitored account posts nothing (no story,
     # post, or reel) for this many days. 0 disables the radar.
     dark_radar_days: int = Field(default=3, alias="DARK_RADAR_DAYS")
+
+    # Follower-anomaly alert: a follower change is flagged only when it's large
+    # in BOTH absolute terms (≥ abs_min) and relative terms (≥ pct_min of the
+    # prior count), so it never fires on a small account's noise or a big
+    # account's normal drift. Set either to 0 to disable the alert.
+    follower_anomaly_abs_min: int = Field(default=500, alias="FOLLOWER_ANOMALY_ABS_MIN")
+    follower_anomaly_pct_min: float = Field(default=0.10, alias="FOLLOWER_ANOMALY_PCT_MIN")
+
+    # Digest: an opt-in daily/weekly roll-up of all changes instead of (well, on
+    # top of) per-event alerts. The mode (off/daily/weekly) is a runtime setting
+    # toggled with /digest — these two only pick WHEN the scheduled digest fires.
+    # A daily digest goes out every day at digest_hour (UTC); a weekly one only
+    # on digest_weekday (0=Monday). Reads the already-logged notifications, so
+    # nothing extra is stored.
+    digest_hour: int = Field(default=9, alias="DIGEST_HOUR")
+    digest_weekday: int = Field(default=0, alias="DIGEST_WEEKDAY")
 
     # Storage
     media_dir: str = Field(default="./data/media", alias="MEDIA_DIR")

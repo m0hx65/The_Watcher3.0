@@ -22,6 +22,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException, Timeout
 
 from app.config import settings
+from app.monitor.health import IG_PROFILE, IG_REEL, fetch_health
 from app.utils.logger import logger
 
 INSTAGRAM_HOST = "www.instagram.com"
@@ -382,8 +383,10 @@ class InstagramClient:
             except Exception:
                 logger.debug("Proxy reel query id={} returned non-JSON 200", user_id)
                 return False, None
+            fetch_health.record_status(IG_REEL, 200)
             return True, _parse_reel_query_user(payload)
         if response.status_code == 404:
+            fetch_health.record_status(IG_REEL, 404)
             return True, None  # Instagram says the id doesn't exist
         logger.debug(
             "Proxy reel query id={} HTTP {}", user_id, response.status_code
@@ -425,10 +428,12 @@ class InstagramClient:
                     except Exception:
                         logger.debug("Reel query id={} returned non-JSON 200", user_id)
                         return None
+                    fetch_health.record_status(IG_REEL, 200)
                     return _parse_reel_query_user(payload)
                 if response.status_code in (401, 403):
                     # Hard block (IP/auth) — don't retry, trip the breaker.
                     self._reel_blocked_until = time.monotonic() + self._REEL_BLOCK_TTL
+                    fetch_health.record_status(IG_REEL, response.status_code)
                     logger.debug(
                         "Reel query id={} HTTP {} — blocking endpoint for {:.0f}s",
                         user_id, response.status_code, self._REEL_BLOCK_TTL,
@@ -438,6 +443,7 @@ class InstagramClient:
                 if (response.status_code == 429 or 500 <= response.status_code < 600) and attempt < 2:
                     await asyncio.sleep(random.uniform(0.3, 0.7))
                     continue
+                fetch_health.record_status(IG_REEL, response.status_code)
                 logger.debug("Reel query id={} HTTP {} — giving up", user_id, response.status_code)
                 return None
             except Exception as exc:
@@ -492,12 +498,14 @@ class InstagramClient:
                     else:
                         parsed = _parse_user(payload)
                         if parsed is None:
+                            fetch_health.record_status(IG_PROFILE, 404)
                             return ProfileFetchResult(
                                 username=username,
                                 http_status=404,
                                 raw_response=payload,
                                 error="User not found in response",
                             )
+                        fetch_health.record_status(IG_PROFILE, 200)
                         return ProfileFetchResult(
                             username=username,
                             http_status=200,
@@ -506,6 +514,7 @@ class InstagramClient:
                         )
 
                 if response.status_code == 404:
+                    fetch_health.record_status(IG_PROFILE, 404)
                     return ProfileFetchResult(
                         username=username,
                         http_status=404,
@@ -563,6 +572,9 @@ class InstagramClient:
                 )
                 await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
 
+        # Record the terminal outcome once per fetch (retries within a single
+        # fetch are one logical attempt against the endpoint).
+        fetch_health.record_status(IG_PROFILE, last_status)
         return ProfileFetchResult(
             username=username,
             http_status=last_status,

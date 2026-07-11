@@ -13,7 +13,7 @@ from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 from app.config import settings
 from app.monitor.change_detector import ChangeSet
 from app.monitor.instagram import ProfileFetchResult
-from app.utils.formatting import esc, fmt_delta, fmt_number, truncate
+from app.utils.formatting import esc, fmt_delta, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
 
 
@@ -415,6 +415,77 @@ def render_highlight_catalog_changes(
         lines.append("")
     lines.append(f"Total highlights: <b>{total}</b>")
     return "\n".join(lines).rstrip()
+
+
+# Friendly labels for the digest roll-up, keyed by NotificationLog.change_type.
+_DIGEST_LABELS: dict[str, str] = {
+    "followers_count": "followers",
+    "following_count": "following",
+    "posts_count": "posts",
+    "reels_count": "reels",
+    "story_count": "highlights",
+    "biography": "bio",
+    "full_name": "name",
+    "username": "username",
+    "is_private": "privacy",
+    "is_verified": "verification",
+    "is_business": "business",
+    "external_url": "link",
+    "profile_picture": "profile pic",
+    "follower_anomaly": "⚠️ follower jump",
+    "story_posted": "new story",
+    "going_live": "went live",
+    "highlight_catalog": "highlights updated",
+    "went_dark": "went dark",
+    "back_active": "back active",
+    "fetch_failure": "fetch failure",
+}
+# Per-sweep status noise that would swamp a digest — the "HAS STORY / NO STORY /
+# LIVE NOW" heartbeat is logged every sweep. The one-off "just posted a story"
+# (story_posted) and "just went live" (going_live) events are kept.
+_DIGEST_EXCLUDE: frozenset[str] = frozenset({"story_status"})
+
+
+def render_digest(
+    rows: list[tuple[object, str]], *, since: datetime
+) -> str:
+    """Roll up logged notifications since `since` into one per-account summary.
+
+    `rows` is [(NotificationLog, username)] as returned by crud.notifications_since.
+    Per-sweep status heartbeats are dropped; everything else is counted per
+    account and rendered newest-activity-first. Returns a short "nothing to
+    report" line when the window is empty.
+    """
+    from collections import Counter, defaultdict
+
+    per_user: dict[str, Counter] = defaultdict(Counter)
+    for note, username in rows:
+        change_type = getattr(note, "change_type", None)
+        if not change_type or change_type in _DIGEST_EXCLUDE:
+            continue
+        per_user[username][change_type] += 1
+    per_user = {u: c for u, c in per_user.items() if sum(c.values())}
+
+    since_str = fmt_timestamp(since)
+    if not per_user:
+        return f"🗞 <b>Digest</b>\nNo changes to report since {since_str}."
+
+    total_events = sum(sum(c.values()) for c in per_user.values())
+    lines = [
+        f"🗞 <b>Digest</b> — since {since_str}",
+        f"<i>{total_events} event{'s' if total_events != 1 else ''} across "
+        f"{len(per_user)} account{'s' if len(per_user) != 1 else ''}</i>",
+        "",
+    ]
+    for username in sorted(per_user, key=lambda u: -sum(per_user[u].values())):
+        counts = per_user[username]
+        parts = []
+        for change_type, n in counts.most_common():
+            label = _DIGEST_LABELS.get(change_type, change_type.replace("_", " "))
+            parts.append(f"{label}{f' ×{n}' if n > 1 else ''}")
+        total = sum(counts.values())
+        lines.append(f"• <b>@{esc(username)}</b> — {total}: {', '.join(parts)}")
+    return "\n".join(lines)
 
 
 def render_failure_message(username: str, fetch: ProfileFetchResult) -> str:

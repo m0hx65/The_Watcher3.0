@@ -6,12 +6,79 @@ caller pulls timestamps from seen_stories via crud and passes them in.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from app.utils.formatting import DAMASCUS_TZ, esc
+from app.utils.formatting import DAMASCUS_TZ, esc, fmt_number
 
 _WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+@dataclass
+class FollowerAnomaly:
+    """An unusually large follower jump between two consecutive observations."""
+
+    direction: str  # "spike" | "drop"
+    old: int
+    new: int
+    delta: int      # signed (new - old)
+    pct: float      # signed fraction, e.g. -0.12 for a 12% drop
+
+
+def classify_follower_change(
+    old: Optional[int],
+    new: Optional[int],
+    *,
+    abs_min: int,
+    pct_min: float,
+) -> Optional[FollowerAnomaly]:
+    """Flag a follower change that's large in BOTH absolute and relative terms.
+
+    Requiring both thresholds is what keeps this from crying wolf: a tiny
+    account's ±% swings are ignored because the absolute floor isn't met, and a
+    huge account's normal daily drift is ignored because the percentage floor
+    isn't met. Only a jump that's big for THIS account's size qualifies.
+
+    Returns None when disabled (either threshold ≤ 0), when there's no prior
+    baseline (old ≤ 0), or when the change is within normal range.
+    """
+    if old is None or new is None:
+        return None
+    if abs_min <= 0 or pct_min <= 0:
+        return None  # detection disabled
+    try:
+        old = int(old)
+        new = int(new)
+    except (TypeError, ValueError):
+        return None
+    if old <= 0:
+        return None  # no meaningful baseline to measure against
+    delta = new - old
+    if delta == 0:
+        return None
+    pct = delta / old
+    if abs(delta) >= abs_min and abs(pct) >= pct_min:
+        return FollowerAnomaly(
+            direction="spike" if delta > 0 else "drop",
+            old=old,
+            new=new,
+            delta=delta,
+            pct=pct,
+        )
+    return None
+
+
+def render_follower_anomaly(username: str, anomaly: FollowerAnomaly) -> str:
+    """Render a high-visibility alert for an unusual follower jump (HTML)."""
+    arrow = "📈" if anomaly.direction == "spike" else "📉"
+    verb = "gained" if anomaly.delta > 0 else "lost"
+    return (
+        f"⚠️ {arrow} <b>@{esc(username)}</b> — unusual follower {anomaly.direction}\n"
+        f"{verb} <b>{fmt_number(abs(anomaly.delta))}</b> "
+        f"({abs(anomaly.pct) * 100:.0f}%) in one check\n"
+        f"{fmt_number(anomaly.old)} → {fmt_number(anomaly.new)}"
+    )
 
 
 def compute_rhythm(

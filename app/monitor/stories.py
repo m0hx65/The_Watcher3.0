@@ -36,6 +36,7 @@ from typing import Optional
 from curl_cffi.requests import AsyncSession
 
 from app.config import settings
+from app.monitor.health import SAVEINSTA, fetch_health
 from app.utils.logger import logger
 
 _BASE = "https://saveinsta.to"
@@ -251,6 +252,7 @@ class StoriesClient:
         try:
             tokens = await self._get_tokens()
             if tokens is None:
+                fetch_health.record(SAVEINSTA, "error")
                 return ""
             k_exp, k_token = tokens
 
@@ -290,14 +292,18 @@ class StoriesClient:
             if search.status_code != 200:
                 logger.debug("saveinsta ajaxSearch HTTP {}", search.status_code)
                 self._tokens = None  # tokens may be stale — force refresh next time
+                fetch_health.record_status(SAVEINSTA, search.status_code)
                 return ""
             payload = search.json()
             if payload.get("status") != "ok":
                 logger.debug("saveinsta ajaxSearch status={}", payload.get("status"))
+                fetch_health.record(SAVEINSTA, "error")
                 return ""
+            fetch_health.record(SAVEINSTA, "ok")
             return payload.get("data", "") or ""
         except Exception as exc:
             logger.warning("saveinsta fetch failed for {}: {}", target_url, exc)
+            fetch_health.record(SAVEINSTA, "error")
             return ""
 
     def _parse_items(self, data: str, *, source: str) -> list[StoryItem]:

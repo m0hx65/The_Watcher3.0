@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.bot.notifications import (
     NotificationDispatcher,
     render_changes_message,
+    render_digest,
     render_failure_message,
     render_highlight_catalog_changes,
     render_new_stories_alert,
@@ -19,6 +21,7 @@ from app.config import settings
 from app.database import crud
 from app.database.models import AccountSnapshot, MonitoredAccount, ProfileMediaHash
 from app.database.session import get_session
+from app.monitor.analytics import classify_follower_change, render_follower_anomaly
 from app.monitor.change_detector import (
     ChangeSet,
     detect_changes,
@@ -51,6 +54,89 @@ _SWEEP_RETRY_COOLDOWN_SECONDS = 30.0
 # Fetch statuses worth a second pass: rate-limit blocks and network timeouts.
 # 404s are handled by the rename-recovery path, not by retrying.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
+
+
+class _SweepThrottle:
+    """Adaptive launch pacing + a 401 circuit breaker for one sweep.
+
+    This never touches a request — it only decides how long to wait before
+    launching the NEXT account, and whether to stop launching more. On a
+    healthy sweep it behaves exactly like the old fixed stagger.
+
+    As consecutive 401/403 blocks accumulate, the gap between launches widens
+    (soft backoff). Once `breaker_threshold` blocks happen in a row the breaker
+    opens: every not-yet-launched account is skipped and returned as a retriable
+    failure, so the existing retry pass (sequential, after a cooldown) or the
+    next sweep picks them up — instead of bursting into Instagram's rate limiter
+    and turning 4 blocks into 9.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_stagger: float,
+        max_stagger: float,
+        breaker_threshold: int,
+    ) -> None:
+        self._base = max(0.0, base_stagger)
+        self._max = max(self._base, max_stagger)
+        self._threshold = breaker_threshold  # 0 disables the breaker
+        self._extra = 0.0
+        self._consecutive_auth_fails = 0
+        self._peak_consecutive = 0
+        self._open = False
+        self._skipped = 0
+        self._lock = asyncio.Lock()
+        self._next_slot = 0.0  # monotonic time the next launch may proceed
+
+    def is_open(self) -> bool:
+        return self._open
+
+    @property
+    def tripped(self) -> bool:
+        return self._open
+
+    @property
+    def skipped(self) -> int:
+        return self._skipped
+
+    @property
+    def peak_consecutive_blocks(self) -> int:
+        return self._peak_consecutive
+
+    @property
+    def current_stagger(self) -> float:
+        return min(self._max, self._base + self._extra)
+
+    def note_skip(self) -> None:
+        self._skipped += 1
+
+    def record(self, status: Optional[int]) -> None:
+        if status in (401, 403):
+            self._consecutive_auth_fails += 1
+            self._peak_consecutive = max(
+                self._peak_consecutive, self._consecutive_auth_fails
+            )
+            # Widen the gap by one base step per consecutive block.
+            self._extra = min(self._max - self._base, self._extra + self._base)
+            if self._threshold and self._consecutive_auth_fails >= self._threshold:
+                self._open = True
+        elif status == 200:
+            self._consecutive_auth_fails = 0
+            # Relax gradually back toward the base stagger on success.
+            self._extra = max(0.0, self._extra - self._base)
+        # 404/429/0 leave pacing unchanged — they aren't the datacenter block.
+
+    async def await_slot(self) -> None:
+        """Sleep until this account's launch slot. Serialized so concurrently
+        scheduled checks don't all fire at once; the gap adapts to blocks."""
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._next_slot - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._next_slot = now + self.current_stagger + random.uniform(0.0, 0.8)
 
 
 class MonitorService:
@@ -383,13 +469,24 @@ class MonitorService:
         await self.notifier.send_text(
             f"👁 Sweep started — {len(targets)} {noun} queued."
         )
+        throttle = _SweepThrottle(
+            base_stagger=_SWEEP_STAGGER_SECONDS,
+            max_stagger=settings.sweep_stagger_max_seconds,
+            breaker_threshold=settings.sweep_breaker_threshold,
+        )
         results = await asyncio.gather(
             *(
-                self._staggered_check(i, aid, uname)
-                for i, (aid, uname) in enumerate(targets)
+                self._staggered_check(throttle, aid, uname)
+                for aid, uname in targets
             ),
             return_exceptions=True,
         )
+        if throttle.tripped:
+            logger.warning(
+                "Sweep circuit breaker tripped after {} consecutive 401/403s — "
+                "{} account(s) deferred to the retry pass / next sweep",
+                throttle.peak_consecutive_blocks, throttle.skipped,
+            )
 
         # account_id -> (fallback username, result dict). Exceptions become
         # failure dicts (flagged "crashed") so the retry pass can rewrite any
@@ -478,6 +575,12 @@ class MonitorService:
         if failed:
             names = ", ".join(f"@{u}" for u in failed_usernames)
             summary += f" {failed} failed: {names}"
+        if throttle.tripped:
+            summary += (
+                f"\n⚡ Rate-limit guard tripped after {throttle.peak_consecutive_blocks} "
+                f"blocks in a row — {throttle.skipped} account(s) deferred to avoid "
+                "making it worse. They'll retry shortly / next sweep."
+            )
         if backfill_ids:
             async with get_session() as session:
                 accounts_after = await crud.list_accounts(session, only_active=True)
@@ -619,20 +722,52 @@ class MonitorService:
         )
         return {"threshold_days": threshold_days, "accounts": report}
 
-    async def _staggered_check(
-        self, index: int, account_id: int, username: str
-    ) -> dict:
-        """Run one sweep check after a position-based delay.
+    async def compose_digest(self, since: datetime) -> tuple[str, int, int]:
+        """Build the digest text for everything logged since `since`.
 
-        Spreads the sweep's Instagram traffic over ~2s per account instead of
-        bursting everything at once — bursts are what trip Instagram's
-        anonymous rate limiter into 401s on the shared proxy egress.
+        Reads the already-stored NotificationLog (no extra tracking) and rolls it
+        up per account. Returns (text, event_count, account_count) so callers can
+        log/announce what went out.
         """
-        if index:
-            await asyncio.sleep(
-                index * _SWEEP_STAGGER_SECONDS + random.uniform(0.0, 0.8)
-            )
-        return await self._run_check(account_id, username)
+        async with get_session() as session:
+            rows = await crud.notifications_since(session, since)
+        text = render_digest(rows, since=since)
+        accounts = len({username for _, username in rows})
+        return text, len(rows), accounts
+
+    @staticmethod
+    def _breaker_skipped_result(username: str) -> dict:
+        """A deferred account looks like a retriable failure, so the existing
+        retry pass (sequential, after a cooldown) or the next sweep picks it up
+        without any special-casing downstream."""
+        return {
+            "ok": False,
+            "username": username,
+            "status": 401,
+            "error": "deferred — sweep circuit breaker open (too many 401s)",
+            "skipped": True,
+        }
+
+    async def _staggered_check(
+        self, throttle: "_SweepThrottle", account_id: int, username: str
+    ) -> dict:
+        """Run one sweep check, paced by the shared adaptive throttle.
+
+        The throttle spaces launches (widening the gap as 401s accumulate) and,
+        once the breaker is open, skips the remaining accounts so a burst never
+        snowballs — bursts are what trip Instagram's anonymous rate limiter into
+        401s on the shared proxy egress. The request itself is unchanged.
+        """
+        if throttle.is_open():
+            throttle.note_skip()
+            return self._breaker_skipped_result(username)
+        await throttle.await_slot()
+        if throttle.is_open():  # tripped while this one was waiting its turn
+            throttle.note_skip()
+            return self._breaker_skipped_result(username)
+        result = await self._run_check(account_id, username)
+        throttle.record(result.get("status"))
+        return result
 
     async def _run_check(
         self, account_id: int, username: str, *, notify_unchanged: bool = False
@@ -1115,6 +1250,38 @@ class MonitorService:
                     message=text,
                     delivered=delivered,
                 )
+
+        # Follower anomaly: when the follower change is unusually large for this
+        # account's size, send a separate high-visibility alert and log it under
+        # its own change_type (so it stands out in /history and the digest).
+        follower_change = changeset.find("followers_count")
+        if follower_change is not None:
+            anomaly = classify_follower_change(
+                follower_change.old,
+                follower_change.new,
+                abs_min=settings.follower_anomaly_abs_min,
+                pct_min=settings.follower_anomaly_pct_min,
+            )
+            if anomaly is not None:
+                alert = render_follower_anomaly(username, anomaly)
+                a_delivered = await self.notifier.send_text(
+                    alert, message_thread_id=thread_id
+                )
+                async with get_session() as session:
+                    await crud.log_notification(
+                        session,
+                        account_id=account_id,
+                        change_type="follower_anomaly",
+                        payload={
+                            "direction": anomaly.direction,
+                            "old": anomaly.old,
+                            "new": anomaly.new,
+                            "delta": anomaly.delta,
+                            "pct": round(anomaly.pct, 4),
+                        },
+                        message=alert,
+                        delivered=a_delivered,
+                    )
 
         # Profile picture sent as a document to preserve full quality
         if changeset.profile_pic_changed and new_pic_path is not None:

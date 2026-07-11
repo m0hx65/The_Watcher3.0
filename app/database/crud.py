@@ -285,6 +285,24 @@ async def recent_notifications(
     return list(result.scalars().all())
 
 
+async def notifications_since(
+    session: AsyncSession, since: datetime
+) -> List[tuple[NotificationLog, str]]:
+    """Every logged notification since `since`, paired with its account username.
+
+    Powers the digest — one indexed range scan joined to the account, instead of
+    N per-account queries. Ordered newest-first within the window.
+    """
+    stmt = (
+        select(NotificationLog, MonitoredAccount.username)
+        .join(MonitoredAccount, MonitoredAccount.id == NotificationLog.account_id)
+        .where(NotificationLog.created_at >= since)
+        .order_by(desc(NotificationLog.created_at))
+    )
+    result = await session.execute(stmt)
+    return [(row[0], row[1]) for row in result.all()]
+
+
 async def stats_summary(session: AsyncSession) -> dict[str, Any]:
     total = (
         await session.execute(select(func.count()).select_from(MonitoredAccount))
