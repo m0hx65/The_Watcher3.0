@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     notification_retention_days: int = Field(default=90, alias="NOTIFICATION_RETENTION_DAYS")
     # raw_response JSONB is nulled after this many days even when the row is kept
     raw_response_retention_days: int = Field(default=7, alias="RAW_RESPONSE_RETENTION_DAYS")
+    # Downloaded story/post media files older than this are deleted by the
+    # daily cleanup — they were already delivered to Telegram, and an on-demand
+    # request just re-downloads them. 0 keeps every file forever.
+    media_retention_days: int = Field(default=14, alias="MEDIA_RETENTION_DAYS")
 
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

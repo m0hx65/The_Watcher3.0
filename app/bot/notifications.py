@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Union
 
-from telegram import Bot
+from telegram import Bot, InputFile
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 
@@ -45,7 +45,13 @@ class NotificationDispatcher:
         self.chat_id = chat_id
         # Extra chats that receive a flat copy of every message (no topics).
         self.mirror_chat_ids: list[Union[int, str]] = list(mirror_chat_ids or [])
-        self._send_lock = asyncio.Lock()
+        # Two locks, not one: sends of the same kind stay serialized (Telegram
+        # rate-limit protection + stable ordering), but a text message must
+        # never queue behind a media upload — a big story video can hold the
+        # connection for minutes (write_timeout 180s), and with a single lock
+        # every sweep alert and status message in the app froze behind it.
+        self._text_lock = asyncio.Lock()
+        self._upload_lock = asyncio.Lock()
         self.post_send_hook: Optional[Callable[[], Awaitable[None]]] = None
 
     def _targets(
@@ -104,6 +110,25 @@ class NotificationDispatcher:
             await self.post_send_hook()
         return delivered_primary
 
+    async def _load_media(self, path: Path) -> Optional[InputFile]:
+        """Read a media file into an InputFile, off the event loop.
+
+        Pre-materializing the bytes fixes two things at once:
+          * A story video can be tens of MB — PTB would otherwise read it
+            synchronously ON the event loop when the send is awaited, freezing
+            every handler and download for the duration of the read.
+          * The old closed-handle bug class (a `with open(...)` whose handle
+            died before the await) is impossible: there is no handle at all,
+            and mirrors/retries reuse the same bytes instead of re-reading.
+        Returns None (logged) when the file can't be read.
+        """
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            logger.error("Could not read media file {}: {}", path, exc)
+            return None
+        return InputFile(data, filename=path.name)
+
     async def send_photo(
         self,
         path: Path,
@@ -111,15 +136,14 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
+        media = await self._load_media(path)
+        if media is None:
+            return False
+
         def _send(chat, thread):
-            # Pass the path itself — python-telegram-bot reads the file when the
-            # coroutine is awaited. Opening a handle here and returning the
-            # coroutine would close the file (end of `with`) BEFORE the await in
-            # _send_with_retry, raising "read of closed file" and silently
-            # dropping every upload.
             return self.bot.send_photo(
                 chat_id=chat,
-                photo=path,
+                photo=media,
                 caption=caption or "",
                 parse_mode=ParseMode.HTML,
                 message_thread_id=thread,
@@ -138,12 +162,14 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
+        media = await self._load_media(path)
+        if media is None:
+            return False
+
         def _send(chat, thread):
-            # See send_photo: pass the path so PTB reads it at await time. A
-            # `with open(...)` here closes the handle before the await.
             return self.bot.send_document(
                 chat_id=chat,
-                document=path,
+                document=media,
                 caption=caption or "",
                 parse_mode=ParseMode.HTML,
                 message_thread_id=thread,
@@ -159,12 +185,14 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
+        media = await self._load_media(path)
+        if media is None:
+            return False
+
         def _send(chat, thread):
-            # See send_photo: pass the path so PTB reads it at await time. A
-            # `with open(...)` here closes the handle before the await.
             return self.bot.send_video(
                 chat_id=chat,
-                video=path,
+                video=media,
                 caption=caption or "",
                 parse_mode=ParseMode.HTML,
                 supports_streaming=True,
@@ -202,10 +230,12 @@ class NotificationDispatcher:
         # `action(chat_id, thread)` — thread can be cleared mid-flight if
         # Telegram reports the topic gone (handled in the BadRequest branch).
         thread = message_thread_id
+        # Texts and uploads serialize independently — see __init__.
+        lock = self._upload_lock if is_upload else self._text_lock
 
         for attempt in range(1, 5):
             delay: float = 0.0
-            async with self._send_lock:
+            async with lock:
                 try:
                     result = action(chat_id, thread)
                     if asyncio.iscoroutine(result):

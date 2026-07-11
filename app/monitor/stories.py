@@ -22,6 +22,7 @@ graphql story/live status + highlight-name detection stays the reliable signal.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -204,7 +205,9 @@ class StoriesClient:
                     username, item.pk, resp.status_code,
                 )
                 return None
-            dest.write_bytes(resp.content)
+            # Story videos run to tens of MB — write off the event loop so a
+            # bulk download never freezes the bot's handlers mid-write.
+            await asyncio.to_thread(dest.write_bytes, resp.content)
             return dest
         except Exception as exc:
             logger.warning(

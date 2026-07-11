@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import re
@@ -268,22 +269,31 @@ class MediaHasher:
             )
             return None
 
-        digest = hashlib.sha256(response.content).hexdigest()
+        content = response.content
         ext = _ext_from_content_type(response.headers.get("Content-Type", "")) or ".jpg"
-
         account_dir = settings.media_path / username
-        account_dir.mkdir(parents=True, exist_ok=True)
-        path = account_dir / f"{digest}{ext}"
-        if not path.exists():
-            path.write_bytes(response.content)
+
+        def _persist() -> tuple[str, Path, Optional[str]]:
+            # SHA256 + disk write + PIL decode/resize/hash are all CPU/disk
+            # bound — run them in a worker thread so a sweep hashing dozens of
+            # avatars never stalls the event loop (and with it every Telegram
+            # handler and in-flight download).
+            digest = hashlib.sha256(content).hexdigest()
+            account_dir.mkdir(parents=True, exist_ok=True)
+            path = account_dir / f"{digest}{ext}"
+            if not path.exists():
+                path.write_bytes(content)
+            return digest, path, perceptual_hash(content)
+
+        digest, path, phash = await asyncio.to_thread(_persist)
 
         return HashedMedia(
             sha256=digest,
-            byte_size=len(response.content),
+            byte_size=len(content),
             content_type=response.headers.get("Content-Type"),
             local_path=path,
             source_url=url,
-            phash=perceptual_hash(response.content),
+            phash=phash,
         )
 
 

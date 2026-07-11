@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -31,6 +33,51 @@ MAX_INTERVAL = 86_400
 
 def _stakeout_job_id(account_id: int) -> str:
     return f"stakeout:{account_id}"
+
+
+def _unlink_files(paths: list[str]) -> int:
+    """Best-effort delete of a list of files. Runs in a worker thread."""
+    removed = 0
+    for p in paths:
+        try:
+            target = Path(p)
+            if target.is_file():
+                target.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _purge_story_files(root: Path, older_than_days: int) -> tuple[int, int]:
+    """Delete downloaded story/post media older than the cutoff (by mtime).
+
+    Only touches the per-account `stories/` directories — avatar files in the
+    account root are governed by the profile_media_hashes ledger instead.
+    Deleting is safe: every file here was already delivered to Telegram, and
+    an on-demand request simply re-downloads. Runs in a worker thread.
+    Returns (files_deleted, bytes_freed).
+    """
+    cutoff = time.time() - older_than_days * 86_400
+    files = 0
+    freed = 0
+    for stories_dir in root.glob("*/stories"):
+        try:
+            entries = list(stories_dir.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            try:
+                if not f.is_file():
+                    continue
+                st = f.stat()
+                if st.st_mtime < cutoff:
+                    f.unlink()
+                    files += 1
+                    freed += st.st_size
+            except OSError:
+                continue
+    return files, freed
 
 
 async def load_persisted_interval() -> int:
@@ -372,7 +419,8 @@ class WatcherScheduler:
         snap_days = settings.snapshot_retention_days
         notif_days = settings.notification_retention_days
         raw_days = settings.raw_response_retention_days
-        if snap_days == 0 and notif_days == 0 and raw_days == 0:
+        media_days = settings.media_retention_days
+        if snap_days == 0 and notif_days == 0 and raw_days == 0 and media_days == 0:
             return
         try:
             async with get_session() as session:
@@ -382,11 +430,28 @@ class WatcherScheduler:
                     notification_days=notif_days,
                     raw_response_days=raw_days,
                 )
+                # Trim the avatar dedup ledger (a new re-encode lands almost
+                # every sweep, so rows + files grow per account forever without
+                # this). Files are unlinked only after the delete commits.
+                stale_avatar_paths = await crud.purge_old_media_hashes(session)
+            avatars_removed = await asyncio.to_thread(
+                _unlink_files, stale_avatar_paths
+            )
+            story_files, story_bytes = 0, 0
+            if media_days > 0:
+                story_files, story_bytes = await asyncio.to_thread(
+                    _purge_story_files, settings.media_path, media_days
+                )
             logger.info(
-                "Daily cleanup done — snapshots deleted={} raw_responses_nulled={} notifications deleted={}",
+                "Daily cleanup done — snapshots deleted={} raw_responses_nulled={} "
+                "notifications deleted={} avatar files removed={} "
+                "story/post files removed={} ({} KB freed)",
                 totals["snapshots_deleted"],
                 totals["raw_responses_nulled"],
                 totals["notifications_deleted"],
+                avatars_removed,
+                story_files,
+                story_bytes // 1024,
             )
         except Exception as exc:
             logger.exception("Cleanup job crashed: {}", exc)

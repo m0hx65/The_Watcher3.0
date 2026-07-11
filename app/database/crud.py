@@ -220,7 +220,9 @@ async def latest_media_hash(
     stmt = (
         select(ProfileMediaHash)
         .where(ProfileMediaHash.account_id == account_id)
-        .order_by(desc(ProfileMediaHash.created_at))
+        # id tiebreaker: created_at can collide (same-second inserts), and an
+        # arbitrary winner would serve a stale avatar (see get_latest_snapshot).
+        .order_by(desc(ProfileMediaHash.created_at), desc(ProfileMediaHash.id))
         .limit(1)
     )
     result = await session.execute(stmt)
@@ -641,7 +643,8 @@ async def purge_old_data(
     - raw_response is NULLed on snapshots older than raw_response_days even when
       the row itself is kept — this is the biggest space saver.
     - notification_logs older than notification_days are deleted.
-    - profile_media_hashes are never purged (sparse table, serves dedup).
+    - profile_media_hashes are trimmed separately by purge_old_media_hashes
+      (the CDN's per-fetch re-encodes make that table grow every sweep).
 
     Pass 0 for any threshold to skip that step.
     Returns counts of affected rows.
@@ -694,6 +697,51 @@ async def purge_old_data(
         totals["notifications_deleted"] = result.rowcount
 
     return totals
+
+
+async def purge_old_media_hashes(
+    session: AsyncSession, keep_per_account: int = 25
+) -> list[str]:
+    """Trim profile_media_hashes to the newest keep_per_account rows per account.
+
+    The CDN serves byte-different re-encodes of the same avatar on almost every
+    signed URL, so without a cap this table — and its file per row on disk —
+    grows on every sweep, per account, forever. The newest rows are kept so
+    /photo (latest_media_hash) and recent-re-encode dedup keep working.
+
+    Returns the local_path of every deleted row so the caller can remove the
+    files from disk AFTER the transaction commits.
+    """
+    result = await session.execute(
+        select(
+            ProfileMediaHash.id,
+            ProfileMediaHash.account_id,
+            ProfileMediaHash.local_path,
+        ).order_by(
+            ProfileMediaHash.account_id,
+            desc(ProfileMediaHash.created_at),
+            desc(ProfileMediaHash.id),
+        )
+    )
+    doomed_ids: list[int] = []
+    doomed_paths: list[str] = []
+    kept = 0
+    current_account: Optional[int] = None
+    for row_id, account_id, local_path in result.all():
+        if account_id != current_account:
+            current_account = account_id
+            kept = 0
+        kept += 1
+        if kept > keep_per_account:
+            doomed_ids.append(row_id)
+            if local_path:
+                doomed_paths.append(local_path)
+
+    if doomed_ids:
+        await session.execute(
+            delete(ProfileMediaHash).where(ProfileMediaHash.id.in_(doomed_ids))
+        )
+    return doomed_paths
 
 
 async def clear_history(session: AsyncSession) -> dict[str, int]:
