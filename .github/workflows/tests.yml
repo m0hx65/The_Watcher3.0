@@ -5,9 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: this workflow only checks out the repo and runs tests — it
+# never writes to the repo, so the GITHUB_TOKEN gets read-only content access.
+permissions:
+  contents: read
+
 jobs:
   offline-suites:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
