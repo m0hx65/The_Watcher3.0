@@ -148,14 +148,14 @@ async def get_latest_snapshot(
     return result.scalar_one_or_none()
 
 
-async def get_latest_pic_hash(
+async def get_latest_pic_baseline(
     session: AsyncSession, account_id: int
-) -> Optional[str]:
-    """Just the newest successful snapshot's profile_pic_hash — one indexed
-    scalar read, for the pic-change confirmation pass that runs before the
-    full snapshot is loaded."""
+) -> tuple[Optional[str], Optional[str]]:
+    """The newest successful snapshot's (profile_pic_hash, profile_pic_url) —
+    one indexed two-column read, for the pic-change confirmation pass that
+    runs before the full snapshot is loaded."""
     stmt = (
-        select(AccountSnapshot.profile_pic_hash)
+        select(AccountSnapshot.profile_pic_hash, AccountSnapshot.profile_pic_url)
         .where(
             AccountSnapshot.account_id == account_id,
             AccountSnapshot.http_status == 200,
@@ -164,7 +164,8 @@ async def get_latest_pic_hash(
         .limit(1)
     )
     result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    row = result.first()
+    return (row[0], row[1]) if row else (None, None)
 
 
 async def insert_snapshot(

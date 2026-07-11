@@ -824,6 +824,28 @@ class MonitorService:
         if pic_url:
             hashed = await self.hasher.hash_url(pic_url, username)
 
+        # The direct CDN download can fail (datacenter egress gets blocked) or
+        # return an unhashable payload; without a fingerprint the pic check
+        # silently skips the whole sweep. Fall back to saveinsta's login-free
+        # HD avatar so the check still runs this sweep instead of never.
+        if (hashed is None or hashed.phash is None) and pic_url and self.stories is not None:
+            try:
+                fallback_url = await self.stories.fetch_profile_pic_url(username)
+            except Exception as exc:  # pragma: no cover - network failure path
+                fallback_url = None
+                logger.debug(
+                    "Fallback avatar URL lookup failed for @{}: {}", username, exc
+                )
+            if fallback_url:
+                fallback = await self.hasher.hash_url(fallback_url, username)
+                if fallback is not None and fallback.phash:
+                    hashed = fallback
+                    logger.info(
+                        "Fingerprinted @{}'s avatar via the saveinsta fallback "
+                        "(direct CDN download failed)",
+                        username,
+                    )
+
         # Change detection runs on the PERCEPTUAL hash, not sha256: the CDN
         # serves byte-different re-encodes of the same avatar on every signed
         # URL, so sha256 flip-flops each sweep and raised a false "profile
@@ -840,16 +862,27 @@ class MonitorService:
         # suppressed; a real change that got suppressed re-confirms and alerts
         # on the very next sweep, so nothing is ever lost — only delayed past
         # the glitch. Costs one extra CDN download only when a change is
-        # tentatively detected, i.e. almost never.
-        if new_pic_hash and pic_url:
+        # tentatively detected, i.e. almost never. The stored/current avatar
+        # URLs ride along so the asset-id signal (see _pic_changed) applies to
+        # the tentative and confirmation comparisons alike.
+        web_pic_url = parsed.get("profile_pic_url")
+        if new_pic_hash and hashed is not None:
             async with get_session() as session:
-                baseline_hash = await crud.get_latest_pic_hash(session, account_id)
-            if baseline_hash and pic_fingerprints_differ(baseline_hash, new_pic_hash):
-                second = await self.hasher.hash_url(pic_url, username)
+                baseline_hash, baseline_url = await crud.get_latest_pic_baseline(
+                    session, account_id
+                )
+            if baseline_hash and pic_fingerprints_differ(
+                baseline_hash, new_pic_hash,
+                old_url=baseline_url, new_url=web_pic_url,
+            ):
+                second = await self.hasher.hash_url(hashed.source_url, username)
                 second_hash = second.phash if second else None
                 confirmed = bool(
                     second_hash
-                    and pic_fingerprints_differ(baseline_hash, second_hash)
+                    and pic_fingerprints_differ(
+                        baseline_hash, second_hash,
+                        old_url=baseline_url, new_url=web_pic_url,
+                    )
                     and not pic_fingerprints_differ(new_pic_hash, second_hash)
                 )
                 if confirmed:
@@ -911,12 +944,21 @@ class MonitorService:
         async with get_session() as session:
             previous = await crud.get_latest_snapshot(session, account_id)
 
-            # If this fetch couldn't be perceptually hashed (rare non-image
-            # payload), carry the last known hash forward instead of nulling the
-            # baseline — losing it would make the next good fetch look like a
-            # first observation and skip the legitimate change alert.
+            # If this fetch produced no usable fingerprint (download failed,
+            # non-image payload, or the confirmation pass suppressed a
+            # tentative change), carry the last known hash AND its URL forward
+            # instead of nulling/overwriting the baseline. Losing the hash
+            # would make the next good fetch look like a first observation and
+            # skip the legitimate change alert; absorbing the new URL without
+            # a verified fingerprint would swallow a new upload's asset id and
+            # permanently hide the change from the URL-identity signal.
             stored_pic_hash = new_pic_hash or (
                 previous.profile_pic_hash if previous else None
+            )
+            stored_pic_url = (
+                web_pic_url
+                if new_pic_hash or previous is None
+                else previous.profile_pic_url
             )
 
             snapshot = AccountSnapshot(
@@ -932,7 +974,7 @@ class MonitorService:
                 is_private=parsed.get("is_private"),
                 is_verified=parsed.get("is_verified"),
                 is_business=parsed.get("is_business"),
-                profile_pic_url=parsed.get("profile_pic_url"),
+                profile_pic_url=stored_pic_url,
                 profile_pic_hash=stored_pic_hash,
                 external_url=parsed.get("external_url"),
                 http_status=200,
@@ -951,7 +993,7 @@ class MonitorService:
                 # both bloated the row and wiped the stored story/highlight
                 # state. The slim form keeps reel_data current instead.
                 previous.raw_response = slim_raw or None
-                previous.profile_pic_url = parsed.get("profile_pic_url")
+                previous.profile_pic_url = stored_pic_url
                 previous.profile_pic_hash = stored_pic_hash
                 previous.error = None
                 logger.debug(

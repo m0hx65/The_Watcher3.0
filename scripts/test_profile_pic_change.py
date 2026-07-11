@@ -66,6 +66,7 @@ from app.monitor.media_hasher import (  # noqa: E402
     HashedMedia,
     PHASH_PREFIX,
     perceptual_hash,
+    pic_asset_id,
 )
 from app.bot.notifications import NotificationDispatcher  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402
@@ -214,10 +215,80 @@ def test_perceptual_hash() -> None:
            _pic_changed(red1, blue), f"dist={_dist(red1, blue)}")
 
 
+# ---------- Part A1b: the URL asset-id signal ----------
+# Instagram avatar URLs carry a numeric asset id in the basename that changes
+# ONLY on a new upload; the signed params / CDN shard / size variant rotate per
+# fetch. When the id changed, reduced perceptual floors apply so subtle real
+# swaps are caught — while an id rotation with an unchanged picture stays quiet.
+
+URL_A = (
+    "https://scontent-mad1-1.cdninstagram.com/v/t51.2885-19/s320x320/"
+    "111111111_2222222222222222_3333333333333333333_n.jpg"
+    "?stp=dst-jpg_e0_s320x320&_nc_ht=scontent.cdninstagram.com&oh=aaa&oe=111"
+)
+# SAME asset id as URL_A: different shard, size variant, size-class letter, and
+# signature — everything that rotates without the picture changing.
+URL_A_ROTATED = (
+    "https://scontent-lhr8-1.cdninstagram.com/v/t51.2885-19/s150x150/"
+    "111111111_2222222222222222_3333333333333333333_s.jpg"
+    "?stp=dst-jpg_e0_s150x150&_nc_ht=other.cdninstagram.com&oh=bbb&oe=222"
+)
+URL_B = (
+    "https://scontent-mad1-1.cdninstagram.com/v/t51.2885-19/s320x320/"
+    "444444444_5555555555555555_6666666666666666666_n.jpg"
+    "?stp=dst-jpg_e0_s320x320&_nc_ht=scontent.cdninstagram.com&oh=ccc&oe=333"
+)
+
+
+def _fp(dhash: int = 0, ahash: int = 0, mean: int = 0x80) -> str:
+    """Craft a v2 fingerprint with exact bit distances from _fp() (all-zero)."""
+    return f"{PHASH_PREFIX}{dhash:064x}:{ahash:064x}:{mean:02x}"
+
+
+def test_url_asset_id() -> None:
+    expect("asset id parses from a CDN avatar URL",
+           pic_asset_id(URL_A) == "111111111_2222222222222222_3333333333333333333",
+           repr(pic_asset_id(URL_A)))
+    expect("asset id survives shard/size/signature rotation",
+           pic_asset_id(URL_A) == pic_asset_id(URL_A_ROTATED))
+    expect("different upload yields a different asset id",
+           pic_asset_id(URL_B) != pic_asset_id(URL_A))
+    expect("non-CDN URL yields None (signal disabled, not faked)",
+           pic_asset_id("https://saveinsta.to/dl?token=eyJ0eXAi") is None)
+    expect("None URL yields None", pic_asset_id(None) is None)
+    expect("CDN URL without a numeric basename yields None",
+           pic_asset_id("https://scontent.cdninstagram.com/v/t51/avatar.jpg") is None)
+
+    # dd=30/ad=5/Δmean=2: real-but-subtle territory — under every strong floor,
+    # over the reduced dHash floor.
+    base = _fp()
+    subtle = _fp(dhash=(1 << 30) - 1, ahash=(1 << 5) - 1, mean=0x82)
+    # dd=20/ad=2/Δmean=3: same-picture re-encode territory — under the reduced
+    # floors too (a re-upload/migration of the SAME picture must stay quiet).
+    reupload = _fp(dhash=(1 << 20) - 1, ahash=(1 << 2) - 1, mean=0x83)
+    # Only the brightness moved past re-encode jitter.
+    dimmed = _fp(mean=0x88)
+
+    expect("subtle diff WITHOUT url evidence is NOT a change",
+           not _pic_changed(base, subtle))
+    expect("subtle diff with the SAME asset id is NOT a change",
+           not _pic_changed(base, subtle, old_url=URL_A, new_url=URL_A_ROTATED))
+    expect("subtle diff with a NEW asset id IS a change",
+           _pic_changed(base, subtle, old_url=URL_A, new_url=URL_B))
+    expect("new asset id but identical-reading image is NOT a change",
+           not _pic_changed(base, reupload, old_url=URL_A, new_url=URL_B))
+    expect("new asset id + subtle brightness shift IS a change",
+           _pic_changed(base, dimmed, old_url=URL_A, new_url=URL_B))
+    expect("subtle brightness shift alone is NOT a change",
+           not _pic_changed(base, dimmed))
+
+
 # ---------- Part A2: detect_changes uses the perceptual comparison ----------
 
-def _snap(phash):
-    return AccountSnapshot(account_id=1, username="t", profile_pic_hash=phash)
+def _snap(phash, url=None):
+    return AccountSnapshot(
+        account_id=1, username="t", profile_pic_hash=phash, profile_pic_url=url
+    )
 
 
 def test_detect_changes() -> None:
@@ -250,6 +321,20 @@ def test_detect_changes() -> None:
     cs = detect_changes(_snap(None), _snap(a), new_pic_hash=a)
     expect("first observation is a silent baseline",
            cs.profile_pic_changed is False and cs.new_pic_hash == a)
+
+    # The URL asset-id signal flows through detect_changes via the snapshots.
+    base = _fp()
+    subtle = _fp(dhash=(1 << 30) - 1, ahash=(1 << 5) - 1, mean=0x82)
+    cs = detect_changes(
+        _snap(base, URL_A), _snap(subtle, URL_B), new_pic_hash=subtle
+    )
+    expect("subtle swap with a new asset id IS a change via detect_changes",
+           cs.profile_pic_changed is True)
+    cs = detect_changes(
+        _snap(base, URL_A), _snap(subtle, URL_A_ROTATED), new_pic_hash=subtle
+    )
+    expect("same subtle diff with a rotated-only URL is NOT a change",
+           cs.profile_pic_changed is False)
 
 
 # ---------- Part B: notifier media senders survive the await ----------
@@ -315,16 +400,20 @@ class FakeInstagram:
 
 
 class SeqHasher:
-    """Returns a scripted HashedMedia per hash_url call (one per sweep)."""
+    """Returns a scripted HashedMedia per hash_url call (one per sweep).
 
-    def __init__(self, phashes: list[str], path: Path) -> None:
+    A scripted None simulates a failed download (hash_url returns None)."""
+
+    def __init__(self, phashes: list, path: Path) -> None:
         self._phashes = phashes
         self._path = path
         self.i = 0
 
-    async def hash_url(self, url: str, username: str) -> HashedMedia:
+    async def hash_url(self, url: str, username: str):
         phash = self._phashes[self.i]
         self.i += 1
+        if phash is None:
+            return None
         # sha256 differs every sweep (mimics the CDN re-encode) to prove change
         # detection ignores it and keys off phash instead.
         return HashedMedia(
@@ -496,15 +585,104 @@ async def test_confirmation_recheck() -> None:
         )
 
 
+# ---------- Part E: the URL-identity signal across sweeps --------------------
+# A new avatar upload changes the URL's asset id. Even when the pic DOWNLOAD
+# fails that sweep (blocked CDN egress), the stored baseline URL must NOT
+# absorb the new id — the change stays pending and fires on the next sweep
+# that manages to fingerprint the picture, even a change too subtle for the
+# strong perceptual floors.
+
+async def test_url_signal_sweep() -> None:
+    parsed = {
+        "username": "urlcase", "full_name": "U", "biography": "",
+        "followers_count": 10, "following_count": 5, "posts_count": 0,
+        "reels_count": 0, "story_count": 0, "is_private": True,
+        "is_verified": False, "is_business": False,
+        "profile_pic_url": URL_A, "external_url": None,
+        "instagram_id": "2000",
+    }
+    async with get_session() as session:
+        session.add(MonitoredAccount(username="urlcase", active=True))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pic = Path(tmp) / "pic.jpg"
+        pic.write_bytes(b"\xff\xd8\xfffake")
+
+        base = _fp()
+        # Subtle real swap: under every strong floor, over the reduced floors.
+        subtle = _fp(dhash=(1 << 30) - 1, ahash=(1 << 5) - 1, mean=0x82)
+        # sweep1: baseline. sweep2: download FAILS while IG already serves the
+        # new URL. sweep3: fingerprint lands (tentative + confirmation).
+        hasher = SeqHasher([base, None, subtle, subtle], pic)
+
+        notifier = AsyncMock()
+        notifier.send_text = AsyncMock(return_value=True)
+        notifier.send_document = AsyncMock(return_value=True)
+        notifier.create_forum_topic = AsyncMock(return_value=None)
+
+        service = MonitorService(
+            instagram=FakeInstagram(parsed), hasher=hasher,
+            notifier=notifier, stories=None,
+        )
+
+        r1 = await service.check_username("urlcase")
+        expect("url sweep1 baselines", r1.get("first_seen") is True, repr(r1))
+
+        # Instagram now serves the NEW upload's URL…
+        parsed["profile_pic_url"] = URL_B
+        # …but the download fails this sweep.
+        r2 = await service.check_username("urlcase")
+        expect("failed download reports no change", r2.get("changed") is False, repr(r2))
+        from sqlalchemy import select
+        async with get_session() as session:
+            snaps = (await session.execute(
+                select(AccountSnapshot)
+                .where(AccountSnapshot.username == "urlcase")
+                .order_by(AccountSnapshot.id)
+            )).scalars().all()
+        expect(
+            "failed download does NOT absorb the new URL into the baseline",
+            snaps[-1].profile_pic_url == URL_A,
+            repr(snaps[-1].profile_pic_url),
+        )
+        expect("failed download keeps the baseline hash",
+               snaps[-1].profile_pic_hash == base)
+
+        r3 = await service.check_username("urlcase")
+        expect(
+            "subtle swap fires once the new upload is fingerprinted",
+            r3.get("changed") is True, repr(r3),
+        )
+        expect(
+            "url-signal change sends the photo exactly once",
+            notifier.send_document.call_count == 1,
+            f"send_document called {notifier.send_document.call_count}x",
+        )
+        expect("url-signal change consumed the confirmation download",
+               hasher.i == 4, f"hash_url called {hasher.i}x")
+        async with get_session() as session:
+            snaps = (await session.execute(
+                select(AccountSnapshot)
+                .where(AccountSnapshot.username == "urlcase")
+                .order_by(AccountSnapshot.id)
+            )).scalars().all()
+        expect("baseline advances to the new fingerprint after the alert",
+               snaps[-1].profile_pic_hash == subtle)
+        expect("baseline advances to the new URL after the alert",
+               snaps[-1].profile_pic_url == URL_B)
+
+
 async def main() -> int:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     test_perceptual_hash()
+    test_url_asset_id()
     test_detect_changes()
     await test_media_send_file_lifecycle()
     await test_full_sweep()
     await test_confirmation_recheck()
+    await test_url_signal_sweep()
 
     print()
     if FAILURES:

@@ -55,6 +55,31 @@ class HashedMedia:
     phash: Optional[str] = None
 
 
+# Leading numeric core of an avatar basename, e.g.
+# "463908845_1234567890123456_987654321_n.jpg" -> "463908845_1234567890123456_987654321".
+# The trailing size-class letter and extension are excluded — they can vary per
+# CDN variant of the same upload.
+_ASSET_ID_RE = re.compile(r"^(\d+(?:_\d+)+)")
+
+
+def pic_asset_id(url: Optional[str]) -> Optional[str]:
+    """Stable identity of an Instagram avatar URL, or None when unknowable.
+
+    The basename of a t51.*-19 avatar URL carries the numeric id of the avatar
+    UPLOAD. The signed query params, the CDN shard host, and the size variant
+    all rotate per fetch, but this numeric core only changes when the user
+    actually sets a new picture — so comparing it across sweeps is an exact
+    "did they upload a new avatar" signal that no perceptual threshold can
+    miss. Non-CDN URLs (e.g. a saveinsta JWT href) yield None, which disables
+    the signal for that comparison rather than faking a change.
+    """
+    if not url or ("fbcdn.net" not in url and "cdninstagram.com" not in url):
+        return None
+    basename = urlparse(url).path.rsplit("/", 1)[-1]
+    m = _ASSET_ID_RE.match(basename)
+    return m.group(1) if m else None
+
+
 def _strip_cdn_size(url: str) -> Optional[str]:
     """Return a size-constraint-free CDN URL, or None if no modification was made.
 
