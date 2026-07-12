@@ -156,7 +156,7 @@ def _totals(data: dict[str, list[dict]]) -> str:
 
 async def main_async(args: argparse.Namespace) -> int:
     if args.dump_json and args.source:
-        print(f"Reading from source database…")
+        print("Reading from source database…")
         data = await _read_all(args.source)
         Path(args.dump_json).write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"

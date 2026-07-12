@@ -317,8 +317,9 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `/darkradar` | List monitored accounts ranked by how long they've been silent |
 | `/synctopics` | Create a forum topic per account (needs `TELEGRAM_FORUM_TOPICS=true` + a Topics group) |
 | `/interval [value]` | Show or set the sweep interval — `30m`, `1h`, `1800s`, `1h30m`. No argument shows presets |
-| `/status` | Global stats: accounts, last sweep, next scheduled sweep, active stakeouts |
+| `/status` | Global stats: accounts (+ paused / needs-attention), last & next sweep, digest mode, gone-dark count, active guards, and last-hour fetch health |
 | `/history <user>` | Recent detected changes for a target |
+| `/digest [off\|daily\|weekly]` | Show/preview or set the daily or weekly roll-up of all changes (no argument previews the recent window) |
 | `/photo <user>` | Latest stored profile picture and its SHA-256 hash |
 | `/fetchphoto <user>` | Download the current profile picture in max quality — works for any public account |
 | `/story <user>` | Download any public user's **current story** — no monitoring required |

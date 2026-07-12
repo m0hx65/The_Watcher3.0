@@ -135,9 +135,8 @@ async def test_bulk_add_flags_invalid() -> None:
     service = make_service()
     update = make_update()
     context = make_context(service)
-    tokens = ["good_user", "not a valid !!", "also$bad"]
-    # _split already happened upstream; here we pass raw-ish tokens. The two bad
-    # ones fail _parse_add_target and must be reported, not added.
+    # _split already happened upstream; here we pass raw-ish tokens. The bad one
+    # fails _parse_add_target and must be reported, not added.
     await handlers._do_add_bulk(update, context, ["good_user", "also$bad"])
     await asyncio.sleep(0.05)
     async with get_session() as session:

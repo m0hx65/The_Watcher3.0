@@ -24,9 +24,10 @@ CHROME_IMPERSONATE = "chrome120"
 # apart from a legacy raw-SHA256 hash OR the old 64-bit "p:" dHash and treat the
 # format switch as a silent baseline rather than a spurious "changed".
 #
-# The v2 fingerprint is "p2:<dhash>:<ahash>" — two independent 256-bit perceptual
-# hashes of the SAME normalized image (see perceptual_hash). Two hashes that must
-# BOTH agree before a change is reported makes the decision noise-proof.
+# The v2 fingerprint is "p2:<dhash>:<ahash>:<mean>" — two independent 256-bit
+# perceptual hashes plus the brightness mean of the SAME normalized image (see
+# perceptual_hash). Change detection weighs all three complementary signals so a
+# single noisy one can never raise a false alarm (see change_detector).
 PHASH_PREFIX = "p2:"
 
 # Side of the perceptual-hash grid. 16 → 16*16 = 256 bits per hash. Much finer

@@ -11,7 +11,6 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from telegram import Bot
 from telegram.ext import Application as TgApplication
 
 from app.api.routes import router as api_router

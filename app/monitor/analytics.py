@@ -7,7 +7,7 @@ caller pulls timestamps from seen_stories via crud and passes them in.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.utils.formatting import DAMASCUS_TZ, esc, fmt_number

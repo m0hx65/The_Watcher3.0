@@ -17,7 +17,7 @@ from app.config import settings
 from app.database import crud
 from app.database.session import get_session
 from app.monitor.service import MonitorService
-from app.utils.formatting import esc, fmt_timestamp
+from app.utils.formatting import esc
 from app.utils.logger import logger
 
 SWEEP_JOB_ID = "watcher-sweep"

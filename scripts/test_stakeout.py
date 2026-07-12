@@ -25,7 +25,7 @@ os.environ["STAKEOUT_MIN_INTERVAL"] = "120"
 os.environ["STAKEOUT_MAX_DURATION"] = "21600"
 
 from app.config import settings  # noqa: E402
-from app.database.models import AppSetting, Base  # noqa: E402
+from app.database.models import Base  # noqa: E402
 from app.database.session import dispose_engine, engine, get_session  # noqa: E402
 from app.workers.scheduler import (  # noqa: E402
     SETTING_STAKEOUTS,

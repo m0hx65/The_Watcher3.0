@@ -85,8 +85,8 @@ class AccountSnapshot(Base):
     is_verified: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     is_business: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     profile_pic_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # v2 perceptual fingerprint "p2:<dhash>:<ahash>" is ~132 chars — well past
-    # the old VARCHAR(64) that held the legacy single hash. Text avoids any
+    # v2 perceptual fingerprint "p2:<dhash>:<ahash>:<mean>" is ~135 chars — well
+    # past the old VARCHAR(64) that held the legacy single hash. Text avoids any
     # truncation on Postgres (SQLite ignores length either way).
     profile_pic_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     external_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
