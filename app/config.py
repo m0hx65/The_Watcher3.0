@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     # post, or reel) for this many days. 0 disables the radar.
     dark_radar_days: int = Field(default=3, alias="DARK_RADAR_DAYS")
 
+    # When a monitored account flips from private to public, automatically grab
+    # its whole backlog (posts, reels, highlights, current story) and send it —
+    # instead of silently baselining it like a normal first public sighting. Set
+    # to false to keep the old baseline-only behavior.
+    auto_grab_on_public: bool = Field(default=True, alias="AUTO_GRAB_ON_PUBLIC")
+
     # Follower-anomaly alert: a follower change is flagged only when it's large
     # in BOTH absolute terms (≥ abs_min) and relative terms (≥ pct_min of the
     # prior count), so it never fires on a small account's noise or a big

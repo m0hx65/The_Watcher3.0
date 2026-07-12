@@ -55,6 +55,10 @@ _SWEEP_RETRY_COOLDOWN_SECONDS = 30.0
 # 404s are handled by the rename-recovery path, not by retrying.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
 
+# How many sweeps a private→public backlog grab may retry before giving up, so a
+# genuinely empty (or permanently unreachable) account can't retry forever.
+_PUBLIC_GRAB_MAX_ATTEMPTS = 3
+
 
 class _SweepThrottle:
     """Adaptive launch pacing + a 401 circuit breaker for one sweep.
@@ -315,11 +319,24 @@ class MonitorService:
             if is_private is None:
                 is_private = meta["is_private"]
             if not is_private:
-                await self._check_stories_and_highlights(
+                result_username = result.get("username", username)
+                instagram_id = result.get("instagram_id") or meta["instagram_id"]
+                # A private→public flip (or a pending backlog grab) takes over
+                # this account's media for the sweep — the full grab replaces the
+                # normal story phase, which would otherwise silently baseline and
+                # lose the backlog.
+                handled = await self._handle_public_backlog(
                     account_id,
-                    result.get("username", username),
-                    instagram_id=result.get("instagram_id") or meta["instagram_id"],
+                    result_username,
+                    instagram_id,
+                    went_public=bool(result.get("went_public")),
                 )
+                if not handled:
+                    await self._check_stories_and_highlights(
+                        account_id,
+                        result_username,
+                        instagram_id=instagram_id,
+                    )
         return result
 
     async def backfill_instagram_ids(self) -> dict:
@@ -488,11 +505,21 @@ class MonitorService:
                 throttle.peak_consecutive_blocks, throttle.skipped,
             )
 
+        # One batched read of every pending backlog-grab flag, so the per-account
+        # decision below costs no extra query on the hot path.
+        async with get_session() as session:
+            public_grab_flags = await crud.get_settings_by_prefix(
+                session, "public_grab_pending:"
+            )
+
         # account_id -> (fallback username, result dict). Exceptions become
         # failure dicts (flagged "crashed") so the retry pass can rewrite any
         # entry and the final stats fall out of one structure.
         outcomes: list[tuple[int, str, dict]] = []
         story_targets: list[tuple[int, str, Optional[str]]] = []
+        # Accounts that flipped private→public (or have a pending grab): each
+        # gets its whole backlog delivered instead of the normal story phase.
+        public_grab_targets: list[tuple[int, str, Optional[str], bool]] = []
         for (target_account_id, uname), r in zip(targets, results):
             if isinstance(r, Exception):
                 logger.exception("Unhandled error during sweep: {}", r)
@@ -513,7 +540,21 @@ class MonitorService:
                     is_private = meta["is_private"]
                 instagram_id = instagram_id or meta["instagram_id"]
             is_private = bool(is_private)
-            if not is_private:
+            if is_private:
+                continue
+            went_public = bool(r.get("went_public"))
+            has_pending = (
+                self._public_grab_key(target_account_id) in public_grab_flags
+            )
+            if (
+                self.stories is not None
+                and settings.auto_grab_on_public
+                and (went_public or has_pending)
+            ):
+                public_grab_targets.append(
+                    (target_account_id, result_username, instagram_id, went_public)
+                )
+            else:
                 story_targets.append(
                     (target_account_id, result_username, instagram_id)
                 )
@@ -528,6 +569,19 @@ class MonitorService:
                 ),
                 return_exceptions=True,
             )
+
+        # Backlog grabs are heavy (a whole account each) — run them sequentially
+        # after the story phase so they never flood the chat or the source all at
+        # once. Rare in practice (only on a private→public flip).
+        for aid, uname, ig_id, went_public in public_grab_targets:
+            try:
+                await self._handle_public_backlog(
+                    aid, uname, ig_id, went_public=went_public
+                )
+            except Exception as exc:  # pragma: no cover - never sink a sweep on this
+                logger.exception(
+                    "Public backlog grab failed for @{}: {}", uname, exc
+                )
 
         # Second pass: accounts that hit a rate-limit block get one more
         # chance after a cooldown (the story phase above already added some).
@@ -1211,8 +1265,20 @@ class MonitorService:
             "change_count": len(changeset.changes) + (1 if changeset.profile_pic_changed else 0),
             "first_seen": previous is None,
             "is_private": bool(parsed.get("is_private")),
+            "went_public": self._went_public(changeset),
             "instagram_id": stored_id or parsed.get("instagram_id"),
         }
+
+    @staticmethod
+    def _went_public(changeset: ChangeSet) -> bool:
+        """True when this change set marks a private -> public transition.
+
+        Uses truthiness (not ``is True``/``is False``) so a DB that hands back
+        1/0 instead of bools still classifies correctly: old private (truthy) →
+        new public (falsy).
+        """
+        change = changeset.find("is_private")
+        return bool(change is not None and change.old and not change.new)
 
     async def _dispatch_changes(
         self,
@@ -1791,13 +1857,133 @@ class MonitorService:
             account_id, username, new_posts, seen_pks, message_thread_id=thread_id
         )
 
+    # ---------- Private → public backlog grab ----------
+
+    @staticmethod
+    def _public_grab_key(account_id: int) -> str:
+        return f"public_grab_pending:{account_id}"
+
+    async def _handle_public_backlog(
+        self,
+        account_id: int,
+        username: str,
+        instagram_id: Optional[str],
+        *,
+        went_public: bool,
+    ) -> bool:
+        """Drive the private→public backlog grab, with a small retry ledger.
+
+        Returns True when it OWNS this account's media for this sweep (so the
+        caller skips the normal story/highlight baseline, which would otherwise
+        silently mark the backlog seen and lose it). Returns False when there's
+        nothing to grab — no pending flag and not a transition — so the caller
+        runs its normal phase.
+
+        The transition is a one-shot event, but the grab can fail transiently
+        (saveinsta rate-limited at that moment). A per-account pending flag,
+        persisted BEFORE the long grab so an interruption is never lost, retries
+        it on later sweeps until it delivers something — bounded by
+        _PUBLIC_GRAB_MAX_ATTEMPTS so a genuinely empty account can't retry
+        forever.
+        """
+        if self.stories is None or not settings.auto_grab_on_public:
+            return False
+
+        key = self._public_grab_key(account_id)
+        async with get_session() as session:
+            raw = await crud.get_setting(session, key)
+        attempts = int(raw) if raw and raw.isdigit() else 0
+        if went_public and attempts == 0:
+            attempts = 1
+        if attempts == 0:
+            return False  # not pending and not a transition — normal phase
+
+        # Persist the pending state before the (long, cancellable) grab so a
+        # mid-grab cancellation or sweep timeout is retried, not silently lost.
+        async with get_session() as session:
+            await crud.set_setting(session, key, str(attempts))
+
+        result = await self.grab_public_backlog(
+            account_id, username, instagram_id=instagram_id
+        )
+
+        cleared = result["total"] > 0 or attempts >= _PUBLIC_GRAB_MAX_ATTEMPTS
+        async with get_session() as session:
+            if cleared:
+                await crud.delete_setting(session, key)
+            else:
+                await crud.set_setting(session, key, str(attempts + 1))
+        return True
+
+    async def grab_public_backlog(
+        self, account_id: int, username: str, *, instagram_id: Optional[str] = None
+    ) -> dict:
+        """Send a newly-public account's whole backlog: posts, highlights, story.
+
+        Reuses the on-demand download paths, which ignore the seen-dedup set (so
+        everything is delivered) and mark each item seen afterward (so the next
+        sweep won't re-send it). Routed to the account's forum topic when topics
+        are enabled, and cancellable with /kill. Returns
+        {"posts", "highlights", "stories", "total"}.
+        """
+        if self.stories is None:
+            return {"posts": 0, "highlights": 0, "stories": 0, "total": 0}
+
+        thread_id = await self.topic_for(account_id, username)
+        await self.notifier.send_text(
+            f"🔓 <b>@{esc(username)}</b> just went PUBLIC — grabbing the whole "
+            "account (posts, reels, highlights, story)…",
+            message_thread_id=thread_id,
+        )
+
+        # One outer scope so /kill can stop the whole sequence between phases,
+        # not just within one download (the scope nests safely).
+        async with self.download_scope():
+            posts = await self.download_posts(
+                username, message_thread_id=thread_id
+            )
+            highlights = await self.download_all_highlights(
+                username, message_thread_id=thread_id
+            )
+            story = await self.fetch_and_send_stories(
+                username, message_thread_id=thread_id
+            )
+
+        p = posts.get("count", 0)
+        h = highlights.get("count", 0)
+        s = story.get("count", 0)
+        total = p + h + s
+
+        if total:
+            await self.notifier.send_text(
+                f"✅ <b>@{esc(username)}</b> backlog grabbed — "
+                f"{p} post/reel, {h} highlight, {s} story item(s).",
+                message_thread_id=thread_id,
+            )
+        else:
+            await self.notifier.send_text(
+                f"🔓 <b>@{esc(username)}</b> is public now, but nothing could be "
+                "grabbed this time (empty account, or the anonymous source is "
+                "rate-limited — it'll retry).",
+                message_thread_id=thread_id,
+            )
+        logger.info(
+            "Public backlog for @{}: {} post/reel, {} highlight, {} story item(s)",
+            username, p, h, s,
+        )
+        return {"posts": p, "highlights": h, "stories": s, "total": total}
+
     # ---------- On-demand actions ----------
     # These work for ANY public username, monitored or not. When the account is
     # not monitored, account_id is None: media is still fetched and sent, but
     # nothing is persisted (no snapshot, no seen-dedup row).
 
     async def fetch_and_send_stories(
-        self, username: str, *, instagram_id: Optional[str] = None
+        self,
+        username: str,
+        *,
+        instagram_id: Optional[str] = None,
+        message_thread_id: Optional[int] = None,
     ) -> dict:
         """Download every current story item for a public account and send them now.
 
@@ -1808,6 +1994,8 @@ class MonitorService:
         Pass `instagram_id` when it's already known (e.g. from the bulk-download
         panel) to skip the profile fetch — Instagram's web API rate-limits to
         401 quickly on datacenter IPs, so every avoided call matters.
+        `message_thread_id` routes media to a per-account forum topic (used by
+        the private→public backlog grab); on-demand callers leave it None.
         Returns {"ok": bool, "count": int, "error": Optional[str]}.
         """
         if self.stories is None:
@@ -1845,7 +2033,8 @@ class MonitorService:
         if stories:
             async with self.download_scope():
                 sent = await self._deliver_story_items(
-                    account_id, username, stories, set(), cancellable=True
+                    account_id, username, stories, set(),
+                    message_thread_id=message_thread_id, cancellable=True,
                 )
             return {"ok": True, "count": sent, "error": None}
 
@@ -1994,9 +2183,13 @@ class MonitorService:
             )
         return {"ok": True, "count": sent, "title": title, "error": None}
 
-    async def download_all_highlights(self, username: str) -> dict:
+    async def download_all_highlights(
+        self, username: str, *, message_thread_id: Optional[int] = None
+    ) -> dict:
         """Download and send every highlight reel for any public account at once.
 
+        `message_thread_id` routes media to a per-account forum topic (used by
+        the private→public backlog grab); on-demand callers leave it None.
         Returns {"ok": bool, "count": int, "reels": int, "error": Optional[str]}
         where count is the total media items sent and reels the number of reels.
         """
@@ -2023,7 +2216,8 @@ class MonitorService:
                     "error": _DOWNLOAD_UNAVAILABLE_MSG,
                 }
             sent = await self._deliver_story_items(
-                account_id, username, story_items, set(), cancellable=True
+                account_id, username, story_items, set(),
+                message_thread_id=message_thread_id, cancellable=True,
             )
         return {"ok": True, "count": sent, "reels": len(items), "error": None}
 
@@ -2072,6 +2266,7 @@ class MonitorService:
         photos: bool = True,
         videos: bool = True,
         limit: int = 100,
+        message_thread_id: Optional[int] = None,
     ) -> dict:
         """Download and send the account's feed grid media (login-free).
 
@@ -2080,6 +2275,8 @@ class MonitorService:
         reels. Like the other on-demand paths this ignores seen-dedup so the
         user always gets the media, but monitored accounts still get the items
         marked seen so the sweep won't re-send them.
+        `message_thread_id` routes media to a per-account forum topic (used by
+        the private→public backlog grab); on-demand callers leave it None.
         Returns {"ok", "count", "photos", "videos", "error"}.
         """
         if self.stories is None:
@@ -2114,11 +2311,13 @@ class MonitorService:
         async with self.download_scope():
             if photo_items:
                 sent_photos = await self._deliver_story_items(
-                    account_id, username, photo_items, set(), cancellable=True
+                    account_id, username, photo_items, set(),
+                    message_thread_id=message_thread_id, cancellable=True,
                 )
             if video_items:
                 sent_videos = await self._deliver_story_items(
-                    account_id, username, video_items, set(), cancellable=True
+                    account_id, username, video_items, set(),
+                    message_thread_id=message_thread_id, cancellable=True,
                 )
 
         return {
