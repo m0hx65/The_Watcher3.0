@@ -153,9 +153,7 @@ async def get_previous_snapshot(
 ) -> Optional[AccountSnapshot]:
     """The most recent snapshot for an account OTHER than `before_id`.
 
-    Used to read the prior sweep's stored reel_data (story/live status) so a
-    "just went live / just posted a story" transition can be detected. Ordered
-    newest-first with the same id tiebreaker as get_latest_snapshot, so
+    Ordered newest-first with the same id tiebreaker as get_latest_snapshot, so
     colliding whole-second timestamps never return an arbitrary row.
     """
     stmt = (

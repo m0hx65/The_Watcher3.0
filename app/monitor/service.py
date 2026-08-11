@@ -336,6 +336,7 @@ class MonitorService:
                         account_id,
                         result_username,
                         instagram_id=instagram_id,
+                        reel_data=result.get("reel_data"),
                     )
         return result
 
@@ -505,6 +506,40 @@ class MonitorService:
                 throttle.peak_consecutive_blocks, throttle.skipped,
             )
 
+        # account_id -> (fallback username, result dict). Exceptions become
+        # failure dicts (flagged "crashed") so the retry pass can rewrite any
+        # entry and the final stats fall out of one structure.
+        outcomes: list[tuple[int, str, dict]] = []
+        for (target_account_id, uname), r in zip(targets, results):
+            if isinstance(r, Exception):
+                logger.exception("Unhandled error during sweep: {}", r)
+                r = {"ok": False, "username": uname, "error": repr(r), "crashed": True}
+            outcomes.append((target_account_id, uname, r))
+
+        # Second pass: accounts that hit a rate-limit block get one more chance
+        # after a cooldown. The throttle is transient — a paced sequential retry
+        # usually succeeds, so the sweep summary stops reporting phantom
+        # failures. This runs BEFORE the story phase so a recovered account's
+        # story status comes from its fresh reel data; when it ran after, the
+        # sweep could announce "story status unavailable" for an account the
+        # very same sweep went on to report as checked.
+        retriable = [
+            (idx, aid, uname)
+            for idx, (aid, uname, r) in enumerate(outcomes)
+            if not r.get("ok") and r.get("status") in _RETRIABLE_STATUSES
+        ]
+        if retriable:
+            logger.info(
+                "Retrying {} rate-limited account(s) after a {:.0f}s cooldown",
+                len(retriable), _SWEEP_RETRY_COOLDOWN_SECONDS,
+            )
+            await asyncio.sleep(_SWEEP_RETRY_COOLDOWN_SECONDS)
+            for idx, aid, uname in retriable:
+                retry = await self._run_check(aid, uname)
+                if retry.get("ok"):
+                    outcomes[idx] = (aid, uname, retry)
+                await asyncio.sleep(random.uniform(2.0, 5.0))
+
         # One batched read of every pending backlog-grab flag, so the per-account
         # decision below costs no extra query on the hot path.
         async with get_session() as session:
@@ -512,19 +547,12 @@ class MonitorService:
                 session, "public_grab_pending:"
             )
 
-        # account_id -> (fallback username, result dict). Exceptions become
-        # failure dicts (flagged "crashed") so the retry pass can rewrite any
-        # entry and the final stats fall out of one structure.
-        outcomes: list[tuple[int, str, dict]] = []
-        story_targets: list[tuple[int, str, Optional[str]]] = []
+        # (account_id, username, instagram_id, this check's reel_data or None)
+        story_targets: list[tuple[int, str, Optional[str], Optional[dict]]] = []
         # Accounts that flipped private→public (or have a pending grab): each
         # gets its whole backlog delivered instead of the normal story phase.
         public_grab_targets: list[tuple[int, str, Optional[str], bool]] = []
-        for (target_account_id, uname), r in zip(targets, results):
-            if isinstance(r, Exception):
-                logger.exception("Unhandled error during sweep: {}", r)
-                r = {"ok": False, "username": uname, "error": repr(r), "crashed": True}
-            outcomes.append((target_account_id, uname, r))
+        for target_account_id, uname, r in outcomes:
             if r.get("crashed"):
                 continue
             result_username = r.get("username", uname)
@@ -556,16 +584,17 @@ class MonitorService:
                 )
             else:
                 story_targets.append(
-                    (target_account_id, result_username, instagram_id)
+                    (target_account_id, result_username, instagram_id,
+                     r.get("reel_data"))
                 )
 
         if self.stories is not None and story_targets:
             await asyncio.gather(
                 *(
                     self._check_stories_and_highlights(
-                        aid, uname, instagram_id=ig_id
+                        aid, uname, instagram_id=ig_id, reel_data=reel
                     )
-                    for aid, uname, ig_id in story_targets
+                    for aid, uname, ig_id, reel in story_targets
                 ),
                 return_exceptions=True,
             )
@@ -582,27 +611,6 @@ class MonitorService:
                 logger.exception(
                     "Public backlog grab failed for @{}: {}", uname, exc
                 )
-
-        # Second pass: accounts that hit a rate-limit block get one more
-        # chance after a cooldown (the story phase above already added some).
-        # The throttle is transient — a paced sequential retry usually
-        # succeeds, so the sweep summary stops reporting phantom failures.
-        retriable = [
-            (idx, aid, uname)
-            for idx, (aid, uname, r) in enumerate(outcomes)
-            if not r.get("ok") and r.get("status") in _RETRIABLE_STATUSES
-        ]
-        if retriable:
-            logger.info(
-                "Retrying {} rate-limited account(s) after a {:.0f}s cooldown",
-                len(retriable), _SWEEP_RETRY_COOLDOWN_SECONDS,
-            )
-            await asyncio.sleep(_SWEEP_RETRY_COOLDOWN_SECONDS)
-            for idx, aid, uname in retriable:
-                retry = await self._run_check(aid, uname)
-                if retry.get("ok"):
-                    outcomes[idx] = (aid, uname, retry)
-                await asyncio.sleep(random.uniform(2.0, 5.0))
 
         checked = sum(1 for _, _, r in outcomes if not r.get("crashed"))
         changed = sum(1 for _, _, r in outcomes if r.get("changed"))
@@ -931,37 +939,46 @@ class MonitorService:
             username, fetch.http_status, fetch.error,
         )
 
-        async with get_session() as session:
-            if fetch.http_status in (401, 404):
-                return {
-                    "ok": False,
-                    "username": username,
-                    "status": fetch.http_status,
-                    "error": fetch.error,
-                }
+        # 401/404 are Instagram's flaky anonymous-gate answers — they come and
+        # go per colo, so a snapshot row for each would bury the real history
+        # and a per-account alert for each would spam the chat (the sweep
+        # summary already names them). The check still HAPPENED and still
+        # FAILED, though, so the last-checked bookkeeping runs for every status.
+        # It used to be skipped here, which froze last_checked_at /
+        # last_status_code / consecutive_failures at the last SUCCESS: an
+        # account Instagram had been blocking for days still showed
+        # "Last check: <3 days ago> · HTTP 200" and zero failures on its card,
+        # i.e. a stale check presented as a healthy one.
+        gate_status = fetch.http_status in (401, 404)
 
-            # Only store a failure snapshot when transitioning from success
-            # (i.e. the previous snapshot was OK). Repeated identical failures
-            # are not stored — they add no information.
-            previous = await crud.get_latest_snapshot(session, account_id, successful_only=False)
-            is_new_failure = previous is None or previous.http_status == 200
-            if is_new_failure:
-                snapshot = AccountSnapshot(
-                    account_id=account_id,
-                    username=username,
-                    http_status=fetch.http_status,
-                    raw_response=fetch.raw_response,
-                    error=fetch.error,
+        async with get_session() as session:
+            if not gate_status:
+                # Only store a failure snapshot when transitioning from success
+                # (i.e. the previous snapshot was OK). Repeated identical failures
+                # are not stored — they add no information.
+                previous = await crud.get_latest_snapshot(
+                    session, account_id, successful_only=False
                 )
-                await crud.insert_snapshot(session, snapshot)
-                # Keep only the latest 200 snapshots per account
-                await crud.cleanup_old_snapshots(session, account_id, keep_count=200)
+                is_new_failure = previous is None or previous.http_status == 200
+                if is_new_failure:
+                    snapshot = AccountSnapshot(
+                        account_id=account_id,
+                        username=username,
+                        http_status=fetch.http_status,
+                        raw_response=fetch.raw_response,
+                        error=fetch.error,
+                    )
+                    await crud.insert_snapshot(session, snapshot)
+                    # Keep only the latest 200 snapshots per account
+                    await crud.cleanup_old_snapshots(session, account_id, keep_count=200)
             failure_count = await crud.mark_checked(
                 session, account_id, fetch.http_status, success=False
             )
 
         # Only notify on the first failure or every 5th consecutive failure
-        should_notify = failure_count == 1 or failure_count % 5 == 0
+        should_notify = not gate_status and (
+            failure_count == 1 or failure_count % 5 == 0
+        )
         if should_notify:
             msg = render_failure_message(username, fetch)
             delivered = await self.notifier.send_text(msg)
@@ -1115,12 +1132,14 @@ class MonitorService:
                     username, exc
                 )
 
-        # Persist only what later reads actually consume: the numeric user id
-        # (404 recovery / ID backfill) and reel_data (story/live status and the
-        # highlight catalog). The full web_profile_info payload is 50–200 KB per
-        # snapshot and was the main thing filling the database — this slim form
-        # is a few hundred bytes, so the 0.5 GB free tier effectively never
-        # fills. Everything diffable already lives in the snapshot's columns.
+        # Persist a slim form: the numeric user id (404 recovery / ID backfill)
+        # and this check's reel_data as a record of what the reel query said at
+        # this timestamp. Nothing reads reel_data back as CURRENT status — that
+        # is always a live fetch — so a stale row can't be mistaken for now.
+        # The full web_profile_info payload is 50–200 KB per snapshot and was
+        # the main thing filling the database; this form is a few hundred bytes,
+        # so the 0.5 GB free tier effectively never fills. Everything diffable
+        # already lives in the snapshot's columns.
         parsed_instagram_id = parsed.get("instagram_id") or self._extract_instagram_id(
             fetch.raw_response
         )
@@ -1267,6 +1286,9 @@ class MonitorService:
             "is_private": bool(parsed.get("is_private")),
             "went_public": self._went_public(changeset),
             "instagram_id": stored_id or parsed.get("instagram_id"),
+            # This check's live reel query (None when it didn't answer). The
+            # story phase reports status from THIS, never from the snapshot.
+            "reel_data": reel_data_response,
         }
 
     @staticmethod
@@ -1474,20 +1496,27 @@ class MonitorService:
         ]
         return added, removed, renamed
 
+    @staticmethod
+    def _story_state_key(account_id: int) -> str:
+        return f"story_state:{account_id}"
+
     async def _check_stories_and_highlights(
         self,
         account_id: int,
         username: str,
         *,
         instagram_id: Optional[str] = None,
+        reel_data: Optional[dict] = None,
     ) -> None:
         """Stories, highlight catalog changes, and new highlight media for public accounts.
-        
-        Supports two methods for checking public accounts:
-        1. User_id API (reel query) - preferred for public accounts with known instagram_id
-           Returns: has_public_story, is_live, highlight catalog
-           Fetched during profile check and stored in snapshot's raw_response["reel_data"]
-        2. Fallback to stories API - when reel data is unavailable
+
+        `reel_data` is THIS check's reel query (has_public_story / is_live /
+        highlight catalog), handed down by the caller so the same fetch serves
+        both phases. It is None when the profile check failed or never ran, and
+        then one live fetch is attempted here. If that fails too, the story/live
+        status is reported as unavailable — never re-read from a stored
+        snapshot, whose reel_data is only as current as the last SUCCESSFUL
+        check (days old for an account Instagram is currently blocking).
         """
         assert self.stories is not None
         async with self._semaphore:
@@ -1496,22 +1525,17 @@ class MonitorService:
                     previous_catalog = await crud.get_highlight_catalog(
                         session, account_id
                     )
-                    previous_snapshot = await crud.get_latest_snapshot(
-                        session, account_id, successful_only=True
-                    )
                     seen_pks = await crud.get_seen_story_pks(session, account_id)
 
                 # Route everything in this account's check to its own topic.
                 thread_id = await self.topic_for(account_id, username)
 
-                # Extract reel data from the latest snapshot (fetched during profile check)
-                # Reel data is used ONLY for story/live status detection, not for highlight catalog
-                reel_data = None
-                if previous_snapshot and previous_snapshot.raw_response:
-                    reel_data = previous_snapshot.raw_response.get("reel_data")
-                
-                # If reel_data is not in snapshot, try to fetch it now for story/live status
-                if not reel_data and instagram_id:
+                # The profile check already ran the reel query and passed the
+                # result down, so this costs nothing on a healthy check. Only a
+                # failed/absent profile check reaches Instagram again here.
+                attempted_reel = False
+                if reel_data is None and instagram_id:
+                    attempted_reel = True
                     reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
                     if reel_user:
                         reel_data = {
@@ -1520,20 +1544,25 @@ class MonitorService:
                             "highlights": reel_user.get("highlights", {}),
                         }
                         logger.debug(
-                            "Fetched reel data for @{} during story check (not in snapshot)",
+                            "Fetched reel data for @{} during story check "
+                            "(profile check didn't supply it)",
                             username
                         )
 
-                # Highlight catalog: the profile check already fetched it (it
-                # rides on the same reel query as story/live status), so reuse
-                # it rather than asking Instagram again — every avoided call
-                # lowers the 401 rate. Only fetch when the snapshot predates
-                # highlights being stored in reel_data.
+                # Highlight catalog rides on the same reel query as story/live
+                # status — reuse it rather than asking Instagram again; every
+                # avoided call lowers the 401 rate. Only reach for a separate
+                # fetch when no reel query has been attempted at all (e.g. the
+                # numeric id isn't stored yet, which that path resolves).
                 catalog = (reel_data or {}).get("highlights")
-                if catalog is None:
+                if catalog is None and not attempted_reel:
                     catalog = await self._fetch_highlight_catalog(
                         username, instagram_id
                     )
+                if catalog is None:
+                    # Reel query unavailable this check — "unknown", not "empty".
+                    # The guard below keeps the stored catalog untouched.
+                    catalog = {}
 
                 establishing_baseline = not previous_catalog and bool(catalog)
 
@@ -1586,37 +1615,44 @@ class MonitorService:
                         len(previous_catalog),
                     )
 
-                # Check story/live status using reel data (user_id API)
-                # Always report current status every time sweep runs
-                if reel_data:
-                    has_public_story = reel_data.get("has_public_story", False)
-                    is_live = reel_data.get("is_live", False)
-                    
-                    # Extract previous story/live status from the snapshot before
-                    # the current one (its stored reel_data).
-                    prev_has_story = False
-                    prev_is_live = False
-                    if previous_snapshot and previous_snapshot.id:
-                        async with get_session() as session:
-                            prev_snapshot_older = await crud.get_previous_snapshot(
-                                session, account_id, previous_snapshot.id
-                            )
-                        if prev_snapshot_older and prev_snapshot_older.raw_response:
-                            prev_reel = prev_snapshot_older.raw_response.get("reel_data", {})
-                            prev_has_story = prev_reel.get("has_public_story", False)
-                            prev_is_live = prev_reel.get("is_live", False)
-                    
+                # Story/live status — reported ONLY from this check's live reel
+                # data. When Instagram didn't answer, say so instead of dressing
+                # the last known status up as the current one: that's how an
+                # account whose profile fetch had been 401ing for days kept
+                # getting "🎬 HAS STORY" out of a stale snapshot while its Story
+                # button (a live saveinsta fetch) correctly said there was none.
+                state_key = self._story_state_key(account_id)
+                if reel_data is not None:
+                    has_public_story = bool(reel_data.get("has_public_story"))
+                    is_live = bool(reel_data.get("is_live"))
+
+                    # The previous status comes from the last OBSERVED one, kept
+                    # in app_settings — not from snapshot rows, which are only
+                    # written/refreshed when the profile itself changes, so they
+                    # can be weeks apart and would fire "just posted a story!"
+                    # on every sweep of one long-lived story (or never at all).
+                    async with get_session() as session:
+                        prev_state = await crud.get_setting(session, state_key)
+                    prev_is_live = prev_state == "live"
+                    prev_has_story = prev_state == "story"
+
                     # One status message per sweep, upgraded to a "just went
                     # live" / "just posted a story" alert only when the status
-                    # actually changed since the previous sweep. While
-                    # establishing the baseline there is no real prior state,
-                    # so the "just …" wording is never used then.
+                    # actually changed since the last observation. With no prior
+                    # observation (or while establishing the highlight baseline)
+                    # there is no real prior state, so the "just …" wording is
+                    # never used then.
+                    first_observation = prev_state is None
                     just_live = (
-                        is_live and not prev_is_live and not establishing_baseline
+                        is_live
+                        and not prev_is_live
+                        and not first_observation
+                        and not establishing_baseline
                     )
                     just_story = (
                         has_public_story
                         and not prev_has_story
+                        and not first_observation
                         and not establishing_baseline
                     )
 
@@ -1640,6 +1676,13 @@ class MonitorService:
                         msg, message_thread_id=thread_id
                     )
                     async with get_session() as session:
+                        # Only an OBSERVED status updates the baseline, so a
+                        # blocked sweep can never manufacture a transition.
+                        await crud.set_setting(
+                            session,
+                            state_key,
+                            "live" if is_live else "story" if has_public_story else "none",
+                        )
                         await crud.log_notification(
                             session,
                             account_id=account_id,
@@ -1648,6 +1691,29 @@ class MonitorService:
                                 "has_public_story": has_public_story,
                                 "is_live": is_live,
                             },
+                            message=msg,
+                            delivered=delivered,
+                        )
+                else:
+                    msg = (
+                        f"<b>@{esc(username)}</b> — ⚠️ story status unavailable\n"
+                        "<i>Instagram didn't answer the live check — not "
+                        "repeating the last known status.</i>"
+                    )
+                    logger.warning(
+                        "No live reel data for @{} this check — story/live status "
+                        "reported as unavailable rather than from stored data",
+                        username,
+                    )
+                    delivered = await self.notifier.send_text(
+                        msg, message_thread_id=thread_id
+                    )
+                    async with get_session() as session:
+                        await crud.log_notification(
+                            session,
+                            account_id=account_id,
+                            change_type="story_status_unknown",
+                            payload={"reason": "reel query unavailable"},
                             message=msg,
                             delivered=delivered,
                         )

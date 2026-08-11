@@ -221,7 +221,7 @@ async def test_check_username_triggers_grab_on_flip() -> None:
         calls["backlog"].append(went_public)
         return True  # claim the account so the normal phase is skipped
 
-    async def spy_story(account_id, username, *, instagram_id=None):
+    async def spy_story(account_id, username, *, instagram_id=None, reel_data=None):
         calls["story"].append(username)
 
     service._handle_public_backlog = spy_backlog  # type: ignore[assignment]

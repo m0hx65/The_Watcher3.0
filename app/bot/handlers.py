@@ -513,7 +513,15 @@ async def _render_account_card(
 
     if snapshot:
         lines.append("")
-        lines.append("<b>Latest snapshot</b>")
+        # While checks are failing the numbers below are from the last check
+        # that worked, not from now — date them so they can't read as current.
+        if fails:
+            lines.append(
+                "<b>Latest snapshot</b> "
+                f"<i>(captured {fmt_timestamp(snapshot.created_at)})</i>"
+            )
+        else:
+            lines.append("<b>Latest snapshot</b>")
         if snapshot.full_name:
             lines.append(f"Name: <code>{esc(snapshot.full_name)}</code>")
         lines.append(
@@ -531,14 +539,14 @@ async def _render_account_card(
         if flags:
             lines.append(" · ".join(flags))
 
-        # Story / live status for public accounts. Fetch it LIVE so a story
-        # posted since the last check shows immediately — the stored snapshot's
-        # reel_data is only as fresh as the last sweep/recheck. Fall back to the
-        # stored value if the live fetch is unavailable or fails.
+        # Story / live status for public accounts, from a LIVE check only. The
+        # stored snapshot's reel_data is only as fresh as the last SUCCESSFUL
+        # check — for an account Instagram is currently blocking that can be
+        # days old, and seeding from it showed a story that expired long ago.
+        # None here means "couldn't find out", never "no".
         if not snapshot.is_private:
-            reel_data = (snapshot.raw_response or {}).get("reel_data") or {}
-            has_story = bool(reel_data.get("has_public_story"))
-            is_live = bool(reel_data.get("is_live"))
+            has_story: Optional[bool] = None
+            is_live = False
             live = None
             if service is not None and account.instagram_id:
                 try:
@@ -547,22 +555,25 @@ async def _render_account_card(
                     )
                 except Exception:  # pragma: no cover - network failure path
                     live = None
-                if live is not None:
-                    has_story = bool(live.get("has_public_story"))
-                    is_live = bool(live.get("is_live"))
-            # Instagram's graphql reel query is 401-blocked from datacenter IPs
-            # (e.g. Render), so `live` is often None in production. saveinsta is a
-            # third-party host and isn't IP-blocked, so use it as the story oracle
-            # when graphql is unavailable: any items back means an active story.
-            if live is None and not has_story and service is not None and service.stories:
+            if live is not None:
+                has_story = bool(live.get("has_public_story"))
+                is_live = bool(live.get("is_live"))
+            elif service is not None and service.stories:
+                # Instagram's graphql reel query is 401-blocked from datacenter
+                # IPs (e.g. Render), so `live` is often None in production.
+                # saveinsta is a third-party host and isn't IP-blocked, so it's
+                # the live story oracle when graphql is unavailable: any items
+                # back means an active story.
                 try:
-                    items = await service.stories.fetch_stories(account.username)
-                    if items:
-                        has_story = True
+                    has_story = bool(
+                        await service.stories.fetch_stories(account.username)
+                    )
                 except Exception:  # pragma: no cover - network failure path
-                    pass
+                    has_story = None
             if is_live:
                 story_state = "🔴 live now"
+            elif has_story is None:
+                story_state = "⚠️ unavailable (live check didn't answer)"
             elif has_story:
                 story_state = "🎬 has an active story"
             else:

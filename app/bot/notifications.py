@@ -441,10 +441,13 @@ _DIGEST_LABELS: dict[str, str] = {
     "went_dark": "went dark",
     "back_active": "back active",
     "fetch_failure": "fetch failure",
+    "story_status_unknown": "⚠️ status unavailable",
 }
 # Per-sweep status noise that would swamp a digest — the "HAS STORY / NO STORY /
 # LIVE NOW" heartbeat is logged every sweep. The one-off "just posted a story"
-# (story_posted) and "just went live" (going_live) events are kept.
+# (story_posted) and "just went live" (going_live) events are kept, and so is
+# story_status_unknown: a count of "couldn't check this account" per window is
+# exactly the signal that a 401-blocked target used to hide.
 _DIGEST_EXCLUDE: frozenset[str] = frozenset({"story_status"})
 
 
