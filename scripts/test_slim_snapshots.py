@@ -98,7 +98,7 @@ class FakeInstagram:
     def __init__(self) -> None:
         self.reel_calls = 0
 
-    async def fetch_profile(self, username: str) -> ProfileFetchResult:
+    async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         return make_fetch_result()
 
     async def fetch_reel_user(self, user_id: str):

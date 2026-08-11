@@ -118,7 +118,7 @@ class FakeInstagram:
     def __init__(self, parsed: dict) -> None:
         self.parsed = parsed
 
-    async def fetch_profile(self, username: str) -> ProfileFetchResult:
+    async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         return ProfileFetchResult(
             username=username, http_status=200,
             parsed=dict(self.parsed),

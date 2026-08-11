@@ -188,7 +188,7 @@ class TogglingInstagram:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def fetch_profile(self, username: str) -> ProfileFetchResult:
+    async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         self.calls += 1
         is_private = self.calls == 1
         return ProfileFetchResult(

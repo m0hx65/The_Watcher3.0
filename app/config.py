@@ -54,6 +54,22 @@ class Settings(BaseSettings):
     ig_session_cookie: Optional[str] = Field(default=None, alias="IG_SESSION_COOKIE")
     ig_proxy_url: Optional[str] = Field(default=None, alias="IG_PROXY_URL")
 
+    # How many times a 401/403 from the Cloudflare Worker is re-asked. One
+    # worker call is already 8 upstream attempts with rotating UAs and hosts —
+    # but it may also leave from a different Cloudflare colo, and Instagram's
+    # datacenter gate answers differently per colo, so a re-ask is a real second
+    # chance rather than a repeat of the same question.
+    #
+    # The cost is blocked traffic, and that is where the two paths differ. A
+    # sweep multiplies every extra attempt by every account (14 accounts × 8
+    # upstream = a lot of blocked requests, which is what keeps the gate shut),
+    # so it asks once and leaves the second chance to the paced retry rounds.
+    # An on-demand check — Recheck, a card open, /story — is ONE account with
+    # someone waiting for the answer, so it tries harder; nothing it does is
+    # what shuts the gate.
+    ig_sweep_auth_attempts: int = Field(default=1, alias="IG_SWEEP_AUTH_ATTEMPTS")
+    ig_manual_auth_attempts: int = Field(default=3, alias="IG_MANUAL_AUTH_ATTEMPTS")
+
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")
     jitter_seconds: int = Field(default=120, alias="JITTER_SECONDS")

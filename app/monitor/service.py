@@ -949,7 +949,7 @@ class MonitorService:
             if throttle.is_open():  # tripped while this one waited its turn
                 throttle.note_skip()
                 return self._breaker_skipped_result(username)
-            result = await self._run_check(account_id, username)
+            result = await self._run_check(account_id, username, thorough=False)
             # Recorded inside the slot so the next account's pacing — and any
             # cooldown this block just triggered — already accounts for it.
             throttle.record(result.get("status"))
@@ -999,7 +999,7 @@ class MonitorService:
                 if time.monotonic() >= deadline:
                     logger.info("Retry budget spent mid-round — stopping")
                     break
-                retry = await self._run_check(aid, uname)
+                retry = await self._run_check(aid, uname, thorough=False)
                 if retry.get("ok"):
                     outcomes[idx] = (aid, uname, retry)
                     recovered += 1
@@ -1012,20 +1012,45 @@ class MonitorService:
         return recovered
 
     async def _run_check(
-        self, account_id: int, username: str, *, notify_unchanged: bool = False
+        self,
+        account_id: int,
+        username: str,
+        *,
+        notify_unchanged: bool = False,
+        thorough: bool = True,
     ) -> dict:
+        """One full check. `thorough` (the default) lets a blocked fetch try
+        every colo it can — right for on-demand checks, which are one account
+        with someone waiting. Sweeps pass False: there, extra attempts are
+        multiplied by every account into the blocked traffic that keeps
+        Instagram's gate shut, and the paced retry rounds are the second
+        chance instead."""
         async with self._semaphore:
             try:
-                return await self._do_check(account_id, username, notify_unchanged)
+                return await self._do_check(
+                    account_id, username, notify_unchanged, thorough=thorough
+                )
             except Exception as exc:
                 logger.exception("Unhandled error checking @{}: {}", username, exc)
                 return {"ok": False, "username": username, "error": repr(exc)}
 
     async def _do_check(
-        self, account_id: int, username: str, notify_unchanged: bool
+        self,
+        account_id: int,
+        username: str,
+        notify_unchanged: bool,
+        *,
+        thorough: bool = True,
     ) -> dict:
         logger.info("Checking @{}", username)
-        fetch = await self.instagram.fetch_profile(username)
+        fetch = await self.instagram.fetch_profile(
+            username,
+            auth_attempts=(
+                settings.ig_manual_auth_attempts
+                if thorough
+                else settings.ig_sweep_auth_attempts
+            ),
+        )
 
         if not fetch.success:
             if fetch.http_status == 404:

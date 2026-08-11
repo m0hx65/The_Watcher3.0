@@ -119,11 +119,10 @@ async def test_401_retries_then_succeeds() -> None:
     assert calls["n"] == 2
 
 
-async def test_proxied_401_is_asked_exactly_once() -> None:
-    """The worker answers 401 only after ITS 8 upstream attempts with rotating
-    UAs and hosts have all been blocked. Asking it again fires 8 more blocked
-    requests to learn the same thing — that doubling is what kept the gate shut
-    across a whole sweep, so a proxied 401 must be final."""
+async def test_sweep_asks_the_worker_once_per_blocked_check() -> None:
+    """A sweep multiplies every extra attempt by every account, and one worker
+    call is already 8 upstream attempts. Its second chance is the paced retry
+    round, not another 8 blocked requests right now."""
     from app.config import settings
 
     calls = {"n": 0}
@@ -137,13 +136,44 @@ async def test_proxied_401_is_asked_exactly_once() -> None:
     settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
     try:
         async with InstagramClient(max_retries=5, session=session) as client:
-            result = await client.fetch_profile("65xim")
+            result = await client.fetch_profile("65xim", auth_attempts=1)
     finally:
         settings.ig_proxy_url = old
 
     assert not result.success
     assert result.http_status == 401
-    assert calls["n"] == 1, f"worker asked {calls['n']}× for one blocked check"
+    assert calls["n"] == 1, f"worker asked {calls['n']}× for one swept account"
+
+
+async def test_manual_check_retries_across_colos() -> None:
+    """An on-demand check is ONE account with someone waiting. A repeat worker
+    call may leave from a different Cloudflare colo, and Instagram's gate
+    answers differently per colo — so it is a real second chance, and dropping
+    it is what made a manual Recheck fail where it used to succeed."""
+    from app.config import settings
+
+    calls = {"n": 0}
+
+    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return _MockResponse(401, {})
+        return _MockResponse(200, _payload())
+
+    session = _MockSession(handler)
+    old_proxy = settings.ig_proxy_url
+    old_manual = settings.ig_manual_auth_attempts
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.ig_manual_auth_attempts = 3
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("65xim")  # no cap = on-demand
+    finally:
+        settings.ig_proxy_url = old_proxy
+        settings.ig_manual_auth_attempts = old_manual
+
+    assert result.success, result.error
+    assert calls["n"] == 3, f"gave up after {calls['n']} worker call(s)"
 
 
 async def test_direct_401_still_retries() -> None:
@@ -281,7 +311,8 @@ async def test_reel_user_cache_serves_repeats() -> None:
 async def main() -> int:
     await test_profile_request_shape()
     await test_401_retries_then_succeeds()
-    await test_proxied_401_is_asked_exactly_once()
+    await test_sweep_asks_the_worker_once_per_blocked_check()
+    await test_manual_check_retries_across_colos()
     await test_direct_401_still_retries()
     await test_extract_instagram_id_from_reel_query()
     await test_fetch_reel_user_parses_id_and_username()

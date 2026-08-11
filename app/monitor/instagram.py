@@ -461,8 +461,19 @@ class InstagramClient:
             return None
         return parsed.get("username")
 
-    async def fetch_profile(self, username: str) -> ProfileFetchResult:
-        """Fetch a profile with intelligent retry/backoff."""
+    async def fetch_profile(
+        self, username: str, *, auth_attempts: Optional[int] = None
+    ) -> ProfileFetchResult:
+        """Fetch a profile with intelligent retry/backoff.
+
+        `auth_attempts` caps how many times a 401/403 is re-asked THROUGH THE
+        WORKER, where one call is already 8 upstream attempts. Sweeps pass 1
+        (see IG_SWEEP_AUTH_ATTEMPTS — 14 accounts multiply every extra attempt
+        into the blocked traffic that keeps the gate shut); on-demand checks
+        leave it None and get IG_MANUAL_AUTH_ATTEMPTS, because one account with
+        someone waiting on it should try every colo it can. Ignored on the
+        direct path, which has its own full retry budget.
+        """
         username = username.strip().lstrip("@")
         headers = _build_headers()
         last_status = 0
@@ -539,24 +550,39 @@ class InstagramClient:
                     await asyncio.sleep(delay)
                     continue
 
-                # 401/403 — direct requests retry, since a datacenter IP gets
-                # them intermittently and a re-ask often lands.
-                #
-                # Through the worker there is nothing left to try: that ONE call
-                # is already 8 upstream attempts with rotating UAs and hosts, so
-                # a 401 back from it means all 8 were blocked. Asking again fires
-                # 8 more blocked requests to learn the same thing, doubling the
-                # traffic that keeps the gate shut. Take the answer and move on.
+                # 401/403 — a re-ask is worth it on both paths, but for
+                # different reasons: a datacenter IP gets them intermittently,
+                # and a repeat worker call may leave from a different colo. What
+                # differs is the price, so the caller sets the budget.
+                if response.status_code in (401, 403):
+                    if settings.ig_proxy_url:
+                        max_auth_attempts = max(
+                            1, auth_attempts or settings.ig_manual_auth_attempts
+                        )
+                    else:
+                        max_auth_attempts = self.max_retries
+                else:
+                    max_auth_attempts = self.max_retries
                 logger.warning(
                     "HTTP {} on @{} (attempt {}/{})",
-                    response.status_code, username, attempt, self.max_retries,
+                    response.status_code, username, attempt, max_auth_attempts,
                 )
                 last_error = f"HTTP {response.status_code}"
                 if response.status_code in (401, 403):
-                    max_auth_attempts = 1 if settings.ig_proxy_url else self.max_retries
                     if attempt < max_auth_attempts:
                         await asyncio.sleep(random.uniform(1.0, 3.0))
                         continue
+                    # Worth seeing once per give-up: a body from the worker
+                    # reads differently from Instagram's own block, and that is
+                    # the difference between "our proxy is misconfigured" and
+                    # "the gate is shut".
+                    body = (getattr(response, "text", "") or "")[:200]
+                    if body:
+                        logger.debug(
+                            "Final {} for @{} — response body: {}",
+                            response.status_code, username,
+                            body.replace("\n", " "),
+                        )
                     break
 
             except Timeout as exc:
