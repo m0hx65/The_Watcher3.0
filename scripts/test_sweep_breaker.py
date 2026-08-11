@@ -42,6 +42,12 @@ service_mod._SWEEP_RETRY_GAP_SECONDS = (0.0, 0.0)
 
 FAILURES: list[str] = []
 
+# asyncio fires a timer as soon as it is within one clock resolution of due, so
+# `await asyncio.sleep(x)` can return a few ms EARLY by the monotonic clock
+# (~16ms on Windows). Timing assertions allow that slack — they are checking
+# that a wait happened at all, not benchmarking the event loop.
+TIMER_SLACK = 0.05
+
 
 def expect(name: str, condition: bool, detail: str = "") -> None:
     status = "ok" if condition else "FAIL"
@@ -125,7 +131,7 @@ async def test_slot_spaces_checks() -> None:
     async with t.slot():
         second = time.monotonic() - start
     expect("first check is immediate", first < 0.2, f"{first:.3f}s")
-    expect("second check is spaced out", second >= 0.2, f"{second:.3f}s")
+    expect("second check is spaced out", second >= 0.2 - TIMER_SLACK, f"{second:.3f}s")
 
 
 async def test_slot_serializes_by_default() -> None:
@@ -169,16 +175,20 @@ async def test_guard_pauses_before_it_defers() -> None:
         base_stagger=0.0, max_stagger=0.0, breaker_threshold=2,
         cooldown=0.3, max_pauses=1,
     )
+    # The cooldown deadline is stamped by the block that trips the guard, so
+    # the clock starts here — not at the slot, which would measure a window
+    # already partly elapsed and read as a hair under the cooldown.
+    start = time.monotonic()
     t.record(401)
     t.record(401)  # hits the threshold -> pause, NOT open
     expect("first block run pauses instead of deferring", not t.is_open())
     expect("the pause is counted", t.pauses == 1, repr(t.pauses))
 
     # The pause is a real gap: the next slot waits it out.
-    start = time.monotonic()
     async with t.slot():
         waited = time.monotonic() - start
-    expect("the next check waits out the cooldown", waited >= 0.3, f"{waited:.3f}s")
+    expect("the next check waits out the cooldown", waited >= 0.3 - TIMER_SLACK,
+           f"{waited:.3f}s")
 
     t.record(401)
     t.record(401)  # pauses are spent -> now it opens

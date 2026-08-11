@@ -7,6 +7,7 @@ import csv
 import io
 import re
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -128,6 +129,16 @@ _PROMPT_MSG_ID = "prompt_msg_id"
 # moved to the bottom of the chat after automated notifications arrive.
 PANEL_MSG_ID = "panel_msg_id"
 PANEL_CHAT_ID = "panel_chat_id"
+# Monotonic time the panel was last navigated AWAY from the menu (Status,
+# "Sweep running", Dark radar, …). Absent means it is showing the menu. The
+# re-anchor deletes and re-posts the panel, so without this it would wipe a
+# view the moment the first sweep notification landed — a second after the
+# button was pressed, before anyone could read it. See PanelBumper.
+PANEL_VIEW_AT = "panel_view_at"
+# How long a freshly opened panel view is protected from the re-anchor. Long
+# enough to read a status screen, short enough that the menu still finds its
+# way back to the bottom of the chat on its own.
+PANEL_VIEW_GRACE_SECONDS = 180.0
 # Splits a bulk add into individual targets on commas, spaces, or new lines.
 # Profile URLs contain none of these, so they survive intact as one token.
 _ADD_SPLIT_RE = re.compile(r"[\s,]+")
@@ -329,6 +340,22 @@ async def _safe_edit_text(
         return message
 
 
+def _note_panel_navigation(context, current_msg_id: Optional[int], data: str) -> None:
+    """Record that the panel is now showing something other than the menu.
+
+    Only presses ON the panel itself count — a button on an account card or a
+    search result leaves the panel alone. "menu:main" (🏠 Home) and "noop" are
+    the two that don't navigate anywhere, so they clear the mark instead.
+    """
+    bot_data = context.application.bot_data
+    if current_msg_id is None or current_msg_id != bot_data.get(PANEL_MSG_ID):
+        return
+    if data in ("menu:main", "noop"):
+        bot_data.pop(PANEL_VIEW_AT, None)
+    else:
+        bot_data[PANEL_VIEW_AT] = time.monotonic()
+
+
 async def _safe_answer(query, text: Optional[str] = None, *, show_alert: bool = False) -> None:
     """Acknowledge a callback query, ignoring 'too old / already answered' errors."""
     try:
@@ -450,6 +477,7 @@ async def _send_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     context.application.bot_data[PANEL_MSG_ID] = msg.message_id
     context.application.bot_data[PANEL_CHAT_ID] = chat_id
+    context.application.bot_data.pop(PANEL_VIEW_AT, None)  # showing the menu
     async with get_session() as session:
         await crud.set_setting(session, "panel_msg_id", str(msg.message_id))
         await crud.set_setting(session, "panel_chat_id", str(chat_id))
@@ -2679,6 +2707,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     data = query.data or ""
     current_msg_id = query.message.message_id if query.message else None
+    _note_panel_navigation(context, current_msg_id, data)
 
     # A new button press supersedes any pending text prompt — but keep the
     # awaiting flag alive if this same press is the one that opens that prompt.
@@ -2755,6 +2784,8 @@ async def _handle_menu(
             cid = panel.chat_id
             context.application.bot_data[PANEL_MSG_ID] = mid
             context.application.bot_data[PANEL_CHAT_ID] = cid
+            # Back on the menu, so the re-anchor may move it freely again.
+            context.application.bot_data.pop(PANEL_VIEW_AT, None)
             async with get_session() as session:
                 await crud.set_setting(session, "panel_msg_id", str(mid))
                 await crud.set_setting(session, "panel_chat_id", str(cid))
