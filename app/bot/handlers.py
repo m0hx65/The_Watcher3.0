@@ -108,6 +108,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("digest", "Show/set the daily or weekly digest"),
     BotCommand("photo", "Current profile picture"),
     BotCommand("fetchphoto", "Download current profile picture on demand"),
+    BotCommand("probe", "Test which Instagram sources answer right now"),
     BotCommand("story", "Download any user's current story"),
     BotCommand("highlights", "List any user's highlights to download"),
     BotCommand("export", "Export change history as CSV"),
@@ -2430,6 +2431,89 @@ async def cmd_fetchphoto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_profile_photo(update, context, username)
 
 
+async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Try every profile source against one username and report what answered.
+
+    When everything 401s, the question is which door is shut — the Worker, the
+    public page, both. Waiting for the next sweep to find out is a slow way to
+    ask, and the sweep's summary can't distinguish "blocked" from "misrouted".
+    """
+    if await _reject_if_unauthorized(update):
+        return
+    username = _username_arg(context)
+    if not username:
+        await update.message.reply_text(
+            "Usage: <code>/probe &lt;username&gt;</code>\n"
+            "Tries each profile source in turn and reports which ones answer — "
+            "the fastest way to tell a blocked gate from a broken route.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboards.back_to_menu(),
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        f"🔬 Probing sources for <b>@{esc(username)}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    lines = [
+        f"🔬 <b>@{esc(username)}</b> — source probe",
+        f"<i>Route: {esc(instagram_route())}</i>",
+        "",
+    ]
+
+    api = await service.instagram.fetch_profile(username)
+    if api.success and not api.partial:
+        followers = (api.parsed or {}).get("followers_count")
+        lines.append(
+            f"✅ <b>API</b> (web_profile_info) — answered, "
+            f"followers: <b>{fmt_number(followers or 0)}</b>"
+        )
+    else:
+        lines.append(
+            f"❌ <b>API</b> (web_profile_info) — <code>"
+            f"{esc(str(api.error or api.http_status))}</code>"
+        )
+
+    page = await service.instagram.fetch_profile_via_public_page(username)
+    if page is not None and page.parsed:
+        got = page.parsed
+        lines.append(
+            f"✅ <b>Public page</b> — followers: "
+            f"<b>{fmt_number(got.get('followers_count') or 0)}</b>, "
+            f"following: <b>{fmt_number(got.get('following_count') or 0)}</b>, "
+            f"posts: <b>{fmt_number(got.get('posts_count') or 0)}</b>"
+        )
+    else:
+        lines.append("❌ <b>Public page</b> — blocked, or no counts in the markup")
+
+    if service.stories is not None:
+        try:
+            avatar = await service.stories.fetch_profile_pic_url(username)
+        except Exception as exc:  # pragma: no cover - network failure path
+            avatar = None
+            logger.debug("Probe: saveinsta lookup failed for @{}: {}", username, exc)
+        lines.append(
+            "✅ <b>saveinsta</b> — reachable (media + avatar)"
+            if avatar
+            else "❌ <b>saveinsta</b> — nothing came back"
+        )
+
+    lines.append("")
+    if api.success or (page is not None and page.parsed):
+        lines.append("<i>At least one source works — profile stats can flow.</i>")
+    else:
+        lines.append(
+            "<i>Every profile source is blocked from this host right now.</i>"
+        )
+
+    await status_msg.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboards.fetch_actions(username),
+    )
+
+
 async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download and send the current story for any public username, monitored or not."""
     if await _reject_if_unauthorized(update):
@@ -3240,6 +3324,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("fetchphoto", cmd_fetchphoto))
+    app.add_handler(CommandHandler("probe", cmd_probe))
     app.add_handler(CommandHandler("story", cmd_story))
     app.add_handler(CommandHandler("highlights", cmd_highlights))
     app.add_handler(CommandHandler("export", cmd_export))

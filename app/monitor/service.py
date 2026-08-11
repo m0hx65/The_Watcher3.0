@@ -1351,7 +1351,17 @@ class MonitorService:
         # For public accounts with instagram_id, fetch reel data (stories/highlights/live status)
         # This will be stored in the snapshot for future reference
         reel_data_response = None
-        if not parsed.get("is_private") and instagram_id:
+        # A partial result means the API door just 401'd and the public page
+        # answered instead. The reel query goes through that same shut door, so
+        # asking is one more blocked worker call (8 upstream attempts) for an
+        # answer we already know. The story phase treats it as unknown and
+        # falls back to saveinsta, which is reachable.
+        if fetch.partial:
+            logger.debug(
+                "Skipping the reel query for @{} — the API is blocked and the "
+                "public page supplied this check", username,
+            )
+        elif not parsed.get("is_private") and instagram_id:
             try:
                 reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
                 if reel_user:
@@ -1388,6 +1398,11 @@ class MonitorService:
             slim_raw["data"] = {"user": {"id": str(parsed_instagram_id)}}
         if reel_data_response:
             slim_raw["reel_data"] = reel_data_response
+        if fetch.partial:
+            # Which door answered, on the row itself — so a snapshot whose bio
+            # was carried forward is identifiable later as a partial reading
+            # rather than a full one.
+            slim_raw["source"] = fetch.source
 
         async with get_session() as session:
             previous = await crud.get_latest_snapshot(session, account_id)
@@ -1411,22 +1426,37 @@ class MonitorService:
                 else previous.profile_pic_url
             )
 
+            # The public-page fallback sees the counts and the name; it does not
+            # see the bio, the flags or the reel/highlight counts. For those,
+            # carry the last known value forward rather than writing a None:
+            #  - the card would otherwise show a real bio as newly empty, which
+            #    is a wrong "current" value, not a missing one;
+            #  - and diffing the next full API check against None would silently
+            #    swallow a bio change that happened while the API was blocked,
+            #    whereas against the carried value it still reports.
+            # Fields the source DID observe always win, so nothing fresh is
+            # overwritten by a stale value.
+            def observed(field: str):
+                if not fetch.partial or field in parsed:
+                    return parsed.get(field)
+                return getattr(previous, field, None) if previous else None
+
             snapshot = AccountSnapshot(
                 account_id=account_id,
                 username=parsed.get("username") or username,
-                full_name=parsed.get("full_name"),
-                biography=parsed.get("biography"),
-                followers_count=parsed.get("followers_count"),
-                following_count=parsed.get("following_count"),
-                posts_count=parsed.get("posts_count"),
-                reels_count=parsed.get("reels_count"),
-                story_count=parsed.get("story_count"),
-                is_private=parsed.get("is_private"),
-                is_verified=parsed.get("is_verified"),
-                is_business=parsed.get("is_business"),
+                full_name=observed("full_name"),
+                biography=observed("biography"),
+                followers_count=observed("followers_count"),
+                following_count=observed("following_count"),
+                posts_count=observed("posts_count"),
+                reels_count=observed("reels_count"),
+                story_count=observed("story_count"),
+                is_private=observed("is_private"),
+                is_verified=observed("is_verified"),
+                is_business=observed("is_business"),
                 profile_pic_url=stored_pic_url,
                 profile_pic_hash=stored_pic_hash,
-                external_url=parsed.get("external_url"),
+                external_url=observed("external_url"),
                 http_status=200,
                 raw_response=slim_raw or None,
             )

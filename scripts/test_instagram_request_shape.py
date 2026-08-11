@@ -125,15 +125,10 @@ async def test_sweep_asks_the_worker_once_per_blocked_check() -> None:
     round, not another 8 blocked requests right now."""
     from app.config import settings
 
-    calls = {"n": 0}
-
-    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
-        calls["n"] += 1
-        return _MockResponse(401, {})
-
-    session = _MockSession(handler)
+    proxy_url = "https://ig-proxy.example.workers.dev"
+    session = _MockSession(lambda url, params, headers: _MockResponse(401, {}))
     old = settings.ig_proxy_url
-    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.ig_proxy_url = proxy_url
     try:
         async with InstagramClient(max_retries=5, session=session) as client:
             result = await client.fetch_profile("65xim", auth_attempts=1)
@@ -142,7 +137,13 @@ async def test_sweep_asks_the_worker_once_per_blocked_check() -> None:
 
     assert not result.success
     assert result.http_status == 401
-    assert calls["n"] == 1, f"worker asked {calls['n']}× for one swept account"
+    worker_calls = [r for r in session.requests if r["url"] == proxy_url]
+    assert len(worker_calls) == 1, f"worker asked {len(worker_calls)}× for one account"
+    # The one extra request is the public-page fallback — a different door, one
+    # direct request, not another 8-attempt worker call.
+    page_calls = [r for r in session.requests if r["url"] != proxy_url]
+    assert len(page_calls) == 1, repr(session.requests)
+    assert page_calls[0]["url"] == "https://www.instagram.com/65xim/", page_calls
 
 
 async def test_manual_check_retries_across_colos() -> None:

@@ -23,6 +23,7 @@ from curl_cffi.requests.exceptions import RequestException, Timeout
 
 from app.config import settings
 from app.monitor.health import IG_PROFILE, IG_REEL, fetch_health
+from app.monitor.public_page import PARTIAL_FIELDS, parse_public_profile
 from app.utils.logger import logger
 
 INSTAGRAM_HOST = "www.instagram.com"
@@ -32,6 +33,9 @@ PROFILE_REEL_QUERY_ID = "9957820854288654"
 PROFILE_REEL_QUERY_URL = f"https://{INSTAGRAM_HOST}/graphql/query/"
 MOBILE_HOST = "i.instagram.com"
 MOBILE_USER_INFO_PATH = "/api/v1/users/{user_id}/info/"
+# The plain profile page — the fallback door when the API 401s. Same host, but
+# a public link-preview surface rather than a private API path.
+PROFILE_PAGE_HOST = INSTAGRAM_HOST
 FORCED_IG_APP_ID = "936619743392459"
 CHROME_IMPERSONATE = "chrome120"
 # Android Instagram UA — used for the mobile API endpoint to retrieve hd_profile_pic_url_info
@@ -62,10 +66,20 @@ class ProfileFetchResult:
     parsed: Optional[dict[str, Any]] = None
     raw_response: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    # Which door answered: "api" (web_profile_info) or "public_page" (the
+    # Open Graph block on instagram.com/<user>/). A public_page result is LIVE
+    # but PARTIAL — it carries the counts and the name, and genuinely does not
+    # know the bio, privacy or verification flags. Callers must not read an
+    # absent field as an empty one.
+    source: str = "api"
 
     @property
     def success(self) -> bool:
         return self.http_status == 200 and self.parsed is not None
+
+    @property
+    def partial(self) -> bool:
+        return self.source != "api"
 
 
 def _build_headers() -> dict[str, str]:
@@ -602,6 +616,15 @@ class InstagramClient:
                 )
                 await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
 
+        # The API door is shut. Before reporting a failure, try the other one:
+        # the public profile page is a different endpoint with different gating,
+        # and it costs a single direct request (not another 8-attempt worker
+        # call). It answers with fewer fields, never with stale ones.
+        if last_status in (401, 403):
+            fallback = await self.fetch_profile_via_public_page(username)
+            if fallback is not None:
+                return fallback
+
         # Record the terminal outcome once per fetch (retries within a single
         # fetch are one logical attempt against the endpoint).
         fetch_health.record_status(IG_PROFILE, last_status)
@@ -609,4 +632,55 @@ class InstagramClient:
             username=username,
             http_status=last_status,
             error=last_error or f"failed after {self.max_retries} attempts",
+        )
+
+    async def fetch_profile_via_public_page(
+        self, username: str
+    ) -> Optional[ProfileFetchResult]:
+        """Profile counts from the public page's Open Graph block, or None.
+
+        Deliberately NOT routed through the Worker: sent directly, this request
+        carries curl_cffi's real Chrome TLS fingerprint, while a Worker hop
+        would carry Cloudflare's runtime fingerprint under a Chrome
+        User-Agent — the mismatch being one of the things the gate reads. It
+        also sends no `x-ig-app-id`, so it looks like a page view rather than a
+        private-API call.
+
+        Returns None when the page is blocked or carries no counts, leaving the
+        caller's original error intact. Never returns zeros for missing data.
+        """
+        url = f"https://{PROFILE_PAGE_HOST}/{username.strip().lstrip('@')}/"
+        try:
+            response = await self._session.get(
+                url, headers={"Accept-Language": "en-US,en;q=0.9"}
+            )
+        except Exception as exc:
+            logger.debug("Public page fetch failed for @{}: {}", username, exc)
+            return None
+
+        if response.status_code != 200:
+            logger.debug(
+                "Public page for @{} answered HTTP {}", username, response.status_code
+            )
+            return None
+
+        parsed = parse_public_profile(getattr(response, "text", "") or "", username)
+        if parsed is None:
+            logger.debug(
+                "Public page for @{} carried no profile counts (login wall or "
+                "markup change)", username,
+            )
+            return None
+
+        fetch_health.record_status(IG_PROFILE, 200)
+        logger.info(
+            "@{} answered on the public page after the API blocked us — "
+            "partial data ({} of {} fields)",
+            username, len(parsed), len(PARTIAL_FIELDS),
+        )
+        return ProfileFetchResult(
+            username=username,
+            http_status=200,
+            parsed=parsed,
+            source="public_page",
         )

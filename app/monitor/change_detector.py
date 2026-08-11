@@ -278,7 +278,13 @@ def _is_meaningful_change(field_name: str, old: Any, new: Any) -> bool:
             return False
         return bool(old) != bool(new)
     if field_name in TEXT_FIELDS:
-        old_s = (old or "").strip()
-        new_s = (new or "").strip()
+        # None means "this observation couldn't see the field", which is not
+        # the same as seeing it empty — the public-page fallback knows the
+        # counts but genuinely cannot read the bio. Instagram's API sends ""
+        # for a cleared bio, so a real removal still reports as "" vs text.
+        if old is None or new is None:
+            return False
+        old_s = old.strip()
+        new_s = new.strip()
         return old_s != new_s
     return old != new
