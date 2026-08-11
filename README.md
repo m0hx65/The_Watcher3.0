@@ -94,7 +94,7 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - Tracks 10+ profile fields: followers, following, posts, reels, highlights, biography, full name, username, external link, verification badge, business flag, public/private status
 - **Works on private accounts** — all profile-level fields above are tracked for private targets, including an alert the moment an account goes private or public
 - Profile-picture change detection — avatars are compared by a perceptual fingerprint that ignores Instagram's per-URL re-encodes (so it never cries wolf) yet catches real swaps, and archived to disk
-- Story & live status surfaced on every sweep and live-checked when you open an account card
+- Story & live status checked every sweep and announced when it changes — one message per story, not one per sweep — plus a live check whenever you open an account card
 - Highlight catalog tracking — detects added, renamed, and removed highlights by name
 - Sweep-complete summary after every run, so you always know the bot is alive
 
@@ -128,6 +128,8 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls on the direct path
 - 90-second reel-data cache — sweeps and card opens never re-ask Instagram for the same data
 - Fast-fail circuit breaker on blocked endpoints instead of retry storms
+- Sweeps check one account at a time — the same request rhythm as a manual recheck, since bursts are what trip Instagram's anonymous rate limiter
+- Rate-limit guard: the gap widens as blocks pile up, a run of them pauses the sweep until the throttle window clears, and anything still blocked is retried in paced rounds before it's ever called a failure
 - Cached downloader tokens — the three-step token handshake runs once, not per request
 - Tenacity retries with exponential backoff; debounced failure alerts (no 429 spam)
 - Consecutive-failure counter per target, visible in `/status` and `/list`

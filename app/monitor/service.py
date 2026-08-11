@@ -48,15 +48,27 @@ _DOWNLOAD_UNAVAILABLE_MSG = (
     "status still work."
 )
 
-# Seconds between sweep launch starts. Firing every account at once is the
-# main 401 trigger — Instagram rate-limits the proxy egress on bursts, and a
-# blocked call retries inside the worker, snowballing the blocked traffic.
+# Seconds between sweep checks. Firing every account at once is the main 401
+# trigger — Instagram rate-limits the proxy egress on bursts, and a blocked call
+# retries inside the worker, snowballing the blocked traffic. The gap is counted
+# from the END of a check (see _SweepThrottle.slot), so with the default
+# concurrency of 1 the sweep produces the same request rhythm as a human
+# pressing Recheck — the pattern Instagram answers reliably.
 _SWEEP_STAGGER_SECONDS = 2.0
-# Cooldown before re-checking accounts that hit a rate-limit block during the
-# sweep. Instagram's anonymous throttle windows are short — by the time the
-# story phase plus this pause have run, a retry usually goes through.
+# First cooldown before re-checking accounts that hit a rate-limit block during
+# the sweep; it doubles each round up to the max. Instagram's anonymous throttle
+# windows are short, so a paced retry usually goes straight through.
 _SWEEP_RETRY_COOLDOWN_SECONDS = 30.0
-# Fetch statuses worth a second pass: rate-limit blocks and network timeouts.
+_SWEEP_RETRY_COOLDOWN_MAX_SECONDS = 120.0
+# Gap between the individual re-checks inside a retry round, so the round keeps
+# the unhurried one-at-a-time rhythm rather than replaying the burst that got
+# these accounts blocked in the first place.
+_SWEEP_RETRY_GAP_SECONDS = (2.0, 5.0)
+# How many times one sweep may pause on the rate-limit guard before it gives up
+# and defers the rest. A pause lets the throttle window clear and keeps the
+# accounts in THIS sweep; only a block that survives every pause defers them.
+_SWEEP_BREAKER_MAX_PAUSES = 2
+# Fetch statuses worth another pass: rate-limit blocks and network timeouts.
 # 404s are handled by the rename-recovery path, not by retrying.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
 
@@ -66,18 +78,25 @@ _PUBLIC_GRAB_MAX_ATTEMPTS = 3
 
 
 class _SweepThrottle:
-    """Adaptive launch pacing + a 401 circuit breaker for one sweep.
+    """Concurrency gate + adaptive pacing + a 401 guard for one sweep.
 
-    This never touches a request — it only decides how long to wait before
-    launching the NEXT account, and whether to stop launching more. On a
-    healthy sweep it behaves exactly like the old fixed stagger.
+    This never touches a request — it only decides WHEN the next account may be
+    checked, and whether to keep going at all.
 
-    As consecutive 401/403 blocks accumulate, the gap between launches widens
-    (soft backoff). Once `breaker_threshold` blocks happen in a row the breaker
-    opens: every not-yet-launched account is skipped and returned as a retriable
-    failure, so the existing retry pass (sequential, after a cooldown) or the
-    next sweep picks them up — instead of bursting into Instagram's rate limiter
-    and turning 4 blocks into 9.
+    `concurrency` lanes run at a time (1 by default: one account at a time, the
+    same shape as a manual Recheck). The gap between checks is stamped when a
+    slot is RELEASED, so it is a real gap between requests rather than between
+    launches — a burst of launches that all sit waiting on a semaphore was the
+    old behavior and it hit Instagram as one wave.
+
+    As consecutive 401/403 blocks accumulate the gap widens (soft backoff). Once
+    `breaker_threshold` blocks happen in a row the guard pauses the sweep for
+    `cooldown` seconds so Instagram's short throttle window can clear, and the
+    remaining accounts are checked after it — they stay in THIS sweep. Only
+    after `max_pauses` cooldowns fail to help does the breaker open: the
+    not-yet-checked accounts are skipped and returned as retriable failures for
+    the retry rounds / next sweep, instead of bursting into the rate limiter and
+    turning 4 blocks into 9.
     """
 
     def __init__(
@@ -86,17 +105,25 @@ class _SweepThrottle:
         base_stagger: float,
         max_stagger: float,
         breaker_threshold: int,
+        concurrency: int = 1,
+        cooldown: float = 0.0,
+        max_pauses: int = _SWEEP_BREAKER_MAX_PAUSES,
     ) -> None:
         self._base = max(0.0, base_stagger)
         self._max = max(self._base, max_stagger)
-        self._threshold = breaker_threshold  # 0 disables the breaker
+        self._threshold = breaker_threshold  # 0 disables the guard
+        self._cooldown = max(0.0, cooldown)  # 0 = open immediately, never pause
+        self._max_pauses = max(0, max_pauses)
         self._extra = 0.0
         self._consecutive_auth_fails = 0
         self._peak_consecutive = 0
         self._open = False
         self._skipped = 0
+        self._pauses = 0
+        self._gate = asyncio.Semaphore(max(1, concurrency))
         self._lock = asyncio.Lock()
-        self._next_slot = 0.0  # monotonic time the next launch may proceed
+        self._next_slot = 0.0  # monotonic time the next check may proceed
+        self._pause_until = 0.0  # monotonic time the guard's cooldown ends
 
     def is_open(self) -> bool:
         return self._open
@@ -108,6 +135,10 @@ class _SweepThrottle:
     @property
     def skipped(self) -> int:
         return self._skipped
+
+    @property
+    def pauses(self) -> int:
+        return self._pauses
 
     @property
     def peak_consecutive_blocks(self) -> int:
@@ -129,23 +160,53 @@ class _SweepThrottle:
             # Widen the gap by one base step per consecutive block.
             self._extra = min(self._max - self._base, self._extra + self._base)
             if self._threshold and self._consecutive_auth_fails >= self._threshold:
-                self._open = True
+                streak = self._consecutive_auth_fails
+                # A fresh streak starts after the pause — the cooldown is the
+                # remedy being tried, so it deserves its own window to work.
+                self._consecutive_auth_fails = 0
+                if self._cooldown > 0 and self._pauses < self._max_pauses:
+                    self._pauses += 1
+                    # A deadline, not a flag: every lane waits it out, so the
+                    # pause is a real gap in outbound traffic rather than one
+                    # delayed check with the others sliding past it.
+                    self._pause_until = time.monotonic() + self._cooldown
+                    logger.warning(
+                        "Rate-limit guard: pausing the sweep for {:.0f}s after "
+                        "{} blocks in a row (pause {}/{})",
+                        self._cooldown, streak, self._pauses, self._max_pauses,
+                    )
+                else:
+                    self._open = True
         elif status == 200:
             self._consecutive_auth_fails = 0
             # Relax gradually back toward the base stagger on success.
             self._extra = max(0.0, self._extra - self._base)
         # 404/429/0 leave pacing unchanged — they aren't the datacenter block.
 
-    async def await_slot(self) -> None:
-        """Sleep until this account's launch slot. Serialized so concurrently
-        scheduled checks don't all fire at once; the gap adapts to blocks."""
-        async with self._lock:
-            now = time.monotonic()
-            wait = self._next_slot - now
+    @contextlib.asynccontextmanager
+    async def slot(self):
+        """Hold one sweep lane for the duration of a check.
+
+        Waits for a free lane, then for the pacing gap left by the previous
+        check (and for any rate-limit cooldown still running), and stamps the
+        next gap on the way out so the spacing is measured between requests,
+        not launches.
+        """
+        async with self._gate:
+            async with self._lock:
+                now = time.monotonic()
+                wait = max(0.0, self._next_slot - now, self._pause_until - now)
             if wait > 0:
                 await asyncio.sleep(wait)
-                now = time.monotonic()
-            self._next_slot = now + self.current_stagger + random.uniform(0.0, 0.8)
+            try:
+                yield
+            finally:
+                async with self._lock:
+                    self._next_slot = (
+                        time.monotonic()
+                        + self.current_stagger
+                        + random.uniform(0.0, 0.8)
+                    )
 
 
 class MonitorService:
@@ -342,6 +403,7 @@ class MonitorService:
                         result_username,
                         instagram_id=instagram_id,
                         reel_data=result.get("reel_data"),
+                        always_report=True,
                     )
         return result
 
@@ -488,6 +550,10 @@ class MonitorService:
             return result
 
         logger.info("Starting scheduled sweep across {} accounts", len(targets))
+        # Randomize the order every sweep. Instagram's throttle hits whoever is
+        # in the window when it closes, so a fixed order made the same tail of
+        # accounts absorb every block sweep after sweep.
+        random.shuffle(targets)
         noun = "profile" if len(targets) == 1 else "profiles"
         await self.notifier.send_text(
             f"👁 Sweep started — {len(targets)} {noun} queued."
@@ -496,6 +562,8 @@ class MonitorService:
             base_stagger=_SWEEP_STAGGER_SECONDS,
             max_stagger=settings.sweep_stagger_max_seconds,
             breaker_threshold=settings.sweep_breaker_threshold,
+            concurrency=settings.sweep_concurrency,
+            cooldown=settings.sweep_breaker_cooldown_seconds,
         )
         results = await asyncio.gather(
             *(
@@ -521,29 +589,15 @@ class MonitorService:
                 r = {"ok": False, "username": uname, "error": repr(r), "crashed": True}
             outcomes.append((target_account_id, uname, r))
 
-        # Second pass: accounts that hit a rate-limit block get one more chance
-        # after a cooldown. The throttle is transient — a paced sequential retry
-        # usually succeeds, so the sweep summary stops reporting phantom
-        # failures. This runs BEFORE the story phase so a recovered account's
-        # story status comes from its fresh reel data; when it ran after, the
-        # sweep could announce "story status unavailable" for an account the
-        # very same sweep went on to report as checked.
-        retriable = [
-            (idx, aid, uname)
-            for idx, (aid, uname, r) in enumerate(outcomes)
-            if not r.get("ok") and r.get("status") in _RETRIABLE_STATUSES
-        ]
-        if retriable:
-            logger.info(
-                "Retrying {} rate-limited account(s) after a {:.0f}s cooldown",
-                len(retriable), _SWEEP_RETRY_COOLDOWN_SECONDS,
-            )
-            await asyncio.sleep(_SWEEP_RETRY_COOLDOWN_SECONDS)
-            for idx, aid, uname in retriable:
-                retry = await self._run_check(aid, uname)
-                if retry.get("ok"):
-                    outcomes[idx] = (aid, uname, retry)
-                await asyncio.sleep(random.uniform(2.0, 5.0))
+        # Second pass: accounts that hit a rate-limit block get several more
+        # chances, each after a longer cooldown. The block is transient — a
+        # paced sequential retry usually succeeds, so the sweep summary stops
+        # reporting failures the owner can't reproduce by hand. This runs BEFORE
+        # the story phase so a recovered account's story status comes from its
+        # fresh reel data; when it ran after, the sweep could announce "story
+        # status unavailable" for an account the very same sweep went on to
+        # report as checked.
+        recovered = await self._retry_blocked(outcomes)
 
         # One batched read of every pending backlog-grab flag, so the per-account
         # decision below costs no extra query on the hot path.
@@ -639,9 +693,17 @@ class MonitorService:
 
         noun = "profile" if checked == 1 else "profiles"
         summary = f"👁 Sweep complete — {checked} {noun} checked."
+        if recovered:
+            summary += f" {recovered} recovered on retry."
         if failed:
-            names = ", ".join(f"@{u}" for u in failed_usernames)
+            names = ", ".join(f"@{u}" for u in sorted(failed_usernames))
             summary += f" {failed} failed: {names}"
+        if throttle.pauses:
+            summary += (
+                f"\n⏸ Paused {throttle.pauses}× mid-sweep to let Instagram's "
+                f"rate-limit window clear ({throttle.peak_consecutive_blocks} "
+                "blocks in a row)."
+            )
         if throttle.tripped:
             summary += (
                 f"\n⚡ Rate-limit guard tripped after {throttle.peak_consecutive_blocks} "
@@ -818,9 +880,10 @@ class MonitorService:
     async def _staggered_check(
         self, throttle: "_SweepThrottle", account_id: int, username: str
     ) -> dict:
-        """Run one sweep check, paced by the shared adaptive throttle.
+        """Run one sweep check inside a slot of the shared throttle.
 
-        The throttle spaces launches (widening the gap as 401s accumulate) and,
+        The throttle limits how many checks run at once, spaces them (widening
+        the gap as 401s accumulate, pausing outright on a run of blocks) and,
         once the breaker is open, skips the remaining accounts so a burst never
         snowballs — bursts are what trip Instagram's anonymous rate limiter into
         401s on the shared proxy egress. The request itself is unchanged.
@@ -828,13 +891,71 @@ class MonitorService:
         if throttle.is_open():
             throttle.note_skip()
             return self._breaker_skipped_result(username)
-        await throttle.await_slot()
-        if throttle.is_open():  # tripped while this one was waiting its turn
-            throttle.note_skip()
-            return self._breaker_skipped_result(username)
-        result = await self._run_check(account_id, username)
-        throttle.record(result.get("status"))
-        return result
+        async with throttle.slot():
+            if throttle.is_open():  # tripped while this one waited its turn
+                throttle.note_skip()
+                return self._breaker_skipped_result(username)
+            result = await self._run_check(account_id, username)
+            # Recorded inside the slot so the next account's pacing — and any
+            # cooldown this block just triggered — already accounts for it.
+            throttle.record(result.get("status"))
+            return result
+
+    async def _retry_blocked(self, outcomes: list[tuple[int, str, dict]]) -> int:
+        """Re-check rate-limit-blocked accounts in paced rounds, in place.
+
+        Instagram's anonymous gate blocks a REQUEST, not an account: the same
+        username that 401s inside a sweep answers 200 a minute later on a manual
+        recheck. That is exactly the gap the owner kept seeing — a sweep naming
+        nine "failures" that all check fine by hand. One retry pass wasn't
+        enough, so each round waits out the throttle window (the cooldown
+        doubles per round) and re-checks the survivors one at a time, the same
+        shape as a manual recheck.
+
+        Bounded by `sweep_retry_budget_seconds` so a genuine hard block can't
+        stretch the sweep indefinitely. Returns how many accounts recovered.
+        """
+        rounds = max(0, settings.sweep_retry_rounds)
+        if not rounds:
+            return 0
+        deadline = time.monotonic() + max(0, settings.sweep_retry_budget_seconds)
+        cooldown = _SWEEP_RETRY_COOLDOWN_SECONDS
+        recovered = 0
+
+        for round_no in range(1, rounds + 1):
+            retriable = [
+                (idx, aid, uname)
+                for idx, (aid, uname, r) in enumerate(outcomes)
+                if not r.get("ok") and r.get("status") in _RETRIABLE_STATUSES
+            ]
+            if not retriable:
+                break
+            if time.monotonic() + cooldown >= deadline:
+                logger.info(
+                    "Retry budget spent — leaving {} blocked account(s) to the "
+                    "next sweep", len(retriable),
+                )
+                break
+            logger.info(
+                "Retry round {}/{}: {} blocked account(s) after a {:.0f}s cooldown",
+                round_no, rounds, len(retriable), cooldown,
+            )
+            await asyncio.sleep(cooldown)
+            for pos, (idx, aid, uname) in enumerate(retriable):
+                if time.monotonic() >= deadline:
+                    logger.info("Retry budget spent mid-round — stopping")
+                    break
+                retry = await self._run_check(aid, uname)
+                if retry.get("ok"):
+                    outcomes[idx] = (aid, uname, retry)
+                    recovered += 1
+                if pos < len(retriable) - 1:
+                    await asyncio.sleep(random.uniform(*_SWEEP_RETRY_GAP_SECONDS))
+            cooldown = min(_SWEEP_RETRY_COOLDOWN_MAX_SECONDS, cooldown * 2)
+
+        if recovered:
+            logger.info("{} account(s) recovered on retry", recovered)
+        return recovered
 
     async def _run_check(
         self, account_id: int, username: str, *, notify_unchanged: bool = False
@@ -1540,7 +1661,18 @@ class MonitorService:
 
     @staticmethod
     def _story_state_key(account_id: int) -> str:
+        """Last OBSERVED story status — the transition baseline. Written only
+        from a live reel query, never from a blocked check."""
         return f"story_state:{account_id}"
+
+    @staticmethod
+    def _story_announce_key(account_id: int) -> str:
+        """Last story status ANNOUNCED to the chat, which is a different thing
+        from the observed one: it advances even when the message was suppressed
+        as a duplicate (delivered media already said it). Quiet mode compares
+        against this, so one story yields one message however many sweeps it
+        survives. See _announce_story_status."""
+        return f"story_announced:{account_id}"
 
     @staticmethod
     def _highlight_scan_key(account_id: int) -> str:
@@ -1594,6 +1726,7 @@ class MonitorService:
         *,
         instagram_id: Optional[str] = None,
         reel_data: Optional[dict] = None,
+        always_report: bool = False,
     ) -> None:
         """Stories, highlight catalog changes, and new highlight media for public accounts.
 
@@ -1604,6 +1737,11 @@ class MonitorService:
         status is reported as unavailable — never re-read from a stored
         snapshot, whose reel_data is only as current as the last SUCCESSFUL
         check (days old for an account Instagram is currently blocking).
+
+        `always_report` forces the story/live status line out even when nothing
+        changed. Sweeps leave it False (see `_announce_story_status`); a manual
+        Recheck sets it, because someone who just asked for a check is owed an
+        answer either way.
         """
         assert self.stories is not None
         async with self._semaphore:
@@ -1702,12 +1840,17 @@ class MonitorService:
                         len(previous_catalog),
                     )
 
-                # Story/live status — reported ONLY from this check's live reel
+                # Story/live status — derived ONLY from this check's live reel
                 # data. When Instagram didn't answer, say so instead of dressing
                 # the last known status up as the current one: that's how an
                 # account whose profile fetch had been 401ing for days kept
                 # getting "🎬 HAS STORY" out of a stale snapshot while its Story
                 # button (a live saveinsta fetch) correctly said there was none.
+                #
+                # The message is only BUILT here. Sending it waits until the
+                # story media has been dealt with, because whether the media
+                # went out decides whether this line is news or a duplicate of
+                # it — see _announce_story_status.
                 state_key = self._story_state_key(account_id)
                 has_public_story = False
                 if reel_data is not None:
@@ -1724,9 +1867,9 @@ class MonitorService:
                     prev_is_live = prev_state == "live"
                     prev_has_story = prev_state == "story"
 
-                    # One status message per sweep, upgraded to a "just went
-                    # live" / "just posted a story" alert only when the status
-                    # actually changed since the last observation. With no prior
+                    # The status line is upgraded to a "just went live" / "just
+                    # posted a story" alert only when the status actually
+                    # changed since the last observation. With no prior
                     # observation (or while establishing the highlight baseline)
                     # there is no real prior state, so the "just …" wording is
                     # never used then.
@@ -1760,51 +1903,31 @@ class MonitorService:
                         msg = f"<b>@{esc(username)}</b> — ⭕ NO STORY"
                         change_type = "story_status"
 
-                    delivered = await self.notifier.send_text(
-                        msg, message_thread_id=thread_id
+                    status = (
+                        "live" if is_live else "story" if has_public_story else "none"
                     )
+                    status_payload = {
+                        "has_public_story": has_public_story,
+                        "is_live": is_live,
+                    }
                     async with get_session() as session:
                         # Only an OBSERVED status updates the baseline, so a
                         # blocked sweep can never manufacture a transition.
-                        await crud.set_setting(
-                            session,
-                            state_key,
-                            "live" if is_live else "story" if has_public_story else "none",
-                        )
-                        await crud.log_notification(
-                            session,
-                            account_id=account_id,
-                            change_type=change_type,
-                            payload={
-                                "has_public_story": has_public_story,
-                                "is_live": is_live,
-                            },
-                            message=msg,
-                            delivered=delivered,
-                        )
+                        await crud.set_setting(session, state_key, status)
                 else:
+                    status = "unknown"
                     msg = (
                         f"<b>@{esc(username)}</b> — ⚠️ story status unavailable\n"
                         "<i>Instagram didn't answer the live check — not "
                         "repeating the last known status.</i>"
                     )
+                    change_type = "story_status_unknown"
+                    status_payload = {"reason": "reel query unavailable"}
                     logger.warning(
                         "No live reel data for @{} this check — story/live status "
                         "reported as unavailable rather than from stored data",
                         username,
                     )
-                    delivered = await self.notifier.send_text(
-                        msg, message_thread_id=thread_id
-                    )
-                    async with get_session() as session:
-                        await crud.log_notification(
-                            session,
-                            account_id=account_id,
-                            change_type="story_status_unknown",
-                            payload={"reason": "reel query unavailable"},
-                            message=msg,
-                            delivered=delivered,
-                        )
 
                 # Fetch the actual story items to download (anonymous, no login,
                 # via saveinsta.to). A dead/rate-limited source just yields [].
@@ -1846,15 +1969,40 @@ class MonitorService:
                         len(catalog),
                         len(stories) + len(highlight_items),
                     )
+                    # Nothing is delivered on a baseline (that's the point), so
+                    # the status line is the only word this account gets.
+                    await self._announce_story_status(
+                        account_id, username,
+                        thread_id=thread_id, status=status, message=msg,
+                        change_type=change_type, payload=status_payload,
+                        always=always_report,
+                    )
                     return
 
+                sent = 0
                 if new_stories:
-                    alert = render_new_stories_alert(username, len(new_stories))
-                    await self.notifier.send_text(alert, message_thread_id=thread_id)
-                    await self._deliver_story_items(
+                    sent = await self._deliver_story_items(
                         account_id, username, new_stories, seen_pks,
                         message_thread_id=thread_id,
                     )
+                    if not sent:
+                        # Every download failed, so the media messages that would
+                        # have announced the story never went out. Say it in
+                        # text rather than let a real story pass in silence.
+                        alert = render_new_stories_alert(username, len(new_stories))
+                        await self.notifier.send_text(
+                            alert, message_thread_id=thread_id
+                        )
+
+                # Last, now that it's known whether the story already spoke for
+                # itself. `new_stories` covers both ways it can have: the media
+                # messages, or the text alert that replaced them.
+                await self._announce_story_status(
+                    account_id, username,
+                    thread_id=thread_id, status=status, message=msg,
+                    change_type=change_type, payload=status_payload,
+                    already_announced=bool(new_stories), always=always_report,
+                )
 
                 # Auto-download honors per-highlight mutes: untracked reels are
                 # skipped entirely (not even fetched). Unmuting re-baselines the
@@ -1901,6 +2049,83 @@ class MonitorService:
                 logger.exception(
                     "Story check failed for @{}: {}", username, exc
                 )
+
+    async def _announce_story_status(
+        self,
+        account_id: int,
+        username: str,
+        *,
+        thread_id: Optional[int],
+        status: str,
+        message: str,
+        change_type: str,
+        payload: dict,
+        already_announced: bool = False,
+        always: bool = False,
+    ) -> None:
+        """Send the story/live status line — but only when it says something new.
+
+        `status` is this check's observed state: "live" / "story" / "none" /
+        "unknown". Sending it every sweep is what turned a single story into a
+        message an hour, all of them identical, plus a third copy of the same
+        news whenever the media itself was delivered. So by default the line
+        goes out only when the status DIFFERS from the one last announced:
+
+        - a story that stays up for six sweeps is announced once, not six times;
+        - `already_announced` says this check has already sent a message about
+          the story — the media itself ("📖 @user — new story"), or the text
+          alert that stands in when the downloads fail. The line would only
+          repeat it, so it is suppressed while the baseline still advances,
+          which keeps the next sweep quiet too;
+        - "unknown" is never announced and never becomes the baseline. The sweep
+          summary already names every account Instagram wouldn't answer for, and
+          a status that merely went dark and came back unchanged is not news.
+
+        STORY_STATUS_HEARTBEAT=true restores the old line-every-sweep behavior.
+        `always` (manual Recheck) reports the status even when it hasn't
+        changed, since someone is waiting on the answer — but never on top of
+        the media, so a check is still one message. Either way the status is
+        logged, so the digest and history see every check.
+        """
+        announce_key = self._story_announce_key(account_id)
+        async with get_session() as session:
+            last_announced = await crud.get_setting(session, announce_key)
+
+        if settings.story_status_heartbeat:
+            send = True                     # opt-in: the old line every sweep
+        elif already_announced:
+            send = False                    # the media already said it
+        elif always:
+            send = True                     # a Recheck is owed an answer
+        elif status == "unknown":
+            send = False                    # the sweep summary covers this
+        else:
+            send = status != last_announced
+
+        delivered = False
+        if send:
+            delivered = await self.notifier.send_text(
+                message, message_thread_id=thread_id
+            )
+        else:
+            logger.debug(
+                "Story status for @{} unchanged ({}) — logged, not sent",
+                username, status,
+            )
+
+        async with get_session() as session:
+            # An unobserved status is not a status: leaving the baseline alone
+            # keeps a blocked sweep from announcing a "change" on recovery.
+            if status != "unknown":
+                await crud.set_setting(session, announce_key, status)
+            await crud.log_notification(
+                session,
+                account_id=account_id,
+                change_type=change_type,
+                payload=payload,
+                message=message,
+                delivered=delivered,
+            )
 
     async def _deliver_story_items(
         self,

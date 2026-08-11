@@ -93,17 +93,22 @@ User (Telegram)
 
 ```
 1.  APScheduler fires _sweep_wrapper()
-2.  MonitorService.check_all() fans out to all active accounts (semaphore-limited)
+2.  MonitorService.check_all() shuffles the active accounts and paces them
+    through _SweepThrottle (one at a time by default; the gap widens, and then
+    the sweep pauses outright, as 401/403 blocks pile up)
 3.  Per account:
     a.  InstagramClient.fetch_profile()  →  200 JSON from Instagram
     b.  InstagramClient.fetch_hd_pic_url()  →  mobile API for full-res picture
-    c.  MediaHasher.hash_url()  →  download + SHA-256
+    c.  MediaHasher.hash_url()  →  download + perceptual hash
     d.  detect_changes(previous_snapshot, new_snapshot)
     e.  If changed: INSERT AccountSnapshot, log NotificationLog
     f.  NotificationDispatcher sends text diff + picture document
-4.  StoriesClient checks stories/highlights (if API key configured)
-5.  Sweep-complete summary notification sent
-6.  Panel-bump debounce: main-menu message moved to bottom of chat
+4.  _retry_blocked() re-checks anything the gate blocked, in paced rounds —
+    a 401 blocks a request, not an account, so most recover here
+5.  StoriesClient checks stories/highlights; the story/live status is announced
+    only when it changed and the media didn't already announce it
+6.  Sweep-complete summary notification sent
+7.  Panel-bump debounce: main-menu message moved to bottom of chat
 ```
 
 ---
@@ -480,6 +485,13 @@ All settings are read from environment variables (or a `.env` file locally).
 | `JITTER_SECONDS` | `120` | Random jitter added to each sweep interval |
 | `MAX_CONCURRENT_FETCHES` | `3` | Max parallel Instagram fetches per sweep |
 | `REQUEST_TIMEOUT` | `20` | HTTP request timeout in seconds |
+| `SWEEP_CONCURRENCY` | `1` | Accounts checked at a time (1 = the manual-recheck rhythm) |
+| `SWEEP_STAGGER_MAX_SECONDS` | `12` | Widest gap between checks once blocks pile up |
+| `SWEEP_BREAKER_THRESHOLD` | `5` | Consecutive 401/403s that trip the guard (0 = off) |
+| `SWEEP_BREAKER_COOLDOWN_SECONDS` | `90` | Mid-sweep pause when it trips (0 = defer instead) |
+| `SWEEP_RETRY_ROUNDS` | `3` | Paced re-check rounds for blocked accounts (0 = off) |
+| `SWEEP_RETRY_BUDGET_SECONDS` | `300` | Wall-clock budget shared by those rounds |
+| `SWEEP_TIMEOUT_SECONDS` | `1500` | Hard cap on one sweep; must clear the pauses + retry budget |
 
 ### Data Retention
 

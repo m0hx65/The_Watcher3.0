@@ -60,14 +60,39 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=20, alias="REQUEST_TIMEOUT")
     max_concurrent_fetches: int = Field(default=3, alias="MAX_CONCURRENT_FETCHES")
 
-    # Sweep pacing + circuit breaker (pacing-on-failure only — never changes a
-    # request). The stagger between account launches widens as consecutive
-    # 401/403 blocks pile up (up to the max), and once this many blocks happen
-    # in a row the breaker opens: the remaining accounts are deferred to the
-    # retry pass / next sweep instead of feeding Instagram's rate limiter.
-    # Set the threshold to 0 to disable the breaker (adaptive stagger still runs).
+    # Sweep pacing + rate-limit guard (pacing-on-failure only — never changes a
+    # request). How many accounts a sweep checks at once: 1 means one at a time,
+    # the same request rhythm as a manual Recheck, which is the pattern
+    # Instagram's anonymous gate answers reliably. Raise it only if a sweep
+    # can't finish in time — every extra lane is a bigger burst.
+    sweep_concurrency: int = Field(default=1, alias="SWEEP_CONCURRENCY")
+    # The gap between checks widens as consecutive 401/403 blocks pile up (up to
+    # the max). Once this many blocks happen in a row the guard pauses the sweep
+    # for the cooldown so Instagram's short throttle window can clear, then
+    # carries on with the remaining accounts; only after the pauses run out
+    # (_SWEEP_BREAKER_MAX_PAUSES) are they deferred to the next sweep. Set the
+    # threshold to 0 to disable the guard (adaptive pacing still runs); set the
+    # cooldown to 0 to defer immediately instead of pausing.
     sweep_stagger_max_seconds: float = Field(default=12.0, alias="SWEEP_STAGGER_MAX_SECONDS")
     sweep_breaker_threshold: int = Field(default=5, alias="SWEEP_BREAKER_THRESHOLD")
+    sweep_breaker_cooldown_seconds: float = Field(
+        default=90.0, alias="SWEEP_BREAKER_COOLDOWN_SECONDS"
+    )
+    # Blocked accounts are re-checked in this many rounds after the sweep, each
+    # after a longer cooldown (30s, 60s, 120s…), one account at a time. A 401
+    # from the anonymous gate blocks a request, not an account, so a paced retry
+    # usually goes through — this is what stops the sweep from reporting
+    # failures that a manual Recheck can't reproduce. The rounds share one
+    # wall-clock budget so a real outage can't stretch the sweep. 0 disables.
+    sweep_retry_rounds: int = Field(default=3, alias="SWEEP_RETRY_ROUNDS")
+    sweep_retry_budget_seconds: int = Field(default=300, alias="SWEEP_RETRY_BUDGET_SECONDS")
+    # Hard cap on one sweep, after which it is abandoned so a hung connection
+    # can't block every later run. It has to clear the paced sweep itself plus
+    # everything the guard may legitimately spend waiting — the mid-sweep pauses
+    # and the retry budget above — or the timeout would start killing healthy
+    # sweeps mid-flight, which looks exactly like the failures it exists to
+    # prevent. Keep it well under CHECK_INTERVAL.
+    sweep_timeout_seconds: int = Field(default=1500, alias="SWEEP_TIMEOUT_SECONDS")
 
     # Stakeout mode — temporary high-frequency watch on a single target.
     # The floor sits above the 90s reel-data cache so every tick gets fresh
@@ -96,6 +121,17 @@ class Settings(BaseSettings):
     # re-listed at most this often. 0 re-lists every reel on every sweep (the
     # old behavior) at roughly 12× the traffic.
     highlight_scan_interval: int = Field(default=21600, alias="HIGHLIGHT_SCAN_INTERVAL")
+
+    # Per-sweep story/live status line ("HAS STORY" / "NO STORY" / "LIVE NOW").
+    # Off by default: with it on, one story produced a status line in every
+    # sweep for as long as it stayed up — dozens of messages saying the same
+    # thing, on top of the "just posted a story!" alert and the story media
+    # itself. Quiet mode announces the status only when it CHANGES, stays
+    # silent when the media (or its text stand-in) already announced the story,
+    # and drops the per-account "status unavailable" notice, which only repeats
+    # what the sweep summary already lists. A manual Recheck always answers.
+    # Every status is still logged for the digest either way.
+    story_status_heartbeat: bool = Field(default=False, alias="STORY_STATUS_HEARTBEAT")
 
     # Follower-anomaly alert: a follower change is flagged only when it's large
     # in BOTH absolute terms (≥ abs_min) and relative terms (≥ pct_min of the

@@ -25,8 +25,12 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPTS_DIR.parent
 
 # Suites that hit the real network / third-party services. Skipped unless --all.
+# They fail on any machine without outbound access (CI sandboxes included), and
+# a red suite that means "no internet here" teaches everyone to ignore red.
 LIVE_SUITES = {
     "test_proxy_live.py",
+    "test_ig_fetch.py",    # probes instagram.com directly
+    "test_stories.py",     # end-to-end saveinsta.to + reel query smoke test
 }
 
 
@@ -57,6 +61,16 @@ def run_one(path: Path) -> tuple[bool, float, str]:
 
 
 def main() -> int:
+    # Suite output is captured as UTF-8 (emoji, box drawing, the U+FFFD that
+    # `errors="replace"` leaves behind). A Windows console defaults to cp1252
+    # and would crash the runner while printing a FAILING suite's output —
+    # losing the report exactly when it matters.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="Run the offline test suites.")
     parser.add_argument("--all", action="store_true", help="include live-network probes")
     parser.add_argument("-k", dest="pattern", default=None, help="only suites whose name contains this")

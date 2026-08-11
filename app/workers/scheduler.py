@@ -414,16 +414,20 @@ class WatcherScheduler:
                 session, SETTING_LAST_SWEEP_AT,
                 datetime.now(timezone.utc).isoformat(),
             )
+        timeout = max(60, settings.sweep_timeout_seconds)
         try:
             # Hard cap: if check_all() never returns (hung HTTP connection, etc.)
             # _sweep_in_flight would stay True and block every subsequent scheduled
-            # run indefinitely. 10 minutes is generous for any realistic account count.
+            # run indefinitely. The cap has to leave room for the sweep's own
+            # rate-limit pauses and retry rounds (see SWEEP_TIMEOUT_SECONDS) —
+            # cutting a paced sweep short is how a healthy run turns into a
+            # screenful of "failed" accounts.
             await asyncio.wait_for(
                 self.service.check_all(backfill_ids=backfill_ids),
-                timeout=600,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
-            logger.error("Sweep timed out after 10 minutes — forcing flag reset")
+            logger.error("Sweep timed out after {}s — forcing flag reset", timeout)
         except Exception as exc:
             logger.exception("Sweep crashed: {}", exc)
         finally:
