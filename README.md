@@ -32,8 +32,8 @@ Track any Instagram account — **public or private** — followers, bio, profil
 - 🎬 **It doesn't just notify — it delivers.** New stories, posts, reels, highlights, and profile pictures arrive in your chat as actual photos and videos, not links.
 - 📦 **One tap grabs a whole account.** The **Download all** panel pulls the story, photos, reels, every highlight, and the profile picture of any public account — all of it, or just the parts you tick.
 - 📲 **Telegram is the entire UI.** Add targets, pause them, pull stories, tune the schedule, export history — all through inline buttons. You never touch a terminal after deploy.
-- ☁️ **Datacenter-proof.** Instagram 401-blocks cloud-host IPs wholesale; The Watcher routes **every** Instagram API call through a free Cloudflare Worker at the edge — IPs Instagram doesn't block — with a direct-request fallback and an anonymous media downloader as a second, independent path. Render, Fly, any VPS: it just works.
-- ⚡ **Proven at scale.** A single instance sweeps 25+ accounts around the clock — with jittered scheduling and throttled concurrency so it never trips rate limits.
+- ☁️ **Built for datacenter hosting.** Instagram 401-blocks cloud-host IPs wholesale, so The Watcher routes **every** Instagram API call through a free Cloudflare Worker at the edge, and when that gate does close it falls through to the public profile page and a login-free media downloader on separate infrastructure. Render, Fly, any VPS.
+- ⚡ **Proven at scale.** A single instance sweeps 25+ accounts around the clock — jittered scheduling, one account at a time, and a guard that backs off (or stops) the moment Instagram starts refusing, instead of hammering a shut door.
 - 📦 **One container, five minutes.** A single Docker image with a `render.yaml` blueprint — database, persistent disk, and webhook included. Runs on a free-tier box.
 
 ---
@@ -42,6 +42,10 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
+| 🚪 **A second door when Instagram's API shuts** | When `web_profile_info` answers 401, the bot falls back to the public profile page and reads follower/following/post counts, name and avatar from its Open Graph block — live, login-free, and fetched directly so it carries a real Chrome TLS fingerprint. Partial by nature and handled as such: fields it can't see stay untouched rather than being written as blank, so a fallback check can never fire a phantom "bio removed". |
+| 🔬 **`/probe <user>`** | Tests every source against one account and reports which answer — the API, the public page (with HTTP status and byte count), and the media downloader. Turns "everything is 401ing" into a specific, actionable answer in a few seconds, and logs the same at INFO. |
+| 🔕 **One story, one message** | A single story used to produce a status line in *every* sweep it survived, plus a "just posted a story!" alert, plus the media itself. Now the status is announced only when it changes, and never on top of the media that already announced it. `STORY_STATUS_HEARTBEAT=true` restores the old behavior. |
+| 🚦 **A guard that tells a throttle from an outage** | If some accounts answer, blocks mean a throttle: widen the gap, pause, carry on. If **nothing** answers, the gate is shut — the sweep stops immediately rather than spending hundreds of blocked requests proving it, and the summary says so instead of naming every account as a separate failure. |
 | 🧵 **One thread per account** | In a Topics-enabled group, the bot gives every monitored account its own forum thread — that account's profile changes, story status, highlights, media, and went-dark alerts route to its thread, while sweeps and summaries stay in General. Enable with `TELEGRAM_FORUM_TOPICS=true` then **Status → 🧵 Sync topics**. Deleted-topic and non-forum cases fall back to General safely. |
 | 🎯 **Stakeout mode** | `/stakeout @user 2h` (or the 🎯 button) watches a single target on a tight loop for a set window, then auto-reverts to the normal schedule. Every tick is a full check — profile, posts, reels, stories, highlights — all through the edge proxy and 90s cache, with an interval floor that keeps it clear of Instagram's rate limits (no 401s). Survives restarts. |
 | 📊 **Activity rhythm** | `/rhythm @user` (or the 📊 button) charts *when* a target is active — an hour-of-day and day-of-week histogram built from everything the bot has caught, in your local time. Spot the windows they post in at a glance. |
@@ -69,12 +73,13 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 ```
  Telegram chat ──► commands & inline menus ──► FastAPI + APScheduler
                                                       │  sweep
-                                 ┌────────────────────┴────────────────────┐
-                                 ▼                                         ▼
-                  Instagram API (web + graphql)              Anonymous media downloader
-              via Cloudflare Worker edge proxy · 90s cache   stories · highlights · posts
-           (profile fields, story/live status, highlights)   reels · full-res avatars
-                                 └────────────────────┬────────────────────┘
+                     ┌────────────────────────────────┼────────────────────────────┐
+                     ▼                                ▼                            ▼
+        Instagram API (web + graphql)     Public profile page          Anonymous media downloader
+    via Cloudflare Worker edge proxy      direct · Chrome TLS          stories · highlights · posts
+    90s cache · full profile fields       og: counts, name, avatar     reels · full-res avatars
+    story/live status · highlights        (fallback when the API 401s)
+                     └────────────────────────────────┼────────────────────────────┘
                                                       ▼
                                                  PostgreSQL
                                     snapshots · diffs · media hashes · dedup
@@ -84,7 +89,13 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
                                        formatted alert + photos/videos
 ```
 
-Two independent data paths mean one being blocked never takes the bot down: profile fields and story/live/highlight **status** come from Instagram's own API, routed through a free Cloudflare Worker on edge IPs Instagram doesn't block (with a Chrome-TLS-fingerprint direct fallback for local runs), while story/post/reel **media** flows through a login-free third-party downloader that cloud IP blocks don't touch.
+**Three independent doors mean one being blocked never takes the bot down.**
+
+1. **The API**, routed through a free Cloudflare Worker on edge IPs — full profile fields, story/live status, and the highlight catalog. This is the authoritative source and the one Instagram gates hardest.
+2. **The public profile page**, tried automatically when the API answers 401. Its Open Graph block carries the follower/following/post counts, display name and avatar — the fields the bot actually alerts on. It is fetched *directly*, so it carries `curl_cffi`'s real Chrome TLS fingerprint (a Worker hop cannot: its runtime fingerprint would contradict a Chrome User-Agent), and it sends no `x-ig-app-id`, so it reads as a page view rather than a private-API call. Live data, never a cache — it reports only the fields it can actually see.
+3. **A login-free media downloader** for story/post/reel media and full-resolution avatars, on infrastructure that cloud-IP blocks don't touch.
+
+`/probe <username>` tests all three and tells you which are answering right now.
 
 ---
 
@@ -128,9 +139,11 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls on the direct path
 - 90-second reel-data cache — sweeps and card opens never re-ask Instagram for the same data
 - Fast-fail circuit breaker on blocked endpoints instead of retry storms
+- **Three independent doors to Instagram** — the API through the edge proxy, the public profile page as a fallback, and a login-free media downloader. When the API gate shuts, follower/following/post counts still arrive from the page, and stories/posts keep flowing from the downloader
 - Sweeps check one account at a time — the same request rhythm as a manual recheck, since bursts are what trip Instagram's anonymous rate limiter
-- Rate-limit guard: the gap widens as blocks pile up, a run of them pauses the sweep until the throttle window clears, and anything still blocked is retried in paced rounds before it's ever called a failure
-- Blocked-request amplification is capped — one proxied call is already 8 upstream attempts, so it's never re-asked, and when a sweep sees a run of blocks with nothing getting through it stops instead of walking the list at ~16 blocked requests per account
+- Rate-limit guard that tells a throttle from an outage: if some accounts are answering, it widens the gap and pauses until the window clears; if **nothing** is answering it stops the sweep outright, because no pace helps a shut gate and every extra request keeps it shut
+- Blocked-request amplification is budgeted per path — one proxied call is already 8 upstream attempts, so a sweep asks once (14 accounts multiply everything), while an on-demand check retries across Cloudflare colos, which the gate answers differently
+- Anything still blocked is retried in paced rounds before it's ever called a failure — and the summary names a shut gate as one problem instead of listing every account as if each had failed separately
 - Cached downloader tokens — the three-step token handshake runs once, not per request
 - Tenacity retries with exponential backoff; debounced failure alerts (no 429 spam)
 - Consecutive-failure counter per target, visible in `/status` and `/list`
@@ -258,6 +271,20 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `JITTER_SECONDS` | `120` | Maximum random seconds added to each interval |
 | `MAX_CONCURRENT_FETCHES` | `3` | Max parallel profile fetches per sweep |
 | `REQUEST_TIMEOUT` | `20` | Per-request timeout in seconds |
+| `SWEEP_TIMEOUT_SECONDS` | `1500` | Hard cap on one sweep, after which it's abandoned so a hung connection can't block every later run. Must clear the paced sweep *plus* whatever the guard may legitimately spend waiting (pauses + retry budget), or it starts killing healthy sweeps mid-flight. Keep it well under `CHECK_INTERVAL` |
+
+### Sweep Pacing & Rate-Limit Guard
+
+Pacing-on-failure only — none of this ever changes a request, just when (and whether) the next one happens.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SWEEP_CONCURRENCY` | `1` | Accounts checked at once. `1` is the same request rhythm as a manual recheck, which is the pattern Instagram's anonymous gate answers reliably. Raise only if a sweep can't finish in time — every extra lane is a bigger burst |
+| `SWEEP_STAGGER_MAX_SECONDS` | `12` | Ceiling on the gap between checks. The gap starts at 2s and widens by one step per consecutive block, relaxing back on success |
+| `SWEEP_BREAKER_THRESHOLD` | `5` | Consecutive 401/403 blocks before the guard reacts. `0` disables the guard (adaptive pacing still runs) |
+| `SWEEP_BREAKER_COOLDOWN_SECONDS` | `90` | How long the sweep pauses when blocks pile up *but some accounts are answering* — a throttle worth waiting out. `0` = defer immediately instead of pausing. When **nothing** is answering the sweep stops outright instead, since no pace helps a shut gate |
+| `SWEEP_RETRY_ROUNDS` | `3` | Paced re-check rounds for blocked accounts after the sweep, each after a longer cooldown (30s, 60s, 120s). A block lands on a *request*, not an account, so a paced retry often goes through — this is what stops the summary reporting failures you can't reproduce by hand. `0` disables |
+| `SWEEP_RETRY_BUDGET_SECONDS` | `300` | Shared wall-clock budget for those rounds, so a real outage can't stretch a sweep indefinitely |
 
 ### Stakeout & Radar
 
@@ -279,6 +306,19 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `SNAPSHOT_RETENTION_DAYS` | `30` | Days to keep account snapshots. `0` = keep forever |
 | `NOTIFICATION_RETENTION_DAYS` | `90` | Days to keep notification logs |
 | `RAW_RESPONSE_RETENTION_DAYS` | `7` | Days to keep raw Instagram API responses |
+| `MEDIA_RETENTION_DAYS` | `14` | Days to keep downloaded story/post files. They were already delivered to Telegram and an on-demand request re-downloads, so this is a cache, not an archive. `0` = keep forever |
+
+### Notifications & Digest
+
+| Variable | Default | Description |
+|---|---|---|
+| `STORY_STATUS_HEARTBEAT` | `false` | Post a `HAS STORY` / `NO STORY` / `LIVE NOW` line every sweep. Off by default: one story used to produce one of these per sweep for as long as it stayed up, on top of the "just posted a story!" alert *and* the media itself. Off means the status is announced only when it **changes**, and never on top of the media that already announced it. A manual recheck always answers, and every status is logged for the digest either way |
+| `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight reel's media. A reel only changes when its owner adds a story to it — and that story was already caught and delivered live minutes earlier. Reels new to the catalog are always listed immediately. `0` = re-list everything every sweep (~12× the traffic) |
+| `AUTO_GRAB_ON_PUBLIC` | `true` | When a monitored account flips private → public, deliver its whole backlog instead of silently baselining it |
+| `FOLLOWER_ANOMALY_ABS_MIN` | `500` | A follower change is flagged only when it's large in **both** absolute and relative terms, so it never fires on a small account's noise or a big account's drift. Either value at `0` disables the alert |
+| `FOLLOWER_ANOMALY_PCT_MIN` | `0.10` | The relative half of that test (10% of the prior count) |
+| `DIGEST_HOUR` | `9` | Hour (UTC) at which a scheduled digest fires. The mode — off/daily/weekly — is set at runtime with `/digest` |
+| `DIGEST_WEEKDAY` | `0` | Weekday for a weekly digest (0 = Monday) |
 
 ### Instagram
 
@@ -286,6 +326,10 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 |---|---|---|
 | `IG_SESSION_COOKIE` | _(empty)_ | **Optional** — full cookie string from a logged-in browser session. The bot is fully functional without it; login-free is the default and recommended mode |
 | `IG_PROXY_URL` | _(empty)_ | Cloudflare Worker that proxies **all** Instagram API calls — profile fields, story/live status, highlight catalog, ID-to-username resolution. Strongly recommended on cloud hosts (preset in `render.yaml`); without it the bot makes direct requests, which datacenter IPs usually get 401-blocked on |
+| `IG_SWEEP_AUTH_ATTEMPTS` | `1` | How many times a sweep re-asks the Worker after a 401. One Worker call is already 8 upstream attempts, and a sweep multiplies every extra attempt by every account — that traffic is what keeps the gate shut, so the second chance is left to the retry rounds |
+| `IG_MANUAL_AUTH_ATTEMPTS` | `3` | Same, for on-demand checks (Recheck, card open, `/story`). A repeat call may leave from a different Cloudflare colo, and the gate answers differently per colo — so it's a real second chance. One account with someone waiting is not what shuts the gate |
+
+The story/live status is reported from live reel data only — never re-read from a stored snapshot. When Instagram doesn't answer, the bot says the status is unavailable rather than repeating a stale one.
 
 ### Proxy & Network
 
@@ -308,7 +352,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 
 | Command | Description |
 |---|---|
-| `/menu` | Open the main inline menu |
+| `/start` or `/menu` | Open the main inline menu |
 | `/add <target>` | Start monitoring — accepts `@username`, `https://instagram.com/username`, or a numeric Instagram ID. Runs an immediate baseline fetch |
 | `/remove <user>` | Stop monitoring and delete all stored history (`/rm` is an alias) |
 | `/pause <user>` | Pause monitoring — the target and its full history stay in the database |
@@ -328,6 +372,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 | `/fetchphoto <user>` | Download the current profile picture in max quality — works for any public account |
 | `/story <user>` | Download any public user's **current story** — no monitoring required |
 | `/highlights <user>` | List any public user's highlights with per-item download buttons |
+| `/probe <user>` | Test every profile source against one account and report which answer — the API, the public page (with status and byte count), and the media downloader. The fast way to tell a blocked gate from a broken route |
 | `/kill` | Stop an in-progress on-demand download (story / highlights / posts / bulk). Already-sent media stays; the rest is skipped (`/stop` is an alias) |
 | `/export` | Full notification history as CSV |
 | `/help` | Command reference |
@@ -340,7 +385,7 @@ All settings come from environment variables. Copy `.env.example` to `.env` for 
 - **📦 Bulk download panel** — asks whether the target is monitored (pick from the list) or not (type a username, URL, or ID), then shows checkboxes for 📖 Story · 👤 Profile pic · 🖼 Photos · 🎬 Reels · every highlight by name, with a select-all-highlights shortcut. **⬇️ Download selected** sends exactly what's ticked; **⚡ Download EVERYTHING** sends it all — with live per-category progress and a final summary
 - **Status view** — Sweep Now · **🌑 Dark radar** · Interval · **Clear Old Data** (with confirmation)
 - **Interval picker** — presets from 5 m to 6 h plus free-form custom entry
-- **Panel bumping** — after every notification the menu re-posts at the bottom of the chat, so it's always within thumb's reach
+- **Panel bumping** — after every notification the panel re-posts at the bottom of the chat, so it's always within thumb's reach. It re-posts *whatever view is currently open* — Status, "Sweep running", Dark radar — rather than snapping back to the menu, and it waits out a running download so it lands under the finished batch instead of between its media items
 
 > **🧵 One thread per target:** run the bot in a Telegram group with **Topics**
 > enabled, set `TELEGRAM_FORUM_TOPICS=true`, and tap **Status → 🧵 Sync topics**
@@ -375,7 +420,7 @@ Tables are created automatically on first boot via SQLAlchemy `create_all`.
 | Table | Description |
 |---|---|
 | `monitored_accounts` | One row per target: username, resolved Instagram ID, active/paused flag, last status, failure count |
-| `account_snapshots` | One row per fetch: all parsed profile fields, raw JSON response, HTTP status |
+| `account_snapshots` | One row per *changed* fetch: parsed profile fields, HTTP status, and a slim ~300-byte record (numeric id + what the reel query said) instead of Instagram's 50–200 KB payload. Identical repeat fetches are not stored |
 | `profile_media_hashes` | One row per unique profile picture (SHA-256 + disk path), deduplicated across accounts |
 | `notification_logs` | One row per dispatched change event: type, payload, delivery status |
 | `seen_stories` | Delivery dedup for stories, highlight items, **and posts/reels** — each media item is sent exactly once |
@@ -391,19 +436,37 @@ Pausing a target never deletes anything — the row, its Instagram ID, and all h
 ```
 app/
 ├── api/            HTTP API routes (FastAPI router)
-├── bot/            Telegram command handlers, inline menus, notification dispatch
+├── bot/            Telegram command handlers, inline menus, notification dispatch,
+│                   panel re-anchoring
 ├── database/       SQLAlchemy models, async session, CRUD helpers
-├── monitor/        Instagram client, anonymous media downloader, change detector, sweep orchestrator
+├── monitor/        Instagram client, public-page fallback parser, anonymous media
+│                   downloader, change detector, perceptual hashing, sweep orchestrator
 ├── utils/          Logging setup, user-agent rotation, formatting helpers
 ├── workers/        APScheduler-based sweep worker
 ├── config.py       Pydantic Settings — environment-driven configuration
 └── main.py         FastAPI app, lifespan wiring, service initialization
+scripts/            Standalone test suites + operational tools (run_tests.py, migrate_db.py)
+docs/               Architecture notes and dated engineering write-ups
 Dockerfile
 Procfile
 render.yaml
 requirements.txt
 .env.example
 ```
+
+---
+
+## 🧪 Tests
+
+Every suite is a standalone script that exits non-zero on failure — no pytest dependency. The runner executes each in its own subprocess, so a crash or a leaked event loop in one can't poison another.
+
+```bash
+python scripts/run_tests.py           # all offline suites
+python scripts/run_tests.py -k story  # only suites whose name matches
+python scripts/run_tests.py --all     # include live-network probes
+```
+
+Offline suites need no network and no Postgres (they run on SQLite), so they work in CI and in a sandbox. Live-network probes — which hit the real Instagram and downloader endpoints — are skipped unless you pass `--all`, because a red suite that only means "no internet here" teaches everyone to ignore red.
 
 ---
 

@@ -263,32 +263,89 @@ x-ig-app-id: 936619743392459
 ```
 
 **Retry logic:**
-- 401/403: immediate retry up to 5 times with `random.uniform(1.0, 3.0)` jitter
+- 401/403 **direct** (no Worker): retried up to `max_retries` (5) with
+  `random.uniform(1.0, 3.0)` jitter — a datacenter IP gets these
+  intermittently and a re-ask often lands
+- 401/403 **through the Worker**: budgeted by the caller, because one Worker
+  call is already 8 upstream attempts. A sweep passes
+  `IG_SWEEP_AUTH_ATTEMPTS` (1); on-demand callers get
+  `IG_MANUAL_AUTH_ATTEMPTS` (3). The re-ask is worth something because a
+  repeat call may leave from a different Cloudflare colo, and Instagram's
+  gate answers differently per colo — but a sweep multiplies every attempt by
+  every account, and that traffic is what keeps the gate shut
 - 429: exponential backoff, capped at 60s
 - 5xx: exponential backoff, capped at 30s
-- 404: return immediately, no retry
+- 404: return immediately, no retry (rename recovery handles it)
 
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
 
-**HD profile picture:** After the web API fetch, the client calls
-`i.instagram.com/api/v1/users/{id}/info/` with an Android UA to retrieve
-`hd_profile_pic_url_info` (full-size image, up to ~1440px). Falls back silently
-if unavailable.
+**Public-page fallback:** When the API path ends in 401/403, the client tries
+`instagram.com/<username>/` and parses the Open Graph block
+(`app/monitor/public_page.py`) for follower/following/post counts, display name
+and avatar. Deliberately **not** routed through the Worker: sent directly it
+carries `curl_cffi`'s real Chrome TLS fingerprint, whereas a Worker `fetch()`
+would carry Cloudflare's runtime fingerprint under a Chrome User-Agent — a
+contradiction that is itself a bot signal. It also sends no `x-ig-app-id`, so
+it reads as a page view rather than a private-API call.
+
+The result is marked `source="public_page"` and `partial=True`. It reports only
+what it saw: the bio, privacy and verification flags are **absent, not blank**.
+(`og:description` does contain a bio, but a truncated one — storing that would
+fire a bio-change alert on every sweep against the API's full text.) Callers
+carry unseen fields forward from the previous snapshot rather than writing
+`None`, and the change detector treats `None` as "unknown", never as "".
+
+Parsing is bounded — capped at `</head>`, matched one tag at a time, and run
+off the event loop. An earlier version used a lazy `(.*?)` under `re.DOTALL`
+that rescanned the whole document per non-matching tag; on a multi-MB profile
+page that pinned the CPU long enough for the health endpoint to time out and
+the instance to be killed.
+
+**HD profile picture:** `i.instagram.com/api/v1/users/{id}/info/` returns
+`hd_profile_pic_url_info` (up to ~1440px), but **only for logged-in sessions**.
+In the anonymous default that call can never succeed, so it is skipped entirely
+unless `IG_SESSION_COOKIE` is set — it was one guaranteed-wasted Instagram
+request per account per sweep. The anonymous ceiling is `profile_pic_url_hd`
+(~320px), with the media downloader's full-resolution avatar as a fallback.
 
 ### 6.2 MonitorService (`app/monitor/service.py`)
 
 Orchestrates the full check pipeline:
 
-1. Fetches profile + HD picture
+1. Fetches the profile (API → public-page fallback), and an avatar only when
+   the stored asset id shows it is a new upload
 2. Diffs against the latest snapshot
-3. Inserts snapshot **only if something changed** (or first-ever check)
+3. Inserts a snapshot **only if something changed** (or first-ever check)
 4. Sends notifications
 5. Runs story/highlight checks (if `StoriesClient` is wired in)
-6. Sends sweep-complete summary
+6. Retries anything blocked, in paced rounds
+7. Sends the sweep-complete summary
 
-Concurrency is limited by `asyncio.Semaphore(MAX_CONCURRENT_FETCHES)` to avoid
-hammering Instagram.
+Concurrency is limited by `asyncio.Semaphore(MAX_CONCURRENT_FETCHES)`, and the
+sweep itself is paced by `_SweepThrottle`:
+
+- **`SWEEP_CONCURRENCY` lanes** (default 1 — one account at a time, the same
+  request rhythm as a manual recheck). The gap is stamped when a check
+  *finishes*, so it is a real gap between requests rather than between
+  launches: a burst of launches all waiting on a semaphore was the old
+  behavior, and it hit Instagram as one wave.
+- **Adaptive pacing** — the gap widens by one step per consecutive 401/403 up
+  to `SWEEP_STAGGER_MAX_SECONDS`, and relaxes on success.
+- **A guard that distinguishes a throttle from an outage.** At
+  `SWEEP_BREAKER_THRESHOLD` consecutive blocks: if *some* account has answered
+  this sweep, it is a throttle — pause for `SWEEP_BREAKER_COOLDOWN_SECONDS`
+  and carry on (those accounts stay in this sweep). If **nothing** has
+  answered, the gate is shut: stop immediately, skip the retry rounds, and
+  skip the per-account reel fallback, because no pace helps and every further
+  request is blocked traffic that keeps it shut.
+- **Retry rounds** (`SWEEP_RETRY_ROUNDS`, cooldown doubling 30s → 60s → 120s,
+  bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a
+  time. A block lands on a *request*, not an account, so a paced retry often
+  goes through — this is what stops the summary reporting failures the owner
+  can reproduce as successes by hand a minute later.
+- **Order is shuffled every sweep**, so the same tail of accounts doesn't
+  absorb every block sweep after sweep.
 
 ### 6.3 WatcherScheduler (`app/workers/scheduler.py`)
 
@@ -297,7 +354,16 @@ APScheduler wrapper with two jobs:
 | Job | Trigger | Role |
 |---|---|---|
 | `watcher-sweep` | `IntervalTrigger` (configurable, default 30m) | Runs `check_all()` |
-| `watcher-cleanup` | `CronTrigger` — 03:00 UTC daily | Purges old DB rows |
+| `watcher-cleanup` | `CronTrigger` — 03:00 UTC daily | Purges old DB rows and expired media files |
+| `watcher-digest` | `CronTrigger` — `DIGEST_HOUR` UTC daily | Sends the roll-up when the runtime mode is daily/weekly |
+| `stakeout:<id>` | `IntervalTrigger` (per target, temporary) | One high-frequency watch; removed when the window ends |
+
+Overlap is impossible: the sweep job is `max_instances=1` with `coalesce=True`,
+and a re-entrancy flag makes a manual trigger skip while one is already in
+flight. `SWEEP_TIMEOUT_SECONDS` bounds a hung sweep — it has to clear the
+guard's pauses plus the retry budget, or it would start killing healthy sweeps
+mid-flight, which looks exactly like the failures it exists to prevent.
+Stakeouts are persisted to `app_settings` and re-armed after a restart.
 
 The sweep job persists `last_sweep_at` immediately at start (not end) to prevent
 duplicate sweeps from rapid server restarts. On startup, it reads this timestamp
@@ -317,29 +383,56 @@ Three send methods, all with retry logic:
 
 Each method calls `post_send_hook` on success, which triggers the panel-bump debounce.
 
-### 6.5 Panel Bump (`app/main.py`)
+### 6.5 Panel Bump (`app/bot/panel_bump.py`)
 
-After every batch of notifications, the main-menu panel is moved to the bottom
-of the chat so it's always accessible:
+After every batch of notifications, the panel is moved to the bottom of the
+chat so it's always accessible:
 
 1. `post_send_hook` fires after each successful send
 2. A 2-second debounced `asyncio.Task` waits for concurrent notifications to land
-3. Old panel is deleted, fresh panel is sent
-4. New panel message ID is persisted to `app_settings` (survives server restarts)
+3. If an on-demand download is running, the bump **waits for it to finish**
+   (bounded) rather than being dropped — bumping between the items of a batch
+   would wedge a menu between every photo, but dropping it strands the panel
+   above the media
+4. The old panel is deleted and re-posted at the bottom
+5. New panel message ID is persisted to `app_settings` (survives restarts)
+
+**It re-posts the panel's CURRENT view, not a hardcoded menu.** The panel is
+also where Status, "Sweep running" and Dark radar render, so posting the menu
+back threw those views away — pressing 🔄 Sweep All opened a view that the
+sweep's own first notification replaced a second later. Every edit records what
+it drew (`{message_id: (text, keyboard)}`, bounded), and the record follows the
+panel to its new message id so the next bump preserves it too. The menu is the
+fallback only when the content is genuinely unknown (a restart dropped it).
 
 ### 6.6 StoriesClient (`app/monitor/stories.py`)
 
-Fetches stories and highlights from `storiesig.info` API (when available).
-Uses the same Chrome TLS impersonation as the rest of the project.
+Fetches story, highlight and post media from **saveinsta.to** — login-free, no
+API key. Uses the same Chrome TLS impersonation as the rest of the project.
+(The older `storiesig.info` API this once used is dead and gone.)
+
+The flow is a three-step handshake, with the tokens cached so repeat fetches
+skip two of the round-trips:
+
+```
+GET  saveinsta.to/en/highlights   -> page carries k_exp / k_token
+POST saveinsta.to/api/userverify  -> issues a per-request cftoken
+POST saveinsta.to/api/ajaxSearch  -> returns media HTML for the target URL
+```
 
 - `fetch_stories(username)` → list of `StoryItem` (images + videos)
-- `fetch_highlights(username)` → all highlight reels and their items
+- `fetch_story_by_url(url)` → the same for a single story permalink
+- `fetch_highlight_items(username, highlight_id, title)` → one reel's media
+- `fetch_posts(username, limit=12)` → recent grid posts/reels, newest first
+- `fetch_profile_pic_url(username)` → full-resolution avatar (the anonymous web
+  API tops out at ~320px)
 - `download(item, username)` → saves to `{MEDIA_DIR}/{username}/stories/{pk}.jpg|mp4`
-- Dedup by `story_pk` against `seen_stories` table
+- Dedup by `story_pk` against the `seen_stories` table
 
-**Current status:** The storiesig.info free API endpoint is dead. The code
-degrades gracefully — `fetch_stories()` returns `[]` when the API is unreachable.
-Activate by setting `STORIESIG_API_KEY` once an API key is obtained.
+**Why it matters beyond media:** this runs on infrastructure unrelated to
+Instagram's own gate, so it keeps working when the API path is 401-blocked.
+During an outage the story media still arrives; only the live *status* goes
+unknown, and the bot says so rather than guessing.
 
 ### 6.7 Cloudflare Worker Proxy
 
@@ -354,12 +447,35 @@ Cloudflare Worker proxy is used for EVERY Instagram API call:
   with a logged-in session, which the anonymous setup doesn't use)
 - Rotates across 6 user agents, retries 8 times; a 200 with a non-JSON body
   (login-wall HTML) counts as blocked and is retried
-- Cloudflare edge IPs are never blocked by Instagram
 - Free tier: 100,000 requests/day
 
 Set `IG_PROXY_URL` in environment variables to enable. The bot falls back to
 direct Instagram requests if the proxy is unreachable, and serves repeated
 reel queries from a 90-second in-memory cache to keep request volume low.
+
+**Cloudflare edge IPs are not immune — they are just better odds.** Worth
+stating plainly, because the opposite assumption shaped earlier versions of
+this design:
+
+- Worker `fetch()` egress leaves from Cloudflare's published ranges under a
+  single well-known ASN, which every IP-intelligence dataset labels as
+  datacenter. Classifying it is a list lookup, not clever detection.
+- Those IPs are **shared** with every other Worker on the platform, so the
+  reputation attached to them is everyone's aggregate traffic, not yours. This
+  is why blocks flip per colo and differ per account, and why the same username
+  can 401 one minute and answer the next.
+- The 8 upstream attempts inside one call all leave from the **same colo with
+  the same TLS fingerprint** — they vary the User-Agent and host, which are not
+  what the gate keys on. Separate calls have a chance at a different colo,
+  which is why the manual path re-asks and the sweep does not.
+- A Worker hop also **loses the Chrome TLS fingerprint**: the runtime's own
+  handshake carries a header claiming to be Chrome. That mismatch is a stronger
+  signal than either fact alone, and it is why the public-page fallback is
+  fetched directly instead.
+
+The durable fix within a login-free design is a residential/mobile proxy
+(`IG_PROXY_URL` unset, `PROXY_URL` set), which gets a consumer-ASN IP *and*
+keeps the real Chrome fingerprint. The Worker remains the free default.
 
 ---
 
@@ -379,8 +495,20 @@ reel queries from a 90-second in-memory cache to keep request volume low.
 | `/history @username` | Last 15 change events for an account |
 | `/photo @username` | Send the stored profile picture |
 | `/fetchphoto @username` | Download and send current profile picture without adding to monitoring |
+| `/pause @username` / `/resume @username` | Freeze or resume a target — the row, its Instagram ID and all history are preserved |
+| `/stakeout @username [2h]` / `/unstakeout @username` | Temporary high-frequency watch on one target, then auto-revert |
+| `/rhythm @username` | Hour-of-day and day-of-week activity histogram |
+| `/darkradar` | Targets ranked by how long they've been silent |
+| `/story @username` / `/highlights @username` | On-demand media for **any** public account, monitored or not |
+| `/probe @username` | Test every profile source and report which answer — API, public page (HTTP status + byte count), media downloader |
+| `/digest [off\|daily\|weekly]` | Show, preview, or set the roll-up mode |
+| `/synctopics` | Create one forum topic per account (needs `TELEGRAM_FORUM_TOPICS=true`) |
+| `/kill` (alias `/stop`) | Abort an in-progress on-demand download; already-sent media stays |
 | `/export` | Download a CSV of all change history |
 | `/help` | Show help text |
+
+`/rm` is an alias for `/remove`. Sweeps and scheduled jobs are unaffected by
+`/kill`, which only cancels on-demand downloads.
 
 ### Inline Menu Navigation
 
@@ -474,8 +602,10 @@ All settings are read from environment variables (or a `.env` file locally).
 
 | Env Var | Default | Description |
 |---|---|---|
-| `IG_SESSION_COOKIE` | — | Full cookie string from a logged-in browser session (enables HD profile pictures) |
+| `IG_SESSION_COOKIE` | — | Full cookie string from a logged-in browser session (enables HD profile pictures). Optional — login-free is the default and recommended mode |
 | `IG_PROXY_URL` | — | Cloudflare Worker proxy URL for datacenter IP bypass |
+| `IG_SWEEP_AUTH_ATTEMPTS` | `1` | Worker re-asks per blocked check during a sweep (each call is already 8 upstream attempts) |
+| `IG_MANUAL_AUTH_ATTEMPTS` | `3` | Worker re-asks for an on-demand check — a repeat call may land on a different colo |
 
 ### Scheduler
 
@@ -500,6 +630,31 @@ All settings are read from environment variables (or a `.env` file locally).
 | `SNAPSHOT_RETENTION_DAYS` | `30` | Delete old snapshot rows (0 = keep forever) |
 | `NOTIFICATION_RETENTION_DAYS` | `90` | Delete old notification log rows |
 | `RAW_RESPONSE_RETENTION_DAYS` | `7` | NULL out `raw_response` JSONB on old rows |
+| `MEDIA_RETENTION_DAYS` | `14` | Delete downloaded story/post files older than this — already delivered to Telegram, and on-demand requests re-download |
+
+### Monitoring Behavior
+
+| Env Var | Default | Description |
+|---|---|---|
+| `STORY_STATUS_HEARTBEAT` | `false` | `true` posts a story/live status line every sweep (the old behavior). Off = announced only when it changes, and never on top of the media that already announced it |
+| `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight's media. New reels are always listed immediately. `0` = every sweep (~12× traffic) |
+| `AUTO_GRAB_ON_PUBLIC` | `true` | Deliver the whole backlog when a target flips private → public |
+| `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel (`0` disables) |
+| `FOLLOWER_ANOMALY_ABS_MIN` | `500` | Follower-jump alert fires only when the change is large in **both** absolute and relative terms |
+| `FOLLOWER_ANOMALY_PCT_MIN` | `0.10` | The relative half of that test |
+| `DIGEST_HOUR` | `9` | UTC hour a scheduled digest fires (mode is set at runtime via `/digest`) |
+| `DIGEST_WEEKDAY` | `0` | Weekday for a weekly digest (0 = Monday) |
+| `STAKEOUT_DEFAULT_INTERVAL` | `180` | Seconds between checks during a stakeout |
+| `STAKEOUT_MIN_INTERVAL` | `120` | Floor, kept above the 90s reel cache so every tick is fresh |
+| `STAKEOUT_DEFAULT_DURATION` | `3600` | Default stakeout length when none is given |
+| `STAKEOUT_MAX_DURATION` | `21600` | Hard cap (6h) on one stakeout |
+
+### Chat Routing
+
+| Env Var | Default | Description |
+|---|---|---|
+| `TELEGRAM_FORUM_TOPICS` | `false` | One forum topic per account in a Topics-enabled group; global messages stay in General |
+| `TELEGRAM_MIRROR_CHAT_IDS` | — | Comma-separated extra chats receiving a flat copy of every notification (mirrors never use topics) |
 
 ### Storage & Misc
 
@@ -509,7 +664,8 @@ All settings are read from environment variables (or a `.env` file locally).
 | `WEB_API_TOKEN` | — | Bearer token for HTTP API auth |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `PORT` | `8000` | Web server port (injected by Render automatically) |
-| `PROXY_URL` | — | Optional HTTP/HTTPS proxy for all outbound requests |
+| `PROXY_URL` | — | Optional HTTP/HTTPS/SOCKS5 proxy for all outbound requests. Wins over `HTTP_PROXY`/`HTTPS_PROXY`. Note it wraps the whole session, so with `IG_PROXY_URL` set it applies to the hop that reaches the Worker — not to the Worker's own egress to Instagram |
+| `HTTP_PROXY` / `HTTPS_PROXY` | — | Standard proxy env vars, used when `PROXY_URL` is unset |
 
 ---
 
