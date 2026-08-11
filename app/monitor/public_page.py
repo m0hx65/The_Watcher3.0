@@ -35,6 +35,16 @@ from typing import Any, Optional
 
 from app.utils.logger import logger
 
+# A profile page runs to several megabytes, almost all of it inlined JSON and
+# script below the fold. Everything this parser wants is in <head>, so the scan
+# is capped: cut at </head> when it appears, else at this many characters. It
+# bounds the work regardless of what Instagram serves — including an endless or
+# malformed document, which is exactly the shape that hurts a regex.
+_HEAD_LIMIT = 256_000
+# The numeric id lives in the inlined JSON below <head>, so it gets its own
+# (larger, still bounded) window. The patterns for it are simple and linear.
+_ID_SCAN_LIMIT = 1_000_000
+
 # "1,234 Followers, 567 Following, 89 Posts" — with abbreviations on big
 # accounts ("1.2M Followers"). The separator between them is a plain comma in
 # every locale we ask for (Accept-Language is en-US).
@@ -44,16 +54,25 @@ _COUNTS_RE = re.compile(
     r"([\d.,]+\s*[KMB]?)\s+Posts?",
     re.IGNORECASE,
 )
-# Meta tags in either attribute order, single or double quoted.
-_META_RE = re.compile(
-    r"<meta[^>]+(?:property|name)=[\"']og:(description|title|image)[\"'][^>]*>",
-    re.IGNORECASE,
+# Meta tags are matched ONE AT A TIME, bounded by the tag's own closing ">".
+#
+# The obvious pattern — one regex spanning content=… and property=… with a lazy
+# `(.*?)` under DOTALL — is a trap on a document this size. For every `<meta`
+# that doesn't match, the lazy group expands across the ENTIRE remaining
+# document before failing, so the cost is quadratic in page size. On a real
+# Instagram profile page (megabytes, hundreds of meta tags) that pinned the CPU
+# for minutes, and since it runs on the event loop it stalled the health
+# endpoint until Render killed the instance.
+#
+# So: find each tag with a length-bounded pattern that cannot cross `>`, then
+# read attributes from within that one short string. Linear, and the work per
+# tag has a hard ceiling.
+_META_TAG_RE = re.compile(r"<meta\b[^>]{0,4000}>", re.IGNORECASE)
+_OG_KEY_RE = re.compile(
+    r"(?:property|name)\s*=\s*[\"']og:(description|title|image)[\"']", re.IGNORECASE
 )
-_CONTENT_RE = re.compile(r"content=[\"'](.*?)[\"']", re.IGNORECASE | re.DOTALL)
-_META_CONTENT_FIRST_RE = re.compile(
-    r"<meta[^>]+content=[\"'](.*?)[\"'][^>]*(?:property|name)=[\"']og:"
-    r"(description|title|image)[\"']",
-    re.IGNORECASE | re.DOTALL,
+_CONTENT_RE = re.compile(
+    r"content\s*=\s*(?:\"([^\"]{0,4000})\"|'([^']{0,4000})')", re.IGNORECASE
 )
 # "Name (@username) • Instagram photos and videos" -> "Name"
 _TITLE_RE = re.compile(r"^(.*?)\s*\(@([^)]+)\)")
@@ -102,17 +121,29 @@ def _to_int(raw: str) -> Optional[int]:
 
 
 def _meta_tags(page: str) -> dict[str, str]:
-    """Extract og:description / og:title / og:image, whatever the attribute order."""
+    """Extract og:description / og:title / og:image, whatever the attribute order.
+
+    One bounded pass: each tag is matched on its own and its attributes read
+    from that short string, so attribute order costs nothing and no pattern
+    can wander across the document. Stops as soon as all three are in hand —
+    they sit in <head>, so a normal page exits within the first few hundred
+    tags without touching the megabytes of body below.
+    """
     found: dict[str, str] = {}
-    for tag in _META_RE.finditer(page):
-        key = tag.group(1).lower()
-        content = _CONTENT_RE.search(tag.group(0))
-        if content and key not in found:
-            found[key] = html.unescape(content.group(1))
-    for match in _META_CONTENT_FIRST_RE.finditer(page):
-        key = match.group(2).lower()
-        if key not in found:
-            found[key] = html.unescape(match.group(1))
+    for tag in _META_TAG_RE.finditer(page):
+        chunk = tag.group(0)
+        key_match = _OG_KEY_RE.search(chunk)
+        if key_match is None:
+            continue
+        key = key_match.group(1).lower()
+        if key in found:
+            continue
+        content = _CONTENT_RE.search(chunk)
+        if content is None:
+            continue
+        found[key] = html.unescape(content.group(1) or content.group(2) or "")
+        if len(found) == 3:
+            break
     return found
 
 
@@ -124,7 +155,11 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
     """
     if not page:
         return None
-    tags = _meta_tags(page)
+
+    head_end = page.find("</head>")
+    head = page[: head_end if 0 <= head_end <= _HEAD_LIMIT else _HEAD_LIMIT]
+
+    tags = _meta_tags(head)
     description = tags.get("description", "")
     counts = _COUNTS_RE.search(description)
     if not counts:
@@ -158,8 +193,9 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
     if image:
         parsed["profile_pic_url"] = image
 
+    id_window = page[:_ID_SCAN_LIMIT]
     for pattern in _ID_RES:
-        found = pattern.search(page)
+        found = pattern.search(id_window)
         if found:
             parsed["instagram_id"] = found.group(1)
             break

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -112,6 +113,53 @@ def test_modern_page_parses() -> None:
     # sweep against the API's full text.
     expect("the truncated bio is never stored", "biography" not in parsed,
            repr(parsed))
+
+
+def test_real_sized_page_parses_fast() -> None:
+    """The bug that killed the service: a lazy `.*?` under DOTALL rescanned the
+    whole document for every non-matching <meta>, so cost grew quadratically
+    with page size. A real profile page is megabytes, the parse ran on the
+    event loop, the health endpoint stopped answering, and Render killed the
+    instance mid-probe.
+
+    So: parse something the size of the real thing, and hold it to a budget a
+    quadratic implementation cannot possibly meet.
+    """
+    # A page shaped like Instagram's: a head full of meta tags that do NOT
+    # match (the trigger), the og: block, then megabytes of inlined JSON.
+    decoys = "\n".join(
+        f'<meta name="decoy-{i}" content="{"x" * 200}">' for i in range(400)
+    )
+    body_json = '<script type="application/json">' + ('{"k":"' + "v" * 100 + '"},') * 20_000 + "</script>"
+    page = (
+        "<html><head>" + decoys + PAGE_CLASSIC.split("<head>")[1].split("</head>")[0]
+        + "</head><body>" + body_json + "</body></html>"
+    )
+    size_mb = len(page) / 1_000_000
+    expect("the fixture is realistically large", size_mb > 2, f"{size_mb:.1f} MB")
+
+    start = time.monotonic()
+    parsed = parse_public_profile(page, "rein__saad")
+    elapsed = time.monotonic() - start
+
+    expect("a real-sized page still parses", parsed is not None)
+    assert parsed
+    expect("and gets the right counts", parsed.get("followers_count") == 1234,
+           repr(parsed))
+    # The quadratic version took minutes on this shape; anything near a second
+    # means the bound is gone again.
+    expect("a multi-MB page parses in well under a second", elapsed < 1.0,
+           f"{elapsed:.2f}s for {size_mb:.1f} MB")
+
+
+def test_pathological_markup_is_bounded() -> None:
+    """Unterminated attributes and no </head> must not send the scan wandering."""
+    page = "<html><head>" + '<meta property="og:description" content="' + "x" * 500_000
+    start = time.monotonic()
+    parsed = parse_public_profile(page, "someone")
+    elapsed = time.monotonic() - start
+    expect("malformed markup yields nothing rather than hanging", parsed is None)
+    expect("and returns immediately", elapsed < 1.0, f"{elapsed:.2f}s")
 
 
 def test_login_wall_yields_nothing() -> None:
@@ -233,6 +281,8 @@ async def test_blocked_page_keeps_the_original_error() -> None:
 async def main() -> int:
     test_classic_page_parses()
     test_modern_page_parses()
+    test_real_sized_page_parses_fast()
+    test_pathological_markup_is_bounded()
     test_login_wall_yields_nothing()
     test_count_parsing()
     test_unknown_text_field_is_not_a_change()

@@ -709,7 +709,12 @@ class InstagramClient:
             )
             return result
 
-        parsed = parse_public_profile(body, username)
+        # Off the event loop. The parse is bounded now, but this ran on the
+        # loop when a pathological pattern made it quadratic, and the stall
+        # took the health endpoint down with it — Render killed the instance
+        # mid-probe. A few megabytes of text scanning does not belong on the
+        # loop even when it is fast.
+        parsed = await asyncio.to_thread(parse_public_profile, body, username)
         result["parsed"] = parsed
         if parsed is None:
             result["error"] = "no counts in the markup"
