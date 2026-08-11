@@ -28,7 +28,12 @@ from app.monitor.change_detector import (
     pic_fingerprints_differ,
 )
 from app.monitor.instagram import InstagramClient, ProfileFetchResult, extract_instagram_id
-from app.monitor.media_hasher import HashedMedia, MediaHasher
+from app.monitor.media_hasher import (
+    PHASH_PREFIX,
+    HashedMedia,
+    MediaHasher,
+    pic_asset_id,
+)
 from app.monitor.stories import StoriesClient
 from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
@@ -1026,15 +1031,53 @@ class MonitorService:
             if hd_url:
                 pic_url = hd_url
 
-        hashed: Optional[HashedMedia] = None
+        # Skip the download entirely when the CDN URL proves it is the same
+        # upload we already fingerprinted. An avatar URL's numeric asset id
+        # changes if and ONLY IF a new picture was set (see pic_asset_id), and
+        # _pic_changed can never report a change without perceptual evidence —
+        # so re-downloading a byte-identical-by-construction image can't alter
+        # any outcome. It was the bot's single largest egress line item: a
+        # full-resolution JPEG (incompressible, often 100 KB+) per account per
+        # sweep, ~48 times a day each, to re-learn a fingerprint we already had.
+        # Any of the escape hatches below (no stored fingerprint, unparseable
+        # id on either side, first sighting) still downloads.
+        baseline_hash, baseline_url = (None, None)
         if pic_url:
+            async with get_session() as session:
+                baseline_hash, baseline_url = await crud.get_latest_pic_baseline(
+                    session, account_id
+                )
+        current_asset = pic_asset_id(pic_url)
+        pic_unchanged = bool(
+            pic_url
+            and current_asset
+            and baseline_hash
+            and baseline_hash.startswith(PHASH_PREFIX)
+            and current_asset == pic_asset_id(baseline_url)
+        )
+
+        hashed: Optional[HashedMedia] = None
+        if pic_url and not pic_unchanged:
             hashed = await self.hasher.hash_url(pic_url, username)
+        elif pic_unchanged:
+            logger.debug(
+                "Avatar for @{} is the same upload (asset id {}) — skipping the "
+                "download, the stored fingerprint still applies",
+                username, current_asset,
+            )
 
         # The direct CDN download can fail (datacenter egress gets blocked) or
         # return an unhashable payload; without a fingerprint the pic check
         # silently skips the whole sweep. Fall back to saveinsta's login-free
-        # HD avatar so the check still runs this sweep instead of never.
-        if (hashed is None or hashed.phash is None) and pic_url and self.stories is not None:
+        # HD avatar so the check still runs this sweep instead of never. Only
+        # when a download was actually ATTEMPTED and failed — a deliberate skip
+        # above already has its fingerprint and must not trigger the fallback.
+        if (
+            not pic_unchanged
+            and (hashed is None or hashed.phash is None)
+            and pic_url
+            and self.stories is not None
+        ):
             try:
                 fallback_url = await self.stories.fetch_profile_pic_url(username)
             except Exception as exc:  # pragma: no cover - network failure path
@@ -1073,10 +1116,7 @@ class MonitorService:
         # the tentative and confirmation comparisons alike.
         web_pic_url = parsed.get("profile_pic_url")
         if new_pic_hash and hashed is not None:
-            async with get_session() as session:
-                baseline_hash, baseline_url = await crud.get_latest_pic_baseline(
-                    session, account_id
-                )
+            # Baseline already loaded above for the skip decision — same row.
             if baseline_hash and pic_fingerprints_differ(
                 baseline_hash, new_pic_hash,
                 old_url=baseline_url, new_url=web_pic_url,
@@ -1163,9 +1203,11 @@ class MonitorService:
             stored_pic_hash = new_pic_hash or (
                 previous.profile_pic_hash if previous else None
             )
+            # `pic_unchanged` means this URL carries the SAME asset id as the
+            # stored one, so absorbing its fresh signature can't hide an upload.
             stored_pic_url = (
                 web_pic_url
-                if new_pic_hash or previous is None
+                if new_pic_hash or pic_unchanged or previous is None
                 else previous.profile_pic_url
             )
 
@@ -1500,6 +1542,51 @@ class MonitorService:
     def _story_state_key(account_id: int) -> str:
         return f"story_state:{account_id}"
 
+    @staticmethod
+    def _highlight_scan_key(account_id: int) -> str:
+        return f"highlight_scan:{account_id}"
+
+    async def _due_highlight_scan(
+        self,
+        account_id: int,
+        tracked_catalog: dict[str, str],
+        previous_catalog: dict[str, str],
+    ) -> tuple[dict[str, str], bool]:
+        """Which highlight reels to list this sweep, and whether it's a full scan.
+
+        A reel's media listing costs one third-party round-trip each, every
+        sweep, to re-discover items that (almost always) haven't changed. So a
+        full re-list runs at most once per `highlight_scan_interval`; between
+        those, only reels that are NEW to the catalog are listed — a reel can't
+        gain items without its owner adding a story to it, and that story was
+        already delivered live by the story phase above. Returns the catalog to
+        scan plus True when this is the full pass (so the caller can stamp the
+        clock only after the work actually happened).
+        """
+        interval = settings.highlight_scan_interval
+        if interval <= 0 or not tracked_catalog:
+            return tracked_catalog, True
+        async with get_session() as session:
+            raw = await crud.get_setting(session, self._highlight_scan_key(account_id))
+        try:
+            last = float(raw) if raw else None
+        except ValueError:
+            last = None
+        if last is None or (time.time() - last) >= interval:
+            return tracked_catalog, True
+        fresh = {
+            hid: title
+            for hid, title in tracked_catalog.items()
+            if hid not in previous_catalog
+        }
+        if fresh:
+            logger.debug(
+                "Listing only {} new highlight reel(s) for account {} — full "
+                "re-scan is not due for another {:.0f}s",
+                len(fresh), account_id, interval - (time.time() - last),
+            )
+        return fresh, False
+
     async def _check_stories_and_highlights(
         self,
         account_id: int,
@@ -1622,6 +1709,7 @@ class MonitorService:
                 # getting "🎬 HAS STORY" out of a stale snapshot while its Story
                 # button (a live saveinsta fetch) correctly said there was none.
                 state_key = self._story_state_key(account_id)
+                has_public_story = False
                 if reel_data is not None:
                     has_public_story = bool(reel_data.get("has_public_story"))
                     is_live = bool(reel_data.get("is_live"))
@@ -1720,7 +1808,20 @@ class MonitorService:
 
                 # Fetch the actual story items to download (anonymous, no login,
                 # via saveinsta.to). A dead/rate-limited source just yields [].
-                stories = await self.stories.fetch_stories(username)
+                # Skipped when Instagram's own live flag says there is no story
+                # to fetch: it's the same signal the sweep just reported as
+                # "⭕ NO STORY", and the media listing behind it would come back
+                # empty. Only a status we actually observed can gate this — when
+                # the reel query didn't answer, saveinsta IS the story oracle
+                # and must still be asked.
+                if reel_data is not None and not has_public_story:
+                    stories = []
+                    logger.debug(
+                        "@{} has no active story — skipping the story media "
+                        "listing this sweep", username,
+                    )
+                else:
+                    stories = await self.stories.fetch_stories(username)
                 new_stories = [s for s in stories if s.pk and s.pk not in seen_pks]
 
                 if establishing_baseline:
@@ -1730,6 +1831,14 @@ class MonitorService:
                     async with get_session() as session:
                         await crud.mark_story_items_seen(
                             session, account_id, stories + highlight_items
+                        )
+                        # Baseline counts as a full reel scan — start the
+                        # re-scan clock here instead of listing them all again
+                        # on the very next sweep.
+                        await crud.set_setting(
+                            session,
+                            self._highlight_scan_key(account_id),
+                            str(time.time()),
                         )
                     logger.info(
                         "Established story/highlight baseline for @{} ({} reels, {} items)",
@@ -1759,9 +1868,27 @@ class MonitorService:
                     for hid, title in catalog.items()
                     if hid not in untracked
                 }
-                highlight_items = await self._gather_highlight_items(
-                    username, tracked_catalog
+
+                # Re-listing every reel's media on every sweep was the second
+                # biggest egress line item and it almost never finds anything: a
+                # reel changes only when its owner adds a story to it, and that
+                # story was already detected and delivered live minutes earlier.
+                # Reels that are NEW to the catalog are listed immediately; the
+                # rest are re-listed once per highlight_scan_interval (0 = every
+                # sweep, the old behavior).
+                scan_catalog, full_scan = await self._due_highlight_scan(
+                    account_id, tracked_catalog, previous_catalog
                 )
+                highlight_items = await self._gather_highlight_items(
+                    username, scan_catalog
+                )
+                if full_scan and scan_catalog:
+                    async with get_session() as session:
+                        await crud.set_setting(
+                            session,
+                            self._highlight_scan_key(account_id),
+                            str(time.time()),
+                        )
                 new_highlight_items = [
                     i for i in highlight_items if i.pk and i.pk not in seen_pks
                 ]

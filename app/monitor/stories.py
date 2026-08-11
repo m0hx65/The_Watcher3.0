@@ -45,6 +45,10 @@ _VERIFY_URL = f"{_BASE}/api/userverify"
 _SEARCH_URL = f"{_BASE}/api/ajaxSearch"
 _DL_HOST = "https://dl.snapcdn.app"
 _CHROME = "chrome120"
+# How long a fetched (k_exp, k_token) pair is reused. Well under the page's own
+# k_exp, and long enough that a 30-minute sweep or a 3-minute stakeout tick
+# reuses one token page instead of re-downloading it.
+_TOKEN_TTL = 1500.0
 
 # Page carries `k_exp = "..."` / `k_token = "..."` inline; ajaxSearch needs both.
 _K_EXP_RE = re.compile(r'k_exp\s*=\s*"([^"]+)"')
@@ -89,6 +93,10 @@ class StoriesClient:
         # stop being reused. Lets repeat fetches skip one of three round-trips.
         self._tokens: Optional[tuple[str, str]] = None
         self._tokens_until: float = 0.0
+        # Serializes the refresh so a parallel burst (one gather over an
+        # account's highlight reels) fetches the token PAGE once instead of once
+        # per reel — it is the largest single response in the whole flow.
+        self._token_lock = asyncio.Lock()
 
     async def close(self) -> None:
         await self._session.close()
@@ -227,22 +235,33 @@ class StoriesClient:
 
     async def _get_tokens(self) -> Optional[tuple[str, str]]:
         """Return cached (k_exp, k_token), refreshing from the token page when
-        the cache has expired. Cached for up to 5 minutes (or k_exp, whichever is
-        sooner) — saves one HTTP round-trip on every fetch after the first."""
+        the cache has expired.
+
+        The token page is the heaviest response in this flow (a full HTML
+        document) and its tokens stay usable far longer than one sweep, so it is
+        cached for _TOKEN_TTL and fetched under a lock — a parallel burst
+        refreshes it once, not once per request. A token that goes stale early
+        is self-healing: ajaxSearch answers non-200, which clears the cache and
+        forces a refresh on the next call.
+        """
         if self._tokens and time.monotonic() < self._tokens_until:
             return self._tokens
-        page = await self._session.get(_TOKEN_PAGE)
-        if page.status_code != 200:
-            logger.debug("saveinsta token page HTTP {}", page.status_code)
-            return None
-        ke = _K_EXP_RE.search(page.text)
-        kt = _K_TOKEN_RE.search(page.text)
-        if not ke or not kt:
-            logger.debug("saveinsta token block not found")
-            return None
-        self._tokens = (ke.group(1), kt.group(1))
-        self._tokens_until = time.monotonic() + 300.0
-        return self._tokens
+        async with self._token_lock:
+            # Another waiter may have refreshed it while we queued.
+            if self._tokens and time.monotonic() < self._tokens_until:
+                return self._tokens
+            page = await self._session.get(_TOKEN_PAGE)
+            if page.status_code != 200:
+                logger.debug("saveinsta token page HTTP {}", page.status_code)
+                return None
+            ke = _K_EXP_RE.search(page.text)
+            kt = _K_TOKEN_RE.search(page.text)
+            if not ke or not kt:
+                logger.debug("saveinsta token block not found")
+                return None
+            self._tokens = (ke.group(1), kt.group(1))
+            self._tokens_until = time.monotonic() + _TOKEN_TTL
+            return self._tokens
 
     async def _fetch_media_html(self, target_url: str) -> str:
         """Run the saveinsta token flow for an Instagram URL; return media HTML.

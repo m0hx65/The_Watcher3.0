@@ -88,6 +88,15 @@ class Settings(BaseSettings):
     # to false to keep the old baseline-only behavior.
     auto_grab_on_public: bool = Field(default=True, alias="AUTO_GRAB_ON_PUBLIC")
 
+    # Highlight re-scan cadence (seconds). Listing every highlight reel's media
+    # on every sweep is close to pure bandwidth: a reel's contents only change
+    # when its owner adds a story to it, and that story was already detected and
+    # delivered live minutes earlier. Reels that are NEW to the catalog are
+    # always listed immediately, whatever this is set to; existing reels are
+    # re-listed at most this often. 0 re-lists every reel on every sweep (the
+    # old behavior) at roughly 12× the traffic.
+    highlight_scan_interval: int = Field(default=21600, alias="HIGHLIGHT_SCAN_INTERVAL")
+
     # Follower-anomaly alert: a follower change is flagged only when it's large
     # in BOTH absolute terms (≥ abs_min) and relative terms (≥ pct_min of the
     # prior count), so it never fires on a small account's noise or a big
