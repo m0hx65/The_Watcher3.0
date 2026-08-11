@@ -476,7 +476,11 @@ class InstagramClient:
         return parsed.get("username")
 
     async def fetch_profile(
-        self, username: str, *, auth_attempts: Optional[int] = None
+        self,
+        username: str,
+        *,
+        auth_attempts: Optional[int] = None,
+        allow_fallback: bool = True,
     ) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff.
 
@@ -487,6 +491,9 @@ class InstagramClient:
         leave it None and get IG_MANUAL_AUTH_ATTEMPTS, because one account with
         someone waiting on it should try every colo it can. Ignored on the
         direct path, which has its own full retry budget.
+
+        `allow_fallback=False` asks the API door only — used by /probe, which
+        tests each source separately and would otherwise measure them combined.
         """
         username = username.strip().lstrip("@")
         headers = _build_headers()
@@ -620,7 +627,7 @@ class InstagramClient:
         # the public profile page is a different endpoint with different gating,
         # and it costs a single direct request (not another 8-attempt worker
         # call). It answers with fewer fields, never with stale ones.
-        if last_status in (401, 403):
+        if allow_fallback and last_status in (401, 403):
             fallback = await self.fetch_profile_via_public_page(username)
             if fallback is not None:
                 return fallback
@@ -649,27 +656,9 @@ class InstagramClient:
         Returns None when the page is blocked or carries no counts, leaving the
         caller's original error intact. Never returns zeros for missing data.
         """
-        url = f"https://{PROFILE_PAGE_HOST}/{username.strip().lstrip('@')}/"
-        try:
-            response = await self._session.get(
-                url, headers={"Accept-Language": "en-US,en;q=0.9"}
-            )
-        except Exception as exc:
-            logger.debug("Public page fetch failed for @{}: {}", username, exc)
-            return None
-
-        if response.status_code != 200:
-            logger.debug(
-                "Public page for @{} answered HTTP {}", username, response.status_code
-            )
-            return None
-
-        parsed = parse_public_profile(getattr(response, "text", "") or "", username)
+        outcome = await self.probe_public_page(username)
+        parsed = outcome.get("parsed")
         if parsed is None:
-            logger.debug(
-                "Public page for @{} carried no profile counts (login wall or "
-                "markup change)", username,
-            )
             return None
 
         fetch_health.record_status(IG_PROFILE, 200)
@@ -684,3 +673,49 @@ class InstagramClient:
             parsed=parsed,
             source="public_page",
         )
+
+    async def probe_public_page(self, username: str) -> dict[str, Any]:
+        """Fetch the public page once and report what came back, in detail.
+
+        Returns {"status", "bytes", "parsed", "error"}. Every outcome is logged
+        at INFO rather than debug: this path only runs when the API is already
+        blocked, so it is rare, and it is the one measurement that says whether
+        anything can still reach Instagram from this host. Learning that from a
+        log needs the log to actually contain it.
+        """
+        username = username.strip().lstrip("@")
+        url = f"https://{PROFILE_PAGE_HOST}/{username}/"
+        result: dict[str, Any] = {
+            "status": 0, "bytes": 0, "parsed": None, "error": None,
+        }
+        try:
+            response = await self._session.get(
+                url, headers={"Accept-Language": "en-US,en;q=0.9"}
+            )
+        except Exception as exc:
+            result["error"] = repr(exc)
+            logger.warning("Public page fetch failed for @{}: {}", username, exc)
+            return result
+
+        body = getattr(response, "text", "") or ""
+        result["status"] = response.status_code
+        result["bytes"] = len(body)
+
+        if response.status_code != 200:
+            result["error"] = f"HTTP {response.status_code}"
+            logger.info(
+                "Public page for @{} answered HTTP {} ({} bytes)",
+                username, response.status_code, len(body),
+            )
+            return result
+
+        parsed = parse_public_profile(body, username)
+        result["parsed"] = parsed
+        if parsed is None:
+            result["error"] = "no counts in the markup"
+            logger.info(
+                "Public page for @{} was served ({} bytes) but carried no "
+                "counts — login wall or markup change",
+                username, len(body),
+            )
+        return result

@@ -2451,33 +2451,52 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    status_msg = await update.message.reply_text(
-        f"🔬 Probing sources for <b>@{esc(username)}</b>…",
-        parse_mode=ParseMode.HTML,
-    )
-    service: MonitorService = context.application.bot_data["monitor"]
-    lines = [
+    header = [
         f"🔬 <b>@{esc(username)}</b> — source probe",
         f"<i>Route: {esc(instagram_route())}</i>",
         "",
     ]
+    status_msg = await update.message.reply_text(
+        "\n".join(header + ["⏳ Asking the API…"]),
+        parse_mode=ParseMode.HTML,
+    )
+    service: MonitorService = context.application.bot_data["monitor"]
+    lines: list[str] = []
 
-    api = await service.instagram.fetch_profile(username)
-    if api.success and not api.partial:
+    async def show(pending: str = "") -> None:
+        """Publish what's known so far. A probe runs while things are broken —
+        a restart mid-probe must not swallow the results already in hand."""
+        body = header + lines + ([pending] if pending else [])
+        try:
+            await status_msg.edit_text(
+                "\n".join(body),
+                parse_mode=ParseMode.HTML,
+                reply_markup=None if pending else keyboards.fetch_actions(username),
+            )
+        except (BadRequest, Forbidden, TelegramError):
+            pass
+
+    # One attempt per source, and no internal fallback — each door is measured
+    # on its own, and the whole probe stays under a few seconds per source.
+    api = await service.instagram.fetch_profile(
+        username, auth_attempts=1, allow_fallback=False
+    )
+    if api.success:
         followers = (api.parsed or {}).get("followers_count")
         lines.append(
-            f"✅ <b>API</b> (web_profile_info) — answered, "
-            f"followers: <b>{fmt_number(followers or 0)}</b>"
+            f"✅ <b>API</b> (web_profile_info) — followers: "
+            f"<b>{fmt_number(followers or 0)}</b>"
         )
     else:
         lines.append(
             f"❌ <b>API</b> (web_profile_info) — <code>"
             f"{esc(str(api.error or api.http_status))}</code>"
         )
+    await show("⏳ Trying the public page…")
 
-    page = await service.instagram.fetch_profile_via_public_page(username)
-    if page is not None and page.parsed:
-        got = page.parsed
+    page = await service.instagram.probe_public_page(username)
+    got = page.get("parsed")
+    if got:
         lines.append(
             f"✅ <b>Public page</b> — followers: "
             f"<b>{fmt_number(got.get('followers_count') or 0)}</b>, "
@@ -2485,7 +2504,11 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"posts: <b>{fmt_number(got.get('posts_count') or 0)}</b>"
         )
     else:
-        lines.append("❌ <b>Public page</b> — blocked, or no counts in the markup")
+        lines.append(
+            f"❌ <b>Public page</b> — <code>{esc(str(page.get('error')))}</code> "
+            f"({fmt_number(page.get('bytes') or 0)} bytes)"
+        )
+    await show("⏳ Checking saveinsta…")
 
     if service.stories is not None:
         try:
@@ -2500,18 +2523,16 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     lines.append("")
-    if api.success or (page is not None and page.parsed):
-        lines.append("<i>At least one source works — profile stats can flow.</i>")
-    else:
+    if api.success or got:
+        lines.append("<i>A profile source works — stats can flow.</i>")
+    elif service.stories is not None and any("✅ <b>saveinsta" in ln for ln in lines):
         lines.append(
-            "<i>Every profile source is blocked from this host right now.</i>"
+            "<i>Profile stats are blocked, but media still works — stories and "
+            "posts keep arriving.</i>"
         )
-
-    await status_msg.edit_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboards.fetch_actions(username),
-    )
+    else:
+        lines.append("<i>Every source is blocked from this host right now.</i>")
+    await show()
 
 
 async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
