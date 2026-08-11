@@ -130,6 +130,7 @@ Two independent data paths mean one being blocked never takes the bot down: prof
 - Fast-fail circuit breaker on blocked endpoints instead of retry storms
 - Sweeps check one account at a time — the same request rhythm as a manual recheck, since bursts are what trip Instagram's anonymous rate limiter
 - Rate-limit guard: the gap widens as blocks pile up, a run of them pauses the sweep until the throttle window clears, and anything still blocked is retried in paced rounds before it's ever called a failure
+- Blocked-request amplification is capped — one proxied call is already 8 upstream attempts, so it's never re-asked, and when a sweep sees a run of blocks with nothing getting through it stops instead of walking the list at ~16 blocked requests per account
 - Cached downloader tokens — the three-step token handshake runs once, not per request
 - Tenacity retries with exponential backoff; debounced failure alerts (no 429 spam)
 - Consecutive-failure counter per target, visible in `/status` and `/list`

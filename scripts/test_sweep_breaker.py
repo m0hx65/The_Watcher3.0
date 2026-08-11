@@ -170,11 +170,15 @@ async def test_slot_serializes_by_default() -> None:
 
 async def test_guard_pauses_before_it_defers() -> None:
     """A run of blocks pauses the sweep; only a run that survives every pause
-    opens the breaker and defers the rest."""
+    opens the breaker and defers the rest.
+
+    Needs one account to have answered: with zero successes the block isn't a
+    throttle to wait out, and the guard stops the sweep outright instead."""
     t = _SweepThrottle(
         base_stagger=0.0, max_stagger=0.0, breaker_threshold=2,
         cooldown=0.3, max_pauses=1,
     )
+    t.record(200)
     # The cooldown deadline is stamped by the block that trips the guard, so
     # the clock starts here — not at the slot, which would measure a window
     # already partly elapsed and read as a hair under the cooldown.
@@ -227,6 +231,40 @@ async def test_staggered_check_defers_after_open() -> None:
     expect("deferred accounts look retriable (status 401)",
            all(r["status"] == 401 for r in deferred))
     expect("throttle counted the skips", t.skipped == 3, repr(t.skipped))
+
+
+def test_gate_down_stops_instead_of_pausing() -> None:
+    """A sweep where NOTHING answers is not a throttle to pace around — it is
+    the gate shut. One worker call is 8 upstream attempts, so walking the rest
+    of the list costs hundreds of blocked requests to learn what the first few
+    already said."""
+    t = _SweepThrottle(
+        base_stagger=0.0, max_stagger=0.0, breaker_threshold=3,
+        cooldown=90.0, max_pauses=2,
+    )
+    t.record(401)
+    t.record(401)
+    expect("still going before the threshold", not t.is_open())
+    t.record(401)
+    expect("zero successes -> the breaker opens immediately", t.is_open())
+    expect("and it is reported as the gate being down", t.gate_down)
+    expect("no cooldown is spent on a shut gate", t.pauses == 0, repr(t.pauses))
+
+
+def test_one_success_keeps_the_pause_behavior() -> None:
+    """With something getting through, the block IS a throttle — pausing to let
+    the window clear is the right move, and the accounts stay in this sweep."""
+    t = _SweepThrottle(
+        base_stagger=0.0, max_stagger=0.0, breaker_threshold=3,
+        cooldown=90.0, max_pauses=2,
+    )
+    t.record(200)
+    t.record(401)
+    t.record(401)
+    t.record(401)
+    expect("a partial block pauses rather than stopping", not t.is_open())
+    expect("the gate is not reported as down", not t.gate_down)
+    expect("the pause is counted", t.pauses == 1, repr(t.pauses))
 
 
 async def test_retry_rounds_recover_blocked_accounts() -> None:
@@ -304,6 +342,8 @@ async def main() -> int:
     test_stagger_caps_at_max()
     test_breaker_opens_at_threshold()
     test_success_resets_the_streak()
+    test_gate_down_stops_instead_of_pausing()
+    test_one_success_keeps_the_pause_behavior()
     await test_slot_spaces_checks()
     await test_slot_serializes_by_default()
     await test_guard_pauses_before_it_defers()

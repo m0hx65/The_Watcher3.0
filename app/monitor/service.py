@@ -90,13 +90,17 @@ class _SweepThrottle:
     old behavior and it hit Instagram as one wave.
 
     As consecutive 401/403 blocks accumulate the gap widens (soft backoff). Once
-    `breaker_threshold` blocks happen in a row the guard pauses the sweep for
-    `cooldown` seconds so Instagram's short throttle window can clear, and the
-    remaining accounts are checked after it — they stay in THIS sweep. Only
-    after `max_pauses` cooldowns fail to help does the breaker open: the
-    not-yet-checked accounts are skipped and returned as retriable failures for
-    the retry rounds / next sweep, instead of bursting into the rate limiter and
-    turning 4 blocks into 9.
+    `breaker_threshold` blocks happen in a row the response depends on whether
+    ANY account has answered this sweep:
+
+    - some have (a partial throttle): pause for `cooldown` seconds so the short
+      window can clear, then carry on — those accounts stay in THIS sweep. Only
+      after `max_pauses` cooldowns fail does the breaker open and defer the rest.
+    - none have (`gate_down`): the breaker opens immediately. Nothing is getting
+      through, so there is no pace that helps; every extra request is blocked
+      traffic that keeps the gate shut. One worker call is 8 upstream attempts,
+      so walking the remaining list costs hundreds of blocked requests to learn
+      what the first few already said.
     """
 
     def __init__(
@@ -118,6 +122,8 @@ class _SweepThrottle:
         self._consecutive_auth_fails = 0
         self._peak_consecutive = 0
         self._open = False
+        self._gate_down = False
+        self._successes = 0
         self._skipped = 0
         self._pauses = 0
         self._gate = asyncio.Semaphore(max(1, concurrency))
@@ -139,6 +145,17 @@ class _SweepThrottle:
     @property
     def pauses(self) -> int:
         return self._pauses
+
+    @property
+    def gate_down(self) -> bool:
+        """True when this sweep hit its block threshold without a single 200.
+
+        That is a different failure from a throttle: nothing is getting through
+        at all, so there is no pace slow enough to help and no account worth
+        retrying — every further request is blocked traffic that keeps the gate
+        shut. The sweep stops and waits for the next one.
+        """
+        return self._gate_down
 
     @property
     def peak_consecutive_blocks(self) -> int:
@@ -164,7 +181,18 @@ class _SweepThrottle:
                 # A fresh streak starts after the pause — the cooldown is the
                 # remedy being tried, so it deserves its own window to work.
                 self._consecutive_auth_fails = 0
-                if self._cooldown > 0 and self._pauses < self._max_pauses:
+                if self._successes == 0:
+                    # Not one account has answered. This is the gate being shut
+                    # to us, not a pace we can tune our way out of — stop now
+                    # rather than spend the rest of the sweep proving it.
+                    self._gate_down = True
+                    self._open = True
+                    logger.warning(
+                        "Instagram's gate is blocking every request ({} in a "
+                        "row, 0 answered) — stopping the sweep instead of "
+                        "walking the rest of the list", streak,
+                    )
+                elif self._cooldown > 0 and self._pauses < self._max_pauses:
                     self._pauses += 1
                     # A deadline, not a flag: every lane waits it out, so the
                     # pause is a real gap in outbound traffic rather than one
@@ -178,6 +206,7 @@ class _SweepThrottle:
                 else:
                     self._open = True
         elif status == 200:
+            self._successes += 1
             self._consecutive_auth_fails = 0
             # Relax gradually back toward the base stagger on success.
             self._extra = max(0.0, self._extra - self._base)
@@ -597,7 +626,11 @@ class MonitorService:
         # fresh reel data; when it ran after, the sweep could announce "story
         # status unavailable" for an account the very same sweep went on to
         # report as checked.
-        recovered = await self._retry_blocked(outcomes)
+        #
+        # Skipped outright when the gate is down: with nothing getting through,
+        # a retry round is 200+ more blocked requests that deny Instagram the
+        # very quiet it needs to let us back in. The next sweep is the retry.
+        recovered = 0 if throttle.gate_down else await self._retry_blocked(outcomes)
 
         # One batched read of every pending backlog-grab flag, so the per-account
         # decision below costs no extra query on the hot path.
@@ -648,10 +681,16 @@ class MonitorService:
                 )
 
         if self.stories is not None and story_targets:
+            # With the gate down, the per-account fallback reel query is 8 more
+            # blocked upstream attempts each for an answer we already know we
+            # can't get. Stories still run: saveinsta is a different source and
+            # is usually up when Instagram's own gate isn't, so media keeps
+            # flowing — only the live status goes unknown, and it says so.
             await asyncio.gather(
                 *(
                     self._check_stories_and_highlights(
-                        aid, uname, instagram_id=ig_id, reel_data=reel
+                        aid, uname, instagram_id=ig_id, reel_data=reel,
+                        skip_reel_fallback=throttle.gate_down,
                     )
                     for aid, uname, ig_id, reel in story_targets
                 ),
@@ -692,24 +731,39 @@ class MonitorService:
             logger.exception("Dark-radar check failed: {}", exc)
 
         noun = "profile" if checked == 1 else "profiles"
-        summary = f"👁 Sweep complete — {checked} {noun} checked."
-        if recovered:
-            summary += f" {recovered} recovered on retry."
-        if failed:
-            names = ", ".join(f"@{u}" for u in sorted(failed_usernames))
-            summary += f" {failed} failed: {names}"
-        if throttle.pauses:
-            summary += (
-                f"\n⏸ Paused {throttle.pauses}× mid-sweep to let Instagram's "
-                f"rate-limit window clear ({throttle.peak_consecutive_blocks} "
-                "blocks in a row)."
+        if throttle.gate_down:
+            # Naming 13 accounts implies 13 separate problems. There was one:
+            # Instagram answered nothing, so no per-account detail is real.
+            summary = (
+                "👁 Sweep stopped — Instagram is blocking every request right "
+                f"now.\n🚫 {throttle.peak_consecutive_blocks} checks in a row "
+                "came back blocked and none succeeded, so the sweep stopped "
+                f"early and left {throttle.skipped} account(s) unchecked "
+                "instead of hammering a shut door."
             )
-        if throttle.tripped:
-            summary += (
-                f"\n⚡ Rate-limit guard tripped after {throttle.peak_consecutive_blocks} "
-                f"blocks in a row — {throttle.skipped} account(s) deferred to avoid "
-                "making it worse. They'll retry shortly / next sweep."
-            )
+            if checked:
+                summary += f"\n✅ {checked} {noun} did get through before that."
+            summary += "\nNothing to do — the next sweep tries again."
+        else:
+            summary = f"👁 Sweep complete — {checked} {noun} checked."
+            if recovered:
+                summary += f" {recovered} recovered on retry."
+            if failed:
+                names = ", ".join(f"@{u}" for u in sorted(failed_usernames))
+                summary += f" {failed} failed: {names}"
+            if throttle.pauses:
+                summary += (
+                    f"\n⏸ Paused {throttle.pauses}× mid-sweep to let Instagram's "
+                    f"rate-limit window clear ({throttle.peak_consecutive_blocks} "
+                    "blocks in a row)."
+                )
+            if throttle.tripped:
+                summary += (
+                    f"\n⚡ Rate-limit guard tripped after "
+                    f"{throttle.peak_consecutive_blocks} blocks in a row — "
+                    f"{throttle.skipped} account(s) deferred to avoid making it "
+                    "worse. They'll retry shortly / next sweep."
+                )
         if backfill_ids:
             async with get_session() as session:
                 accounts_after = await crud.list_accounts(session, only_active=True)
@@ -1727,6 +1781,7 @@ class MonitorService:
         instagram_id: Optional[str] = None,
         reel_data: Optional[dict] = None,
         always_report: bool = False,
+        skip_reel_fallback: bool = False,
     ) -> None:
         """Stories, highlight catalog changes, and new highlight media for public accounts.
 
@@ -1742,6 +1797,11 @@ class MonitorService:
         changed. Sweeps leave it False (see `_announce_story_status`); a manual
         Recheck sets it, because someone who just asked for a check is owed an
         answer either way.
+
+        `skip_reel_fallback` suppresses that one live fetch when the sweep has
+        already established that Instagram is blocking everything — the status
+        is reported as unavailable without spending 8 more blocked upstream
+        attempts to confirm it. The saveinsta story fetch below still runs.
         """
         assert self.stories is not None
         async with self._semaphore:
@@ -1759,7 +1819,7 @@ class MonitorService:
                 # result down, so this costs nothing on a healthy check. Only a
                 # failed/absent profile check reaches Instagram again here.
                 attempted_reel = False
-                if reel_data is None and instagram_id:
+                if reel_data is None and instagram_id and not skip_reel_fallback:
                     attempted_reel = True
                     reel_user = await self.instagram.fetch_reel_user(str(instagram_id))
                     if reel_user:
@@ -1780,7 +1840,7 @@ class MonitorService:
                 # fetch when no reel query has been attempted at all (e.g. the
                 # numeric id isn't stored yet, which that path resolves).
                 catalog = (reel_data or {}).get("highlights")
-                if catalog is None and not attempted_reel:
+                if catalog is None and not attempted_reel and not skip_reel_fallback:
                     catalog = await self._fetch_highlight_catalog(
                         username, instagram_id
                     )

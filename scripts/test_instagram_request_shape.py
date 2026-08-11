@@ -119,6 +119,59 @@ async def test_401_retries_then_succeeds() -> None:
     assert calls["n"] == 2
 
 
+async def test_proxied_401_is_asked_exactly_once() -> None:
+    """The worker answers 401 only after ITS 8 upstream attempts with rotating
+    UAs and hosts have all been blocked. Asking it again fires 8 more blocked
+    requests to learn the same thing — that doubling is what kept the gate shut
+    across a whole sweep, so a proxied 401 must be final."""
+    from app.config import settings
+
+    calls = {"n": 0}
+
+    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
+        calls["n"] += 1
+        return _MockResponse(401, {})
+
+    session = _MockSession(handler)
+    old = settings.ig_proxy_url
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("65xim")
+    finally:
+        settings.ig_proxy_url = old
+
+    assert not result.success
+    assert result.http_status == 401
+    assert calls["n"] == 1, f"worker asked {calls['n']}× for one blocked check"
+
+
+async def test_direct_401_still_retries() -> None:
+    """Without the worker there IS something left to try: a datacenter IP gets
+    401s intermittently and a re-ask often lands."""
+    calls = {"n": 0}
+
+    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return _MockResponse(401, {})
+        return _MockResponse(200, _payload())
+
+    session = _MockSession(handler)
+    from app.config import settings
+
+    old = settings.ig_proxy_url
+    settings.ig_proxy_url = None
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("65xim")
+    finally:
+        settings.ig_proxy_url = old
+
+    assert result.success, result.error
+    assert calls["n"] == 3
+
+
 async def test_extract_instagram_id_from_reel_query() -> None:
     assert extract_instagram_id(_reel_payload()) == "7880052534"
     assert extract_instagram_id(_payload()) == "7880052534"
@@ -228,6 +281,8 @@ async def test_reel_user_cache_serves_repeats() -> None:
 async def main() -> int:
     await test_profile_request_shape()
     await test_401_retries_then_succeeds()
+    await test_proxied_401_is_asked_exactly_once()
+    await test_direct_401_still_retries()
     await test_extract_instagram_id_from_reel_query()
     await test_fetch_reel_user_parses_id_and_username()
     await test_username_lookup_by_id_request_shape()

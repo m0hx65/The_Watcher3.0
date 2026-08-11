@@ -539,17 +539,21 @@ class InstagramClient:
                     await asyncio.sleep(delay)
                     continue
 
-                # 401/403 — retry immediately, IG usually returns 200 within a few tries.
-                # Through the worker proxy each call is already 8 upstream
-                # attempts with rotating UAs, so re-asking more than once just
-                # multiplies blocked traffic — cap at 2 attempts there.
+                # 401/403 — direct requests retry, since a datacenter IP gets
+                # them intermittently and a re-ask often lands.
+                #
+                # Through the worker there is nothing left to try: that ONE call
+                # is already 8 upstream attempts with rotating UAs and hosts, so
+                # a 401 back from it means all 8 were blocked. Asking again fires
+                # 8 more blocked requests to learn the same thing, doubling the
+                # traffic that keeps the gate shut. Take the answer and move on.
                 logger.warning(
                     "HTTP {} on @{} (attempt {}/{})",
                     response.status_code, username, attempt, self.max_retries,
                 )
                 last_error = f"HTTP {response.status_code}"
                 if response.status_code in (401, 403):
-                    max_auth_attempts = 2 if settings.ig_proxy_url else self.max_retries
+                    max_auth_attempts = 1 if settings.ig_proxy_url else self.max_retries
                     if attempt < max_auth_attempts:
                         await asyncio.sleep(random.uniform(1.0, 3.0))
                         continue
