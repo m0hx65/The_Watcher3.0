@@ -14,7 +14,13 @@ from fastapi.responses import JSONResponse
 from telegram.ext import Application as TgApplication
 
 from app.api.routes import router as api_router
-from app.bot.handlers import BOT_COMMANDS, PANEL_CHAT_ID, PANEL_MSG_ID, register_handlers
+from app.bot.handlers import (
+    BOT_COMMANDS,
+    PANEL_CHAT_ID,
+    PANEL_MSG_ID,
+    instagram_route,
+    register_handlers,
+)
 from app.bot.notifications import build_dispatcher
 from app.bot.panel_bump import PanelBumper
 from app.config import settings
@@ -31,6 +37,9 @@ from app.workers.scheduler import WatcherScheduler
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting The Watcher V3.0…")
+    # Say the route once, at boot. A cloud host's own IP is 401-blocked, so a
+    # misconfigured IG_PROXY_URL looks exactly like Instagram blocking us.
+    logger.info("Instagram requests route via: {}", instagram_route())
 
     await init_db()
 

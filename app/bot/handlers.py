@@ -8,6 +8,7 @@ import io
 import re
 import tempfile
 from collections import OrderedDict
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -663,6 +664,30 @@ def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def instagram_route() -> str:
+    """Plain description of the path Instagram requests actually take.
+
+    When every check 401s, the first question is whether traffic is going
+    through the Cloudflare Worker at all — a cloud host's own IP is blocked
+    outright, so "direct" and "blocked" look identical from the outside.
+    Nothing in the app answered that, so it had to be inferred from retry
+    counts in the logs. Now it just says.
+    """
+    if not settings.ig_proxy_url:
+        return "DIRECT — this host's own IP (datacenter IPs are 401-blocked)"
+    host = urlparse(settings.ig_proxy_url).hostname or settings.ig_proxy_url
+    route = f"Cloudflare Worker ({host})"
+    if settings.proxy:
+        # PROXY_URL wraps the whole session, so it applies to the hop that
+        # reaches the worker — not to the worker's own egress to Instagram.
+        route += " + outbound proxy"
+    return route
+
+
+def _route_line() -> str:
+    return f"🌐 Instagram via: {esc(instagram_route())}"
+
+
 def _guards_line() -> str:
     """Compact summary of which protections are currently active."""
     if settings.sweep_breaker_threshold > 0:
@@ -751,6 +776,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"{digest_line}"
         f"{dark_line}"
         f"{stakeout_line}\n"
+        f"{_route_line()}\n"
         f"{_guards_line()}"
         f"{health_block}"
     )
