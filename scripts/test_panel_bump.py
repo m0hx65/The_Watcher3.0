@@ -4,11 +4,12 @@ Hand-rolled smoke test (no pytest). A fake bot + a toggleable download_active
 flag drive PanelBumper directly, asserting it re-anchors the panel for sweep
 notifications but never:
 
-- while a manual download is in flight (the duplicate-menu bug), nor
-- while the panel is showing a view the user just opened. Re-anchoring DELETES
-  the panel, and the panel is where "Sweep running", Status and Dark radar are
-  rendered — so 🔄 Sweep All used to open a view that the sweep's own first
-  notification wiped a second later, before it could be read.
+- while a manual download is in flight (the duplicate-menu bug),
+
+and that when it DOES re-anchor it re-posts whatever the panel is currently
+showing. Re-anchoring DELETES the panel, and the panel is where "Sweep
+running", Status and Dark radar are rendered — so posting a hardcoded menu
+back threw those views away a second after a button opened them.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -32,9 +32,12 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 from app.bot.handlers import (  # noqa: E402
     PANEL_CHAT_ID,
     PANEL_MSG_ID,
-    PANEL_VIEW_AT,
-    PANEL_VIEW_GRACE_SECONDS,
-    _note_panel_navigation,
+    WELCOME_TEXT,
+    _LAST_RENDER,
+    _LAST_RENDER_MAX,
+    current_render,
+    forget_render,
+    remember_render,
 )
 from app.bot.panel_bump import PanelBumper  # noqa: E402
 
@@ -61,7 +64,7 @@ def make_bot() -> SimpleNamespace:
     )
 
 
-def make_bumper(bot, *, download_active) -> tuple[PanelBumper, dict, list]:
+def make_bumper(bot, *, download_active, max_deferral=DEBOUNCE * 4) -> tuple[PanelBumper, dict, list]:
     bot_data = {PANEL_MSG_ID: 100, PANEL_CHAT_ID: 7}
     persisted: list = []
 
@@ -74,6 +77,7 @@ def make_bumper(bot, *, download_active) -> tuple[PanelBumper, dict, list]:
         download_active=download_active,
         persist=_persist,
         debounce=DEBOUNCE,
+        max_deferral=max_deferral,
     )
     return bumper, bot_data, persisted
 
@@ -94,31 +98,43 @@ async def test_bump_when_idle() -> None:
     expect("idle: new position persisted", persisted == [(999, 7)])
 
 
-async def test_no_bump_during_download() -> None:
+async def test_no_bump_between_download_items() -> None:
+    """A batch download delivers each item through the notifier. Bumping per
+    item would wedge a menu between every photo — but the re-anchor must not be
+    lost either, or the panel is left stranded above the media."""
     bot = make_bot()
-    bumper, bot_data, persisted = make_bumper(bot, download_active=lambda: True)
+    active = {"v": True}
+    bumper, bot_data, persisted = make_bumper(
+        bot, download_active=lambda: active["v"], max_deferral=DEBOUNCE * 40
+    )
     await bumper.schedule()
     await _settle()
     expect(
-        "download: nothing deleted",
-        bot.delete_message.await_count == 0,
-        str(bot.delete_message.await_count),
-    )
-    expect(
-        "download: no fresh panel posted",
+        "download: nothing posted between items",
         bot.send_message.await_count == 0,
         str(bot.send_message.await_count),
     )
-    expect("download: panel id untouched", bot_data.get(PANEL_MSG_ID) == 100)
-    expect("download: nothing persisted", persisted == [])
+    expect("download: panel id untouched mid-batch", bot_data.get(PANEL_MSG_ID) == 100)
+    expect("download: nothing persisted mid-batch", persisted == [])
+
+    active["v"] = False  # batch finishes
+    await _settle()
+    expect(
+        "download: the panel re-anchors once the batch ends",
+        bot.send_message.await_count == 1,
+        str(bot.send_message.await_count),
+    )
+    expect("download: new panel id recorded", bot_data.get(PANEL_MSG_ID) == 999)
 
 
-async def test_download_starting_mid_debounce_cancels_bump() -> None:
-    # Scheduled while idle, but a download begins before the debounce fires — the
-    # post-sleep re-check must still bail so the menu isn't dropped under media.
+async def test_download_starting_mid_debounce_defers_the_bump() -> None:
+    # Scheduled while idle, but a download begins before the debounce fires —
+    # the bump must wait it out rather than land between the media items.
     bot = make_bot()
     active = {"v": False}
-    bumper, bot_data, persisted = make_bumper(bot, download_active=lambda: active["v"])
+    bumper, bot_data, _persisted = make_bumper(
+        bot, download_active=lambda: active["v"], max_deferral=DEBOUNCE * 40
+    )
     await bumper.schedule()  # idle at schedule time -> task queued
     active["v"] = True  # download starts during the debounce window
     await _settle()
@@ -128,6 +144,31 @@ async def test_download_starting_mid_debounce_cancels_bump() -> None:
         str(bot.send_message.await_count),
     )
     expect("mid-debounce download: panel id untouched", bot_data.get(PANEL_MSG_ID) == 100)
+
+    active["v"] = False
+    await _settle()
+    expect(
+        "mid-debounce download: bump runs after it finishes",
+        bot.send_message.await_count == 1,
+        str(bot.send_message.await_count),
+    )
+
+
+async def test_wedged_download_gives_up() -> None:
+    """A download that never clears must not leave a task waiting forever."""
+    bot = make_bot()
+    bumper, _bot_data, _persisted = make_bumper(
+        bot, download_active=lambda: True, max_deferral=DEBOUNCE * 2
+    )
+    await bumper.schedule()
+    await _settle()
+    await _settle()
+    expect(
+        "a wedged download abandons the bump",
+        bot.send_message.await_count == 0,
+        str(bot.send_message.await_count),
+    )
+    expect("and the task is not left pending", bumper._pending.done())
 
 
 async def test_burst_collapses_to_one_bump() -> None:
@@ -143,79 +184,77 @@ async def test_burst_collapses_to_one_bump() -> None:
     )
 
 
-async def test_no_bump_while_a_view_is_being_read() -> None:
-    """Pressing 🔄 Sweep All renders "Sweep running" INTO the panel, and the
-    sweep's own first notification used to delete it a second later — the view
-    vanished into a bare menu before it could be read."""
+async def test_bump_preserves_the_open_view() -> None:
+    """Pressing 🔄 Sweep All renders "Sweep running" INTO the panel. The sweep's
+    own first notification re-anchors it a second later, and that must move the
+    view to the bottom — not replace it with a bare menu."""
     bot = make_bot()
     bumper, bot_data, persisted = make_bumper(bot, download_active=lambda: False)
-    bot_data[PANEL_VIEW_AT] = time.monotonic()  # a view was just opened
-    await bumper.schedule()
-    await _settle()
-    expect("reading: the open view is not deleted",
-           bot.delete_message.await_count == 0,
-           str(bot.delete_message.await_count))
-    expect("reading: no menu posted over it",
-           bot.send_message.await_count == 0,
-           str(bot.send_message.await_count))
-    expect("reading: panel id untouched", bot_data.get(PANEL_MSG_ID) == 100)
-    expect("reading: nothing persisted", persisted == [])
+    view_text = "🔄 Sweep running — results will appear in the chat."
+    view_markup = "STATUS_ACTIONS"
+    remember_render(100, view_text, view_markup)
+    try:
+        await bumper.schedule()
+        await _settle()
+        expect("the stale copy is deleted", bot.delete_message.await_count == 1)
+        expect("the panel is re-posted", bot.send_message.await_count == 1)
+        kwargs = bot.send_message.await_args.kwargs
+        expect("the open view is re-posted, not the menu",
+               kwargs.get("text") == view_text, repr(kwargs.get("text")))
+        expect("its keyboard comes with it",
+               kwargs.get("reply_markup") == view_markup,
+               repr(kwargs.get("reply_markup")))
+        expect("the new panel id is recorded", bot_data.get(PANEL_MSG_ID) == 999)
+        expect("the new position is persisted", persisted == [(999, 7)])
+        # The view moved to a new message id — a second notification must
+        # preserve it again rather than fall back to the menu.
+        carried = current_render(999)
+        expect("the view record follows the panel to its new id",
+               carried == (view_text, view_markup), repr(carried))
+        expect("the old id's record is dropped", current_render(100) is None)
+    finally:
+        forget_render(100)
+        forget_render(999)
 
 
-async def test_bump_resumes_after_the_grace_period() -> None:
+async def test_bump_falls_back_to_the_menu_when_unknown() -> None:
+    """After a restart the panel's content isn't known — the menu is the only
+    honest thing to post, and it still lands at the bottom."""
     bot = make_bot()
-    bumper, bot_data, _persisted = make_bumper(bot, download_active=lambda: False)
-    # Opened longer ago than the grace period — the user has read it by now, so
-    # the menu is allowed to return to the bottom of the chat.
-    bot_data[PANEL_VIEW_AT] = time.monotonic() - PANEL_VIEW_GRACE_SECONDS - 1
-    await bumper.schedule()
-    await _settle()
-    expect("expired grace: the panel is re-anchored",
-           bot.send_message.await_count == 1,
-           str(bot.send_message.await_count))
-    expect("expired grace: the stale mark is cleared",
-           PANEL_VIEW_AT not in bot_data, repr(bot_data.get(PANEL_VIEW_AT)))
+    bumper, _bot_data, _persisted = make_bumper(bot, download_active=lambda: False)
+    forget_render(100)
+    try:
+        await bumper.schedule()
+        await _settle()
+        kwargs = bot.send_message.await_args.kwargs
+        expect("an unknown panel falls back to the menu",
+               kwargs.get("text") == WELCOME_TEXT, repr(kwargs.get("text")))
+    finally:
+        forget_render(999)
 
 
-async def test_bump_clears_the_view_mark() -> None:
-    """After a re-anchor the panel IS the menu again, so a mark left behind
-    would freeze the bumper for a whole grace period for no reason."""
-    bot = make_bot()
-    bumper, bot_data, _persisted = make_bumper(bot, download_active=lambda: False)
-    await bumper.schedule()
-    await _settle()
-    expect("re-anchor leaves no view mark", PANEL_VIEW_AT not in bot_data,
-           repr(bot_data.get(PANEL_VIEW_AT)))
-
-
-def test_panel_navigation_marks_and_clears() -> None:
-    """The mark is only set by presses on the panel itself, and 🏠 Home clears
-    it so the menu can be re-anchored immediately."""
-    bot_data = {PANEL_MSG_ID: 100, PANEL_CHAT_ID: 7}
-    context = SimpleNamespace(application=SimpleNamespace(bot_data=bot_data))
-
-    _note_panel_navigation(context, 100, "menu:sweep")
-    expect("a panel button marks the panel as a view", PANEL_VIEW_AT in bot_data)
-
-    _note_panel_navigation(context, 100, "menu:main")
-    expect("Home clears the mark", PANEL_VIEW_AT not in bot_data)
-
-    # A button on some OTHER message (an account card, a search result) must
-    # not make the menu look like an open view.
-    _note_panel_navigation(context, 555, "acc:open:1")
-    expect("a press on another message leaves the panel alone",
-           PANEL_VIEW_AT not in bot_data)
+def test_render_record_is_bounded() -> None:
+    """The record exists to look up one message; it must not grow forever as
+    account cards and search results are edited."""
+    for i in range(_LAST_RENDER_MAX + 25):
+        remember_render(10_000 + i, f"text {i}", None)
+    expect("the render record stays bounded",
+           len(_LAST_RENDER) <= _LAST_RENDER_MAX, str(len(_LAST_RENDER)))
+    expect("the newest render survives eviction",
+           current_render(10_000 + _LAST_RENDER_MAX + 24) is not None)
+    expect("the oldest render is evicted", current_render(10_000) is None)
+    _LAST_RENDER.clear()
 
 
 async def main() -> None:
     await test_bump_when_idle()
-    await test_no_bump_during_download()
-    await test_download_starting_mid_debounce_cancels_bump()
+    await test_no_bump_between_download_items()
+    await test_download_starting_mid_debounce_defers_the_bump()
+    await test_wedged_download_gives_up()
     await test_burst_collapses_to_one_bump()
-    await test_no_bump_while_a_view_is_being_read()
-    await test_bump_resumes_after_the_grace_period()
-    await test_bump_clears_the_view_mark()
-    test_panel_navigation_marks_and_clears()
+    await test_bump_preserves_the_open_view()
+    await test_bump_falls_back_to_the_menu_when_unknown()
+    test_render_record_is_bounded()
 
     print()
     if FAILURES:
