@@ -82,45 +82,47 @@ block it" shaped the original proxy design.
 
 ---
 
-## 4. The second door — built, then withdrawn (2026-08-12)
+## 4. The second door (2026-08-12)
 
-> **Outcome first:** this source was removed from the data path a day after it
-> shipped. Verified against a real profile, the page reported **677 following
-> where Instagram showed 577**, while followers (118) and posts (0) matched
-> exactly. Read the rest as the reasoning that led there, and section 4b for
-> why it did not survive contact with ground truth.
+> **Outcome first:** the door is open, but not the one first built. The `og:`
+> meta parser shipped, was withdrawn a day later for reporting **677 following
+> where Instagram showed 577**, and was replaced by a parser reading the page's
+> *embedded payload* — which matched ground truth exactly. Sections 4b and 4c
+> are that reversal, in order.
 
 Instagram's plain profile page is a different endpoint with different gating.
-Its Open Graph block carries follower/following/post counts, display name and
-avatar — the fields the bot actually alerts on:
+It is fetched **directly**, not through the Worker, so it carries the real
+Chrome fingerprint, and it sends no `x-ig-app-id`, so it reads as a page view
+rather than a private-API call.
+
+The mistake was in *what part of the page* to read. The obvious surface is the
+Open Graph block:
 
 ```html
 <meta property="og:description"
       content="1,234 Followers, 567 Following, 89 Posts - Name (@user)…">
 ```
 
-It is fetched **directly**, not through the Worker, so it carries the real
-Chrome fingerprint, and it sends no `x-ig-app-id`, so it reads as a page view
-rather than a private-API call.
+That is what the first version parsed.
 
 ### Handling partial data honestly
 
-The page sees the counts; it does not see the bio, privacy or verification
-flags. Three rules keep that from becoming false alerts:
+A page reading knows less than the API. Three rules keep that from becoming
+false alerts, and all three survived the rewrite:
 
-1. **The truncated bio is never stored.** `og:description` does carry a bio —
-   cut short with an ellipsis. Storing it would fire a bio-change alert on every
-   sweep against the API's full text.
-2. **Unseen fields carry forward** from the previous snapshot instead of being
+1. **Unseen fields carry forward** from the previous snapshot instead of being
    written as `None`. Otherwise the card shows a real bio as newly empty, and a
    change made *during* the outage is swallowed when the API returns.
-3. **`None` is not `""`.** The change detector now treats an unknown text field
-   as "no information". A genuinely cleared bio still arrives as `""` and still
+2. **`None` is not `""`.** The change detector treats an unknown text field as
+   "no information". A genuinely cleared bio still arrives as `""` and still
    reports.
+3. **A count Instagram omits is absent, never `0`.** `all_media_count` is
+   `null` for private accounts, and a zero there reads as "they deleted every
+   post".
 
 ---
 
-## 4b. Why it was withdrawn
+## 4b. Why the og: version was withdrawn
 
 Two symptoms appeared in the first full day, and one screenshot ended it.
 
@@ -128,7 +130,7 @@ Two symptoms appeared in the first full day, and one screenshot ended it.
 124 across sweeps — because the API and the page disagreed and the sweep
 alternated between them. Each flip "detected" a change. The giveaway was
 `Full name changed لِ → ‎لِ‎`: two visibly identical strings differing only by
-the bidi marks Instagram's `og:title` adds to RTL names.
+the bidi marks Instagram adds to RTL names on some surfaces.
 
 **A private account got a story check.** `bool(parsed.get("is_private"))` turned
 the page's *absent* privacy flag into `False`, so a private target was reported
@@ -139,14 +141,56 @@ is not "it is false".
 Source-scoped diffing fixed the flip-flop, and the privacy flag now falls back
 to the last known value. But then the owner checked a profile by hand:
 Instagram said **577 following**, the bot's card said **677**. Followers and
-posts matched. That is the fact that settled it — the page's numbers are not
-reliably anything, and no amount of careful diffing makes an untrustworthy
-number safe to show.
+posts matched. That settled it — nothing distinguished a good number from a bad
+one at read time, so the surface was removed from the data path entirely.
 
 **Lesson:** "live, from a different endpoint" is not the same as "correct". A
 second source needs its values verified against ground truth before it is
 allowed to back an alert — being fresh and being right are independent
 properties, and only one of them was ever checked.
+
+---
+
+## 4c. The same page, the right data
+
+The withdrawal was right; the diagnosis was incomplete. A full captured
+response for `/65xim`, logged out, showed the **same page carrying two
+different following numbers**:
+
+| Where | followers | following | posts |
+|---|---|---|---|
+| `og:description` | 118 | **677** ← stale | 0 |
+| embedded Relay payload | 118 | **577** | `null` |
+| rendered HTML | 118 | 577 | 0 |
+| Instagram app | 118 | **577** | 0 |
+
+The parser was never buggy. The `og:` block is a **stale cache**, and nothing
+in it marks it as stale — which is exactly why no read-time test could have
+saved it. Meanwhile the page inlines the payload it renders from:
+
+```json
+"xig_user_by_username":{"pk":"7880052534","username":"65xim","is_private":true,
+  "biography":"…","full_name":"Mohamad","is_verified":false,
+  "follower_count":118,"following_count":577,"all_media_count":null}
+```
+
+Same shape as the API's response, matching ground truth, and carrying
+`is_private` — which fixes the private-account bug at its source rather than
+papering over it with a carry-forward. Note `pk` is the numeric id the rest of
+the bot keys on; the sibling `id` is a different app-scoped identifier and
+storing it would break the reel query.
+
+So the fallback is back, reading the payload. What carried over unchanged:
+source-scoped diffing, bidi stripping, carry-forward for unseen fields, and the
+`/probe` split that measures each door alone.
+
+**What is still unverified.** The payload matched ground truth for *one*
+account, on numbers checked by hand — the check that was missing the first
+time, but a sample of one. And whether the page is reachable at all from
+Render's datacenter IP has never been measured: every earlier probe either died
+or ran before the fallback existed. If it answers with a login wall the parse
+returns `None` and the original error stands. `/probe` on a few mixed
+public/private accounts is the next measurement.
 
 ## 5. The incident: a regex that took the service down
 
@@ -167,12 +211,13 @@ Cost grows with tags × page size, and a real profile page is ~400 tags over
 several MB — tens of seconds of solid CPU. It ran on the event loop, so
 `/health` stopped answering along with everything else.
 
-**Fixes:** tags are matched one at a time with a length-bounded pattern that
-cannot cross `>`; the scan stops at `</head>` (or 256 KB) and exits once all
-three tags are found; parsing moved off the event loop. Same 3.1 MB page now
-parses in **under a millisecond**. The regression test builds a 2 MB+ page with
-400 decoy meta tags and holds the parse to under a second — a budget the old
-implementation could not meet.
+**Fixes:** the scan was bounded and moved off the event loop. The payload
+parser that replaced it (§4c) uses no regex at all — it finds one key, walks
+the object once with a brace matcher that tracks string and escape state, and
+stops at the matching close brace, a 4 MB scan window or a 200 KB object,
+whichever comes first. The regression suite parses a 3 MB+ page under a second
+and asserts that unbalanced braces terminate instead of scanning forever — a
+budget the old implementation could not meet.
 
 **Lesson:** a fallback path only runs when something is already broken, which is
 the worst possible time to discover it is more dangerous than the failure it
@@ -205,7 +250,7 @@ something is already blocked and the log is where it gets diagnosed.
 The distinction it exists to draw:
 
 - `HTTP 302, 0 bytes` → redirected to a login wall; that door is shut too
-- `served 523000 bytes but no counts` → reachable, parser needs adjusting
+- `served 523000 bytes but no profile payload` → reachable, parser needs adjusting
 - `followers: 1,234` → working
 
 Startup and `/status` now also state the route in words (Worker hostname, or

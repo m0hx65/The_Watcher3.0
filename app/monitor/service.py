@@ -1355,7 +1355,9 @@ class MonitorService:
         # answered instead. The reel query goes through that same shut door, so
         # asking is one more blocked worker call (8 upstream attempts) for an
         # answer we already know. The story phase treats it as unknown and
-        # falls back to saveinsta, which is reachable.
+        # falls back to saveinsta, which is reachable — and the payload does
+        # carry is_private, so a private account is still correctly skipped
+        # rather than swept on a guessed flag.
         if fetch.partial:
             logger.debug(
                 "Skipping the reel query for @{} — the API is blocked and the "
@@ -1434,9 +1436,11 @@ class MonitorService:
                 else last_known.profile_pic_url
             )
 
-            # The public-page fallback sees the counts and the name; it does not
-            # see the bio, the flags or the reel/highlight counts. For those,
-            # carry the last known value forward rather than writing a None:
+            # The public-page fallback sees the counts, the name, the bio and
+            # the privacy/verification flags; it does not see reels_count,
+            # story_count or is_business. For those — and for anything the
+            # payload happened to omit — carry the last known value forward
+            # rather than writing a None:
             #  - the card would otherwise show a real bio as newly empty, which
             #    is a wrong "current" value, not a missing one;
             #  - and diffing the next full API check against None would silently

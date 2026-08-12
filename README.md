@@ -42,7 +42,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
-| 🚫 **Wrong numbers are never shown** | A public-page fallback was tried as a second source for counts and **withdrawn after verification**: against a real profile it reported 677 following where Instagram showed 577. Followers and posts matched, so the numbers aren't uniformly stale — they simply can't be trusted, and nothing distinguishes a good one at read time. The API is the only source of record for profile fields; when it's blocked the bot reports a failure instead of a number it can't stand behind. |
+| 🚪 **A second door that reads the right numbers** | When the API is blocked, the profile page is parsed for the payload it actually renders from — the same fields the API returns, including the privacy flag. The first version of this read the page's `og:` meta tags instead and was **withdrawn after one day**: on the very same response they said *677 Following* where the payload, the rendered page and the Instagram app all said **577**. Live is not the same as correct — the tags are a stale cache, and only the payload was ever checked against ground truth. |
 | 🔬 **`/probe <user>`** | Tests every source against one account and reports which answer — the API, the public page (with HTTP status and byte count), and the media downloader. Turns "everything is 401ing" into a specific, actionable answer in a few seconds, and logs the same at INFO. |
 | 🔕 **One story, one message** | A single story used to produce a status line in *every* sweep it survived, plus a "just posted a story!" alert, plus the media itself. Now the status is announced only when it changes, and never on top of the media that already announced it. `STORY_STATUS_HEARTBEAT=true` restores the old behavior. |
 | 🚦 **A guard that tells a throttle from an outage** | If some accounts answer, blocks mean a throttle: widen the gap, pause, carry on. If **nothing** answers, the gate is shut — the sweep stops immediately rather than spending hundreds of blocked requests proving it, and the summary says so instead of naming every account as a separate failure. |
@@ -88,12 +88,13 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
                                        formatted alert + photos/videos
 ```
 
-**Two independent doors, with different jobs.**
+**Three independent doors, with different jobs.**
 
-1. **The API**, routed through a free Cloudflare Worker on edge IPs — full profile fields, story/live status, and the highlight catalog. It is the **only** source of record for profile data. When it's blocked the bot says so; it does not substitute a number from somewhere else.
-2. **A login-free media downloader** for story/post/reel media and full-resolution avatars, on infrastructure that cloud-IP blocks don't touch. This is why media keeps arriving during an API outage.
+1. **The API**, routed through a free Cloudflare Worker on edge IPs — full profile fields, story/live status, and the highlight catalog. The primary source of record for profile data.
+2. **The public profile page**, fetched directly (never through the Worker, which would cost the real Chrome TLS fingerprint). Used only when the API answers 401/403, and parsed from the **Relay payload the page renders from** — not its `og:` meta tags, which are a stale cache that reported *677 Following* on a response whose payload, rendered HTML and app all said **577**. A page reading is marked *partial*: it carries the counts, name, bio and flags, and honestly does not know the reel/highlight counts.
+3. **A login-free media downloader** for story/post/reel media and full-resolution avatars, on infrastructure that cloud-IP blocks don't touch. This is why media keeps arriving during an API outage.
 
-> A third door — Instagram's public profile page, parsed from its Open Graph block — was built and then **withdrawn**. Verified against a real profile it reported 677 following where Instagram showed 577, while followers and posts matched exactly. Nothing distinguishes a good number from a bad one at read time, so it can't back a change alert. The parser survives for `/probe`, where the page is reported as *reachability*, never stored as fact. See [the write-up](docs/2026-08-11-gate-blocks-and-the-second-door.md).
+> When every door is shut the bot reports the failure. It never presents old or uncertain data as current — and the rule the withdrawn `og:` parser bought the hard way is that **being live is not the same as being correct**. See [the write-up](docs/2026-08-11-gate-blocks-and-the-second-door.md).
 
 `/probe <username>` tests every source and tells you which are answering right now.
 
@@ -139,7 +140,7 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 - Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls on the direct path
 - 90-second reel-data cache — sweeps and card opens never re-ask Instagram for the same data
 - Fast-fail circuit breaker on blocked endpoints instead of retry storms
-- **Two independent doors to Instagram** — the API through the edge proxy for profile data, and a login-free media downloader for stories/posts/reels. When the API gate shuts, media keeps flowing; profile fields report an honest failure rather than a number from a source that can't be trusted
+- **Three independent doors to Instagram** — the API through the edge proxy, the public profile page's embedded payload as a partial fallback when the API 401s, and a login-free media downloader for stories/posts/reels. When the API gate shuts, media keeps flowing and profile counts often still arrive; when every door is shut the bot reports an honest failure rather than a number it can't stand behind
 - Sweeps check one account at a time — the same request rhythm as a manual recheck, since bursts are what trip Instagram's anonymous rate limiter
 - Rate-limit guard that tells a throttle from an outage: if some accounts are answering, it widens the gap and pauses until the window clears; if **nothing** is answering it stops the sweep outright, because no pace helps a shut gate and every extra request keeps it shut
 - Blocked-request amplification is budgeted per path — one proxied call is already 8 upstream attempts, so a sweep asks once (14 accounts multiply everything), while an on-demand check retries across Cloudflare colos, which the gate answers differently

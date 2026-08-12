@@ -2478,7 +2478,9 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # One attempt per source, and no internal fallback — each door is measured
     # on its own, and the whole probe stays under a few seconds per source.
-    api = await service.instagram.fetch_profile(username, auth_attempts=1)
+    api = await service.instagram.fetch_profile(
+        username, auth_attempts=1, allow_fallback=False
+    )
     if api.success:
         followers = (api.parsed or {}).get("followers_count")
         lines.append(
@@ -2495,13 +2497,20 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     page = await service.instagram.probe_public_page(username)
     got = page.get("parsed")
     if got:
+        # A count Instagram omitted is shown as "—", never as 0: `all_media_count`
+        # is null for private accounts, and a 0 there would read as "they deleted
+        # every post" — on the one screen meant to show exactly what was seen.
+        def count(field: str) -> str:
+            value = got.get(field)
+            return fmt_number(value) if isinstance(value, int) else "—"
+
         lines.append(
-            f"ℹ️ <b>Public page</b> — followers: "
-            f"<b>{fmt_number(got.get('followers_count') or 0)}</b>, "
-            f"following: <b>{fmt_number(got.get('following_count') or 0)}</b>, "
-            f"posts: <b>{fmt_number(got.get('posts_count') or 0)}</b>\n"
-            "<i>reachability only — these counts are NOT used, they were "
-            "verified wrong against a real profile</i>"
+            f"✅ <b>Public page</b> — followers: <b>{count('followers_count')}</b>, "
+            f"following: <b>{count('following_count')}</b>, "
+            f"posts: <b>{count('posts_count')}</b>"
+            + (" 🔒" if got.get("is_private") else "")
+            + "\n<i>the page's embedded payload — the same numbers the app "
+            "shows; used as the fallback when the API is blocked</i>"
         )
     else:
         lines.append(
@@ -2525,6 +2534,11 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("")
     if api.success:
         lines.append("<i>The API answers — profile stats are live.</i>")
+    elif got:
+        lines.append(
+            "<i>The API is blocked, but the page answers — profile stats keep "
+            "arriving, minus the reel/highlight counts.</i>"
+        )
     elif service.stories is not None and any("✅ <b>saveinsta" in ln for ln in lines):
         lines.append(
             "<i>Profile stats are blocked, but media still works — stories and "

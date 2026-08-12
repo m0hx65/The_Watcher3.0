@@ -1,19 +1,19 @@
-"""Regression tests for the public-page fallback profile source.
+"""Regression tests for the public-page fallback WIRING.
 
 When web_profile_info answers 401 there is a second door: the plain profile
-page, whose Open Graph block carries the follower/following/post counts. It is
-LIVE data from a different endpoint — not a cache — so it satisfies the rule
-that the bot never presents old data as current.
+page, whose embedded Relay payload carries the same fields the API returns.
+The parser itself is covered by test_public_page_payload.py — this file covers
+what happens around it.
 
 What must hold:
-- the counts parse out of both og:description formats Instagram serves, in
-  either attribute order, abbreviated or not;
-- a login wall / block page yields NOTHING rather than zeros;
-- the bio is never taken from og:description (it arrives truncated there, and
-  storing a truncated bio would fire a bio-change alert every sweep);
-- a partial observation never blanks a field it couldn't see, and never
-  invents a change;
-- the fallback only runs after the API is actually blocked.
+- the fallback runs only after the API is actually blocked, never before;
+- a blocked page leaves the API's original error intact, never a bare success;
+- a partial observation never blanks a field it couldn't see, never invents a
+  change, and never turns a private account public;
+- the two sources are diffed against their own history, because they can
+  disagree about the same account at the same moment;
+- the one-time purge removes the withdrawn og:-era rows and leaves the
+  payload-era ones alone.
 
 Runs fully offline.
 """
@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,11 +42,7 @@ from app.database import crud  # noqa: E402
 from app.database.models import MonitoredAccount  # noqa: E402
 from app.monitor.change_detector import _is_meaningful_change  # noqa: E402
 from app.monitor.instagram import InstagramClient  # noqa: E402
-from app.monitor.public_page import (  # noqa: E402
-    _to_int,
-    parse_public_profile,
-    strip_bidi,
-)
+from app.monitor.public_page import parse_public_profile, strip_bidi  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -62,26 +57,40 @@ def expect(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-# The classic render.
-PAGE_CLASSIC = """
-<html><head>
-<meta property="og:title" content="Reina Saad (@rein__saad) &#8226; Instagram photos and videos" />
-<meta property="og:description" content="1,234 Followers, 567 Following, 89 Posts - See Instagram photos and videos from Reina Saad (@rein__saad)" />
-<meta property="og:image" content="https://scontent.cdninstagram.com/v/t51.2885-19/123_n.jpg" />
-<script>{"profile_id":"7880052534","other":1}</script>
-</head><body></body></html>
-"""
+def page_for(
+    username: str = "rein__saad",
+    full_name: str = "Reina Saad",
+    *,
+    followers: int = 1234,
+    following: int = 567,
+    pk: str = "7880052534",
+) -> str:
+    """A profile page shaped like the real capture: the stale og: block that
+    shipped first, and the embedded payload the parser actually reads."""
+    return (
+        "<!DOCTYPE html><html><head>"
+        f'<meta property="og:title" content="{full_name} (@{username})" />'
+        # Deliberately WRONG, and deliberately present: a fixture where both
+        # numbers agree could not catch the parser drifting back to the tags.
+        '<meta property="og:description" content="9,999 Followers, 8,888 '
+        'Following, 7,777 Posts" />'
+        "</head><body><script type=\"application/json\" data-sjs>"
+        '{"require":[["RelayPrefetchedStreamCache","next",[],[{"__bbox":'
+        '{"result":{"data":{"xig_user_by_username":'
+        f'{{"pk":"{pk}","username":"{username}",'
+        '"profile_pic_url":"https:\\/\\/scontent.cdninstagram.com\\/v\\/'
+        't51.2885-19\\/123_n.jpg","is_private":false,'
+        f'"biography":"bio text","full_name":"{full_name}",'
+        '"is_verified":false,"bio_links":[],'
+        f'"follower_count":{followers},"following_count":{following},'
+        '"all_media_count":89,"id":"17841407816045006"}'
+        "}}}}]]]}</script></body></html>"
+    )
 
-# The newer one: bio in the description, attributes reversed, abbreviated counts.
-PAGE_MODERN = """
-<html><head>
-<meta content="1.2M Followers, 2,345 Following, 1,678 Posts - Aya (@alyakarkoutly) on Instagram: &quot;bio text that is truncated here&hellip;&quot;" property="og:description">
-<meta content="Aya (@alyakarkoutly) &#8226; Instagram photos and videos" property="og:title">
-<meta content="https://scontent.cdninstagram.com/v/t51.2885-19/999_n.jpg" property="og:image">
-</head><body></body></html>
-"""
 
-# What a login wall looks like: no counts anywhere.
+PAGE = page_for()
+
+# What a login wall looks like: no payload anywhere.
 PAGE_LOGIN_WALL = """
 <html><head>
 <meta property="og:title" content="Instagram" />
@@ -90,101 +99,17 @@ PAGE_LOGIN_WALL = """
 """
 
 
-def test_classic_page_parses() -> None:
-    parsed = parse_public_profile(PAGE_CLASSIC, "rein__saad")
-    expect("classic page parses", parsed is not None)
+def test_the_fixture_is_a_valid_page() -> None:
+    """Guards the fixture itself: every wiring test below is meaningless if
+    this page stops parsing, and it would fail in confusing ways instead."""
+    parsed = parse_public_profile(PAGE, "rein__saad")
+    expect("the fixture parses", parsed is not None)
     assert parsed
-    expect("followers", parsed.get("followers_count") == 1234, repr(parsed))
-    expect("following", parsed.get("following_count") == 567, repr(parsed))
-    expect("posts", parsed.get("posts_count") == 89, repr(parsed))
-    expect("full name", parsed.get("full_name") == "Reina Saad", repr(parsed))
-    expect("username", parsed.get("username") == "rein__saad", repr(parsed))
-    expect("avatar url", "t51.2885-19" in (parsed.get("profile_pic_url") or ""))
-    expect("numeric id", parsed.get("instagram_id") == "7880052534", repr(parsed))
-    expect("no bio is invented", "biography" not in parsed, repr(parsed))
-    expect("no privacy flag is invented", "is_private" not in parsed, repr(parsed))
-
-
-def test_modern_page_parses() -> None:
-    parsed = parse_public_profile(PAGE_MODERN, "alyakarkoutly")
-    expect("reversed-attribute page parses", parsed is not None)
-    assert parsed
-    expect("abbreviated followers", parsed.get("followers_count") == 1_200_000,
-           repr(parsed))
-    expect("following with separator", parsed.get("following_count") == 2345,
-           repr(parsed))
-    expect("posts", parsed.get("posts_count") == 1678, repr(parsed))
-    expect("full name", parsed.get("full_name") == "Aya", repr(parsed))
-    # The description carries a TRUNCATED bio — taking it would alert every
-    # sweep against the API's full text.
-    expect("the truncated bio is never stored", "biography" not in parsed,
-           repr(parsed))
-
-
-def test_real_sized_page_parses_fast() -> None:
-    """The bug that killed the service: a lazy `.*?` under DOTALL rescanned the
-    whole document for every non-matching <meta>, so cost grew quadratically
-    with page size. A real profile page is megabytes, the parse ran on the
-    event loop, the health endpoint stopped answering, and Render killed the
-    instance mid-probe.
-
-    So: parse something the size of the real thing, and hold it to a budget a
-    quadratic implementation cannot possibly meet.
-    """
-    # A page shaped like Instagram's: a head full of meta tags that do NOT
-    # match (the trigger), the og: block, then megabytes of inlined JSON.
-    decoys = "\n".join(
-        f'<meta name="decoy-{i}" content="{"x" * 200}">' for i in range(400)
-    )
-    body_json = '<script type="application/json">' + ('{"k":"' + "v" * 100 + '"},') * 20_000 + "</script>"
-    page = (
-        "<html><head>" + decoys + PAGE_CLASSIC.split("<head>")[1].split("</head>")[0]
-        + "</head><body>" + body_json + "</body></html>"
-    )
-    size_mb = len(page) / 1_000_000
-    expect("the fixture is realistically large", size_mb > 2, f"{size_mb:.1f} MB")
-
-    start = time.monotonic()
-    parsed = parse_public_profile(page, "rein__saad")
-    elapsed = time.monotonic() - start
-
-    expect("a real-sized page still parses", parsed is not None)
-    assert parsed
-    expect("and gets the right counts", parsed.get("followers_count") == 1234,
-           repr(parsed))
-    # The quadratic version took minutes on this shape; anything near a second
-    # means the bound is gone again.
-    expect("a multi-MB page parses in well under a second", elapsed < 1.0,
-           f"{elapsed:.2f}s for {size_mb:.1f} MB")
-
-
-def test_pathological_markup_is_bounded() -> None:
-    """Unterminated attributes and no </head> must not send the scan wandering."""
-    page = "<html><head>" + '<meta property="og:description" content="' + "x" * 500_000
-    start = time.monotonic()
-    parsed = parse_public_profile(page, "someone")
-    elapsed = time.monotonic() - start
-    expect("malformed markup yields nothing rather than hanging", parsed is None)
-    expect("and returns immediately", elapsed < 1.0, f"{elapsed:.2f}s")
-
-
-def test_login_wall_yields_nothing() -> None:
-    expect("a login wall parses to None",
-           parse_public_profile(PAGE_LOGIN_WALL, "someone") is None)
-    expect("an empty page parses to None",
-           parse_public_profile("", "someone") is None)
-    expect("junk parses to None",
-           parse_public_profile("<html>nope</html>", "someone") is None)
-
-
-def test_count_parsing() -> None:
-    expect("plain", _to_int("1234") == 1234)
-    expect("separators", _to_int("1,234,567") == 1234567)
-    expect("K", _to_int("12.3K") == 12300)
-    expect("M", _to_int("4.5M") == 4500000)
-    expect("B", _to_int("1.2B") == 1200000000)
-    expect("garbage is None, never 0", _to_int("many") is None)
-    expect("empty is None, never 0", _to_int("") is None)
+    expect("counts come from the payload, not the og: tags",
+           (parsed.get("followers_count"), parsed.get("following_count"))
+           == (1234, 567), repr(parsed))
+    expect("the numeric id is pk", parsed.get("instagram_id") == "7880052534",
+           repr(parsed.get("instagram_id")))
 
 
 def test_unknown_text_field_is_not_a_change() -> None:
@@ -224,12 +149,18 @@ class _MockSession:
         pass
 
 
-async def test_purge_removes_partial_snapshots() -> None:
-    """The rows the withdrawn source already wrote have to go: the card reads
-    the newest snapshot, so leaving one means it keeps stating a wrong number
-    as current."""
+async def test_purge_removes_only_the_og_era_rows() -> None:
+    """The withdrawn og: parser's rows have to go — the card reads the newest
+    snapshot, so leaving one means it keeps stating a wrong number as current.
+    The payload parser's rows must NOT: they matched ground truth, and a purge
+    that ran on every boot would delete good data forever."""
+    from datetime import timedelta
+
     from app.database.models import AccountSnapshot, Base
     from app.database.session import engine, get_session
+
+    before_cutoff = crud.OG_ERA_CUTOFF.replace(tzinfo=None) - timedelta(days=1)
+    after_cutoff = crud.OG_ERA_CUTOFF.replace(tzinfo=None) + timedelta(days=8)
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -241,22 +172,40 @@ async def test_purge_removes_partial_snapshots() -> None:
         session.add(AccountSnapshot(
             account_id=account_id, username="purgeme", http_status=200,
             following_count=577, raw_response={"data": {"user": {"id": "9"}}},
+            created_at=before_cutoff,
         ))
         await session.flush()
+        # The wrong number the og: block reported for a real account.
         session.add(AccountSnapshot(
             account_id=account_id, username="purgeme", http_status=200,
             following_count=677, raw_response={"source": "public_page"},
+            created_at=before_cutoff,
+        ))
+        await session.flush()
+        # A payload-era reading of the same account: same source marker, but
+        # written after the parser was fixed.
+        session.add(AccountSnapshot(
+            account_id=account_id, username="purgeme", http_status=200,
+            following_count=577, raw_response={"source": "public_page"},
+            created_at=after_cutoff,
         ))
 
     async with get_session() as session:
         removed = await crud.purge_partial_snapshots(session)
     async with get_session() as session:
         latest = await crud.get_latest_snapshot(session, account_id)
+        survivors = await crud.recent_snapshots(session, account_id, limit=10)
 
-    # Earlier tests in this file also wrote partial rows, so the count covers
-    # every one of them — the contract is "none survive", not "exactly one".
-    expect("partial rows are removed", removed >= 1, repr(removed))
+    expect("og:-era partial rows are removed", removed >= 1, repr(removed))
+    expect("the wrong number is gone",
+           all(row.following_count != 677 for row in survivors),
+           repr([row.following_count for row in survivors]))
+    expect("the payload-era partial row survives",
+           any(crud.snapshot_source(row) == "public_page" for row in survivors),
+           repr([crud.snapshot_source(row) for row in survivors]))
     expect("the authoritative row survives",
+           any(crud.snapshot_source(row) is None for row in survivors))
+    expect("and the card reads a correct number",
            latest is not None and latest.following_count == 577,
            repr(latest and latest.following_count))
 
@@ -266,14 +215,13 @@ async def test_purge_removes_partial_snapshots() -> None:
     await engine.dispose()
 
 
-async def test_a_blocked_api_fails_and_never_uses_the_page() -> None:
-    """The page was withdrawn as a data source: verified against a real profile
-    it reported 677 following where Instagram showed 577. A wrong number
-    presented as current is worse than an honest failure, so a blocked fetch
-    must fail — even though the page would have answered."""
+async def test_a_blocked_api_falls_through_to_the_page() -> None:
+    """The second door, and the reason it exists: the API 401s from a
+    datacenter IP while the page still answers. The reading is marked partial
+    so nothing downstream mistakes it for a full one."""
     def handler(url: str, params: dict, headers: dict) -> _MockResponse:
         if "instagram.com/rein__saad/" in url:
-            return _MockResponse(200, text=PAGE_CLASSIC)  # would have answered
+            return _MockResponse(200, text=PAGE)
         return _MockResponse(401, {})
 
     session = _MockSession(handler)
@@ -285,10 +233,41 @@ async def test_a_blocked_api_fails_and_never_uses_the_page() -> None:
     finally:
         settings.ig_proxy_url = old
 
-    expect("a blocked API reports the block", not result.success)
+    expect("the page answers when the API is blocked", result.success,
+           repr(result.error))
+    expect("and is labelled partial", result.partial and result.source == "public_page",
+           result.source)
+    expect("with the payload's counts",
+           (result.parsed or {}).get("following_count") == 567,
+           repr(result.parsed))
+    expect("the page is fetched directly, not through the worker",
+           any(u.startswith("https://www.instagram.com/rein__saad/")
+               for u in session.urls),
+           repr(session.urls))
+
+
+async def test_probe_measures_each_door_alone() -> None:
+    """/probe reports the API and the page separately. If the API call fell
+    through internally, a blocked API would still print as reachable."""
+    def handler(url: str, params: dict, headers: dict) -> _MockResponse:
+        if "instagram.com/rein__saad/" in url:
+            return _MockResponse(200, text=PAGE)
+        return _MockResponse(401, {})
+
+    session = _MockSession(handler)
+    old = settings.ig_proxy_url
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile(
+                "rein__saad", auth_attempts=1, allow_fallback=False
+            )
+    finally:
+        settings.ig_proxy_url = old
+
+    expect("allow_fallback=False reports the block", not result.success)
     expect("the 401 is preserved", result.http_status == 401, repr(result.http_status))
-    expect("no page data is substituted", result.parsed is None, repr(result.parsed))
-    expect("the page is not even fetched",
+    expect("and the page is not even fetched",
            not any("instagram.com/rein__saad/" in u for u in session.urls),
            repr(session.urls))
 
@@ -341,10 +320,7 @@ def test_bidi_marks_never_alert() -> None:
     expect("a real rename still reports",
            _is_meaningful_change("full_name", plain, "رالا"))
 
-    page = PAGE_CLASSIC.replace(
-        "Reina Saad (@rein__saad)", f"‎{plain}‎ (@rein__saad)"
-    )
-    parsed = parse_public_profile(page, "rein__saad")
+    parsed = parse_public_profile(page_for(full_name=wrapped), "rein__saad")
     assert parsed
     expect("the parsed name carries no marks", parsed.get("full_name") == plain,
            repr(parsed.get("full_name")))
@@ -436,7 +412,10 @@ async def test_partial_reading_keeps_a_private_account_private() -> None:
     service.notifier.send_text = AsyncMock(return_value=True)
     service.hasher.hash_url = AsyncMock(return_value=None)
 
-    # A partial public-page reading carries no privacy flag at all.
+    # The payload normally carries is_private, and that is the real fix for
+    # this bug. This fixture omits it anyway: the rule under test is that an
+    # ABSENT field falls back to the last known value rather than to
+    # bool(None), and it has to hold for whatever the page fails to include.
     fetch = ProfileFetchResult(
         "privateuser", 200,
         parsed={"username": "privateuser", "followers_count": 11,
@@ -461,18 +440,14 @@ async def test_partial_reading_keeps_a_private_account_private() -> None:
 
 
 async def main() -> int:
-    test_classic_page_parses()
-    test_modern_page_parses()
-    test_real_sized_page_parses_fast()
-    test_pathological_markup_is_bounded()
-    test_login_wall_yields_nothing()
-    test_count_parsing()
+    test_the_fixture_is_a_valid_page()
     test_unknown_text_field_is_not_a_change()
     test_bidi_marks_never_alert()
     await test_sources_are_diffed_separately()
     await test_partial_reading_keeps_a_private_account_private()
-    await test_a_blocked_api_fails_and_never_uses_the_page()
-    await test_purge_removes_partial_snapshots()
+    await test_a_blocked_api_falls_through_to_the_page()
+    await test_probe_measures_each_door_alone()
+    await test_purge_removes_only_the_og_era_rows()
     await test_no_fallback_when_the_api_answers()
     await test_blocked_page_keeps_the_original_error()
 

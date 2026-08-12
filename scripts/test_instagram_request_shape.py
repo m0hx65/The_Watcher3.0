@@ -139,11 +139,13 @@ async def test_sweep_asks_the_worker_once_per_blocked_check() -> None:
     assert result.http_status == 401
     worker_calls = [r for r in session.requests if r["url"] == proxy_url]
     assert len(worker_calls) == 1, f"worker asked {len(worker_calls)}× for one account"
-    # And nothing else. The public-page fallback that used to run here was
-    # withdrawn: its counts were verified wrong against a real profile, and a
-    # wrong number presented as current is worse than an honest failure.
-    other = [r for r in session.requests if r["url"] != proxy_url]
-    assert not other, f"unexpected extra request(s): {other!r}"
+    # The one extra request is the public-page fallback — a different door, one
+    # direct request, not another 8-attempt worker call. Direct is also the
+    # point: routed through the Worker it would carry Cloudflare's TLS
+    # fingerprint under a Chrome UA, which is itself a bot signal.
+    page_calls = [r for r in session.requests if r["url"] != proxy_url]
+    assert len(page_calls) == 1, repr(session.requests)
+    assert page_calls[0]["url"] == "https://www.instagram.com/65xim/", page_calls
 
 
 async def test_manual_check_retries_across_colos() -> None:

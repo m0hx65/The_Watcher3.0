@@ -161,26 +161,60 @@ def snapshot_source(snapshot: Optional[AccountSnapshot]) -> Optional[str]:
     return None
 
 
-async def purge_partial_snapshots(session: AsyncSession) -> int:
-    """Delete every snapshot recorded from a non-authoritative source.
+# Everything the public page produced BEFORE this instant came from the og:
+# meta block, which was verified wrong against a real profile (677 following
+# where Instagram showed 577) and withdrawn at 11:40 UTC that day. Everything
+# after comes from the page's embedded Relay payload, which matched ground
+# truth exactly — so it is kept.
+#
+# The cutoff sits in the gap between the two: after the og: parser was deleted
+# (so no good row can be older than it) and before the payload parser shipped
+# (so no bad row can be newer). That makes the purge a one-time cleanup that
+# stays a no-op on every boot afterwards, rather than a standing rule that
+# would now delete trustworthy rows forever.
+OG_ERA_CUTOFF = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
-    The public-page fallback was withdrawn after it was verified wrong against
-    a real profile (677 following where Instagram showed 577). Its rows have to
-    go with it: the account card reads the newest snapshot, so leaving them
-    means the card keeps stating a wrong number as current, and every later
-    diff measures against it. Returns how many were removed.
+
+async def purge_partial_snapshots(
+    session: AsyncSession, *, before: Optional[datetime] = None
+) -> int:
+    """Delete og:-era partial snapshots — those written before `before`.
+
+    Their counts were wrong, and the account card reads the newest snapshot, so
+    leaving one means the card keeps stating a wrong number as current and every
+    later diff measures against it. Returns how many were removed.
 
     Scans in Python rather than querying inside the JSON column, because the
     predicate must behave identically on Postgres and SQLite.
     """
+    cutoff = OG_ERA_CUTOFF if before is None else before
     stmt = select(AccountSnapshot).where(AccountSnapshot.raw_response.is_not(None))
     rows = (await session.execute(stmt)).scalars().all()
-    doomed = [row.id for row in rows if snapshot_source(row) is not None]
+    doomed = [
+        row.id
+        for row in rows
+        if snapshot_source(row) is not None and _written_before(row, cutoff)
+    ]
     if doomed:
         await session.execute(
             delete(AccountSnapshot).where(AccountSnapshot.id.in_(doomed))
         )
     return len(doomed)
+
+
+def _written_before(snapshot: AccountSnapshot, cutoff: datetime) -> bool:
+    """Compare created_at to a UTC cutoff, tolerating a naive timestamp.
+
+    Postgres hands back an aware datetime, SQLite a naive one; comparing the two
+    kinds raises. A naive value is read as UTC, which is what both backends
+    store.
+    """
+    written = snapshot.created_at
+    if written is None:
+        return True
+    if written.tzinfo is None:
+        written = written.replace(tzinfo=timezone.utc)
+    return written < cutoff
 
 
 async def get_latest_snapshot_by_source(

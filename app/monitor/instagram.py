@@ -66,11 +66,11 @@ class ProfileFetchResult:
     parsed: Optional[dict[str, Any]] = None
     raw_response: Optional[dict[str, Any]] = None
     error: Optional[str] = None
-    # Which door answered: "api" (web_profile_info) or "public_page" (the
-    # Open Graph block on instagram.com/<user>/). A public_page result is LIVE
-    # but PARTIAL — it carries the counts and the name, and genuinely does not
-    # know the bio, privacy or verification flags. Callers must not read an
-    # absent field as an empty one.
+    # Which door answered: "api" (web_profile_info) or "public_page" (the Relay
+    # payload embedded in instagram.com/<user>/). A public_page result is LIVE
+    # but PARTIAL — it carries the counts, the name, the bio and the flags, and
+    # genuinely does not know reels_count, story_count or is_business. Callers
+    # must not read an absent field as an empty one.
     source: str = "api"
 
     @property
@@ -480,6 +480,7 @@ class InstagramClient:
         username: str,
         *,
         auth_attempts: Optional[int] = None,
+        allow_fallback: bool = True,
     ) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff.
 
@@ -491,8 +492,8 @@ class InstagramClient:
         someone waiting on it should try every colo it can. Ignored on the
         direct path, which has its own full retry budget.
 
-        A blocked fetch returns the failure. It does NOT fall through to the
-        public profile page — see the note at the end of this method.
+        `allow_fallback=False` asks the API door only — used by /probe, which
+        tests each source separately and would otherwise measure them combined.
         """
         username = username.strip().lstrip("@")
         headers = _build_headers()
@@ -622,20 +623,21 @@ class InstagramClient:
                 )
                 await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
 
-        # NO public-page fallback here — deliberately.
+        # The API door is shut. Try the other one: the profile page's embedded
+        # Relay payload — the data the page itself renders from, verified
+        # against ground truth (follower/following matched the Instagram app
+        # exactly). One direct request, not another 8-attempt worker call.
         #
-        # It shipped as a second door and had to be withdrawn: verified against
-        # the real profile on 2026-08-12, the page reported 677 following for an
-        # account Instagram itself showed as 577. Followers and posts matched,
-        # so the numbers are not uniformly stale — they are simply not
-        # trustworthy, and there is no way to tell a good one from a bad one at
-        # read time. Serving them meant the account card stated a wrong number
-        # as current, which the owner's standing rule forbids outright: an
-        # honest failure beats wrong data.
-        #
-        # The parser and `probe_public_page` remain for /probe, where the page
-        # is reported as diagnostics rather than stored as fact.
-        #
+        # This is NOT the og: meta block, which shipped first and was withdrawn
+        # the next day: on the very same response it read "677 Following" for an
+        # account whose payload — and app, and rendered page — said 577. The
+        # tags are a stale cache with nothing marking them as stale. See
+        # app/monitor/public_page.py.
+        if allow_fallback and last_status in (401, 403):
+            fallback = await self.fetch_profile_via_public_page(username)
+            if fallback is not None:
+                return fallback
+
         # Record the terminal outcome once per fetch (retries within a single
         # fetch are one logical attempt against the endpoint).
         fetch_health.record_status(IG_PROFILE, last_status)
@@ -643,6 +645,44 @@ class InstagramClient:
             username=username,
             http_status=last_status,
             error=last_error or f"failed after {self.max_retries} attempts",
+        )
+
+    async def fetch_profile_via_public_page(
+        self, username: str
+    ) -> Optional[ProfileFetchResult]:
+        """Profile data from the page's embedded Relay payload, or None.
+
+        Deliberately NOT routed through the Worker: sent directly, this request
+        carries curl_cffi's real Chrome TLS fingerprint, while a Worker hop
+        would carry Cloudflare's runtime fingerprint under a Chrome
+        User-Agent — the mismatch being one of the things the gate reads. It
+        also sends no `x-ig-app-id`, so it looks like a page view rather than a
+        private-API call.
+
+        The reading is PARTIAL, not unreliable: it carries the counts, the name,
+        the bio and the privacy/verification flags, and genuinely does not know
+        reels_count, story_count or is_business. Absent is not empty — the
+        caller carries those forward rather than writing a None over them.
+
+        Returns None when the page is blocked or carries no payload, leaving the
+        caller's original error intact. Never returns zeros for missing data.
+        """
+        outcome = await self.probe_public_page(username)
+        parsed = outcome.get("parsed")
+        if parsed is None:
+            return None
+
+        fetch_health.record_status(IG_PROFILE, 200)
+        logger.info(
+            "@{} answered on the public page after the API blocked us — "
+            "partial data ({} of {} fields)",
+            username, len(parsed), len(PARTIAL_FIELDS),
+        )
+        return ProfileFetchResult(
+            username=username,
+            http_status=200,
+            parsed=parsed,
+            source="public_page",
         )
 
     async def probe_public_page(self, username: str) -> dict[str, Any]:
@@ -688,10 +728,10 @@ class InstagramClient:
         parsed = await asyncio.to_thread(parse_public_profile, body, username)
         result["parsed"] = parsed
         if parsed is None:
-            result["error"] = "no counts in the markup"
+            result["error"] = "no profile payload in the page"
             logger.info(
                 "Public page for @{} was served ({} bytes) but carried no "
-                "counts — login wall or markup change",
+                "profile payload — login wall or markup change",
                 username, len(body),
             )
         return result

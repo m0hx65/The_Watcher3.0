@@ -280,42 +280,64 @@ x-ig-app-id: 936619743392459
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
 
-**Public-page fallback — built, then WITHDRAWN (2026-08-12).** When the API
-ended in 401/403 the client used to try `instagram.com/<username>/` and parse
-the Open Graph block (`app/monitor/public_page.py`) for counts, display name and
-avatar. It was removed from the data path after verification against a real
-profile: the page reported **677 following where Instagram showed 577**, with
-followers and posts matching exactly. So the counts are not uniformly stale —
-they are simply untrustworthy, and nothing distinguishes a good one from a bad
-one at read time. Serving them put a wrong number on the account card as
-current, which the standing rule forbids: an honest failure beats wrong data.
+**Public-page fallback — the second door.** When the API ends in 401/403 the
+client tries `instagram.com/<username>/` once, directly, and parses the Relay
+payload the page itself renders from (`app/monitor/public_page.py`):
 
-A blocked fetch now returns the failure. `probe_public_page()` and the parser
-remain for `/probe`, which reports the page as *reachability* and labels the
-counts as unused.
+```json
+"xig_user_by_username":{"pk":"7880052534","username":"65xim","is_private":true,
+  "biography":"…","full_name":"Mohamad","is_verified":false,
+  "follower_count":118,"following_count":577,"all_media_count":null}
+```
 
-Two mechanisms built for it are still in force, because they guard anything
-partial that might arrive later:
+Same shape the API returns, and it carries the privacy flag, so a private
+account is never mistaken for a public one. The result is marked
+`source="public_page"` and `partial` — it does not know `reels_count`,
+`story_count` or `is_business`, and those carry forward rather than being
+written as None.
+
+**Not the `og:` meta block, which shipped first and was withdrawn a day later
+(2026-08-12).** The tags are a stale cache, and the same response carries both:
+`og:description` said *677 Following* for an account whose embedded payload,
+rendered HTML and Instagram app all said **577**. Followers and posts matched
+exactly, and nothing in the block marks it as old — so there was no read-time
+test separating a good value from a bad one, and the whole surface had to go.
+The lesson generalises and is now a standing rule: **a source being LIVE says
+nothing about it being CORRECT.** Only the payload was checked against ground
+truth, and only the payload passed.
+
+Two mechanisms built during that round are still in force, because they guard
+any partial reading:
 
 - **Source-scoped diffing** (`crud.get_latest_snapshot_by_source`). The API and
-  the page disagreed about the same account at the same moment, so alternating
-  between them "detected" a change on every flip. Each source is diffed against
-  its own history; carry-forward still uses the newest snapshot from any source,
-  because "what we last knew" and "what is safe to diff" are different questions.
-- **Bidi normalization** (`public_page.strip_bidi`). Instagram's `og:title`
-  wraps RTL display names in invisible direction marks and its API does not, so
-  an Arabic name reported as `لِ → ‎لِ‎` — two visibly identical strings. Marks
-  are stripped at parse time and ignored in text comparison.
+  the page can disagree about the same account at the same moment, so
+  alternating between them "detected" a change on every flip. Each source is
+  diffed against its own history; carry-forward still uses the newest snapshot
+  from any source, because "what we last knew" and "what is safe to diff" are
+  different questions.
+- **Bidi normalization** (`public_page.strip_bidi`). Instagram wraps RTL display
+  names in invisible direction marks on some surfaces and not others, so an
+  Arabic name reported as `لِ → ‎لِ‎` — two visibly identical strings. Marks are
+  stripped at parse time and ignored in text comparison.
 
-`crud.purge_partial_snapshots()` runs once at startup and deletes the rows the
-withdrawn source already wrote, because the account card reads the newest
-snapshot and would otherwise keep stating a wrong number as current.
+`crud.purge_partial_snapshots()` runs once at startup, bounded to rows written
+before `crud.OG_ERA_CUTOFF`, deleting what the withdrawn `og:` parser wrote —
+the account card reads the newest snapshot and would otherwise keep stating a
+wrong number as current. The cutoff sits in the gap between the two parsers, so
+it never touches the payload-sourced rows the current fallback writes.
 
-Parsing is bounded — capped at `</head>`, matched one tag at a time, and run
-off the event loop. An earlier version used a lazy `(.*?)` under `re.DOTALL`
-that rescanned the whole document per non-matching tag; on a multi-MB profile
-page that pinned the CPU long enough for the health endpoint to time out and
-the instance to be killed.
+Parsing is bounded — a 4 MB scan window, a 200 KB object ceiling, brace-matched
+in one pass, and run off the event loop. An earlier version used a lazy `(.*?)`
+under `re.DOTALL` that rescanned the whole document per non-matching tag; on a
+multi-MB profile page that pinned the CPU long enough for the health endpoint to
+time out and the instance to be killed.
+
+**Verification status.** The payload matched ground truth for one account
+(`@65xim`), on numbers checked by hand — the check that was missing the first
+time, but still a sample of one. Whether the page is reachable at all from
+Render's datacenter IP is unmeasured; if it answers with a login wall the parse
+returns `None` and the fetch reports its original error. Run `/probe <user>` on
+a few mixed public/private accounts and compare against the app.
 
 **HD profile picture:** `i.instagram.com/api/v1/users/{id}/info/` returns
 `hd_profile_pic_url_info` (up to ~1440px), but **only for logged-in sessions**.
