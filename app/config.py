@@ -139,15 +139,25 @@ class Settings(BaseSettings):
     highlight_scan_interval: int = Field(default=21600, alias="HIGHLIGHT_SCAN_INTERVAL")
 
     # Per-sweep story/live status line ("HAS STORY" / "NO STORY" / "LIVE NOW").
-    # Off by default: with it on, one story produced a status line in every
-    # sweep for as long as it stayed up — dozens of messages saying the same
-    # thing, on top of the "just posted a story!" alert and the story media
-    # itself. Quiet mode announces the status only when it CHANGES, stays
-    # silent when the media (or its text stand-in) already announced the story,
-    # and drops the per-account "status unavailable" notice, which only repeats
-    # what the sweep summary already lists. A manual Recheck always answers.
-    # Every status is still logged for the digest either way.
-    story_status_heartbeat: bool = Field(default=False, alias="STORY_STATUS_HEARTBEAT")
+    # ON by default: every check says where each public account stands, so
+    # silence is never something you have to interpret. "No story" is a real
+    # answer and it is the one the quiet mode never gave — it only spoke when
+    # the status CHANGED, which left "@user has nothing up right now" and "the
+    # bot didn't check" looking identical.
+    #
+    # What it does NOT do is repeat itself: a check that already announced the
+    # story (the media, or the text stand-in when the download fails) does not
+    # also get a "HAS STORY" line, so a check is still one message. That was
+    # the actual complaint behind the old quiet mode — one story producing a
+    # line every sweep ON TOP of the alert and the media — and it stays fixed.
+    #
+    # Private accounts never reach this path at all (the story phase is gated
+    # on the privacy flag), so no line is ever printed for stories the bot
+    # cannot and must not see.
+    #
+    # STORY_STATUS_HEARTBEAT=false restores change-only announcements. Every
+    # status is logged for the digest and history either way.
+    story_status_heartbeat: bool = Field(default=True, alias="STORY_STATUS_HEARTBEAT")
 
     # Follower-anomaly alert: a follower change is flagged only when it's large
     # in BOTH absolute terms (≥ abs_min) and relative terms (≥ pct_min of the

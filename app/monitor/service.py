@@ -2213,38 +2213,40 @@ class MonitorService:
         already_announced: bool = False,
         always: bool = False,
     ) -> None:
-        """Send the story/live status line — but only when it says something new.
+        """Send the story/live status line for this check.
 
         `status` is this check's observed state: "live" / "story" / "none" /
-        "unknown". Sending it every sweep is what turned a single story into a
-        message an hour, all of them identical, plus a third copy of the same
-        news whenever the media itself was delivered. So by default the line
-        goes out only when the status DIFFERS from the one last announced:
+        "unknown". The ordering below is the whole design:
 
-        - a story that stays up for six sweeps is announced once, not six times;
-        - `already_announced` says this check has already sent a message about
-          the story — the media itself ("📖 @user — new story"), or the text
-          alert that stands in when the downloads fail. The line would only
-          repeat it, so it is suppressed while the baseline still advances,
-          which keeps the next sweep quiet too;
-        - "unknown" is never announced and never becomes the baseline. The sweep
-          summary already names every account Instagram wouldn't answer for, and
-          a status that merely went dark and came back unchanged is not news.
+        - `already_announced` wins over everything. This check has already sent
+          a message about the story — the media itself ("📖 @user — new story"),
+          or the text alert that stands in when the downloads fail. A "HAS
+          STORY" line after it is a second copy of the same news, which is the
+          noise that made the per-sweep line unbearable in the first place. The
+          baseline still advances, so nothing is lost.
+        - otherwise the default (STORY_STATUS_HEARTBEAT) answers for EVERY
+          check, including "⭕ NO STORY". Silence is not an answer: with
+          change-only announcements, "nothing is up right now" and "the bot
+          never got to this account" looked exactly the same from the outside.
+        - `always` (manual Recheck) answers even with the heartbeat off, since
+          someone is waiting on it.
+        - with the heartbeat off, the line goes out only when the status DIFFERS
+          from the one last announced, and "unknown" is never announced (the
+          sweep summary already names every account Instagram wouldn't answer
+          for).
 
-        STORY_STATUS_HEARTBEAT=true restores the old line-every-sweep behavior.
-        `always` (manual Recheck) reports the status even when it hasn't
-        changed, since someone is waiting on the answer — but never on top of
-        the media, so a check is still one message. Either way the status is
-        logged, so the digest and history see every check.
+        An unobserved status never becomes the baseline either way, so a blocked
+        sweep can't manufacture a transition on recovery. Every status is logged,
+        so the digest and history see every check regardless of what was sent.
         """
         announce_key = self._story_announce_key(account_id)
         async with get_session() as session:
             last_announced = await crud.get_setting(session, announce_key)
 
-        if settings.story_status_heartbeat:
-            send = True                     # opt-in: the old line every sweep
-        elif already_announced:
+        if already_announced:
             send = False                    # the media already said it
+        elif settings.story_status_heartbeat:
+            send = True                     # default: answer for every check
         elif always:
             send = True                     # a Recheck is owed an answer
         elif status == "unknown":

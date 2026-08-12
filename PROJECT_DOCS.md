@@ -673,7 +673,7 @@ All settings are read from environment variables (or a `.env` file locally).
 
 | Env Var | Default | Description |
 |---|---|---|
-| `STORY_STATUS_HEARTBEAT` | `false` | `true` posts a story/live status line every sweep (the old behavior). Off = announced only when it changes, and never on top of the media that already announced it |
+| `STORY_STATUS_HEARTBEAT` | `true` | Posts a story/live status line on every check, so every public account's state is always stated (`⭕ NO STORY` included). Never sent on top of the media that already announced the same story. `false` = announced only when it changes |
 | `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight's media. New reels are always listed immediately. `0` = every sweep (~12× traffic) |
 | `AUTO_GRAB_ON_PUBLIC` | `true` | Deliver the whole backlog when a target flips private → public |
 | `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel (`0` disables) |
