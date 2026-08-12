@@ -43,6 +43,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_db()
 
+    # One-time cleanup: the withdrawn public-page fallback left snapshots whose
+    # counts were verified wrong against the real profile. The card reads the
+    # newest snapshot, so they have to go or it keeps stating a wrong number as
+    # current. A no-op on every boot after the first.
+    async with get_session() as session:
+        purged = await crud.purge_partial_snapshots(session)
+    if purged:
+        logger.warning(
+            "Removed {} snapshot(s) from the withdrawn public-page source — "
+            "their follower/following counts did not match Instagram", purged,
+        )
+
     # Telegram bot
     tg_app = (
         TgApplication.builder()

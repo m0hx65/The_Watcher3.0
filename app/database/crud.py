@@ -161,6 +161,28 @@ def snapshot_source(snapshot: Optional[AccountSnapshot]) -> Optional[str]:
     return None
 
 
+async def purge_partial_snapshots(session: AsyncSession) -> int:
+    """Delete every snapshot recorded from a non-authoritative source.
+
+    The public-page fallback was withdrawn after it was verified wrong against
+    a real profile (677 following where Instagram showed 577). Its rows have to
+    go with it: the account card reads the newest snapshot, so leaving them
+    means the card keeps stating a wrong number as current, and every later
+    diff measures against it. Returns how many were removed.
+
+    Scans in Python rather than querying inside the JSON column, because the
+    predicate must behave identically on Postgres and SQLite.
+    """
+    stmt = select(AccountSnapshot).where(AccountSnapshot.raw_response.is_not(None))
+    rows = (await session.execute(stmt)).scalars().all()
+    doomed = [row.id for row in rows if snapshot_source(row) is not None]
+    if doomed:
+        await session.execute(
+            delete(AccountSnapshot).where(AccountSnapshot.id.in_(doomed))
+        )
+    return len(doomed)
+
+
 async def get_latest_snapshot_by_source(
     session: AsyncSession,
     account_id: int,

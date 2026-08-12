@@ -42,7 +42,7 @@ Track any Instagram account — **public or private** — followers, bio, profil
 
 | | |
 |---|---|
-| 🚪 **A second door when Instagram's API shuts** | When `web_profile_info` answers 401, the bot falls back to the public profile page and reads follower/following/post counts, name and avatar from its Open Graph block — live, login-free, and fetched directly so it carries a real Chrome TLS fingerprint. Partial by nature and handled as such: fields it can't see stay untouched rather than being written as blank, so a fallback check can never fire a phantom "bio removed". |
+| 🚫 **Wrong numbers are never shown** | A public-page fallback was tried as a second source for counts and **withdrawn after verification**: against a real profile it reported 677 following where Instagram showed 577. Followers and posts matched, so the numbers aren't uniformly stale — they simply can't be trusted, and nothing distinguishes a good one at read time. The API is the only source of record for profile fields; when it's blocked the bot reports a failure instead of a number it can't stand behind. |
 | 🔬 **`/probe <user>`** | Tests every source against one account and reports which answer — the API, the public page (with HTTP status and byte count), and the media downloader. Turns "everything is 401ing" into a specific, actionable answer in a few seconds, and logs the same at INFO. |
 | 🔕 **One story, one message** | A single story used to produce a status line in *every* sweep it survived, plus a "just posted a story!" alert, plus the media itself. Now the status is announced only when it changes, and never on top of the media that already announced it. `STORY_STATUS_HEARTBEAT=true` restores the old behavior. |
 | 🚦 **A guard that tells a throttle from an outage** | If some accounts answer, blocks mean a throttle: widen the gap, pause, carry on. If **nothing** answers, the gate is shut — the sweep stops immediately rather than spending hundreds of blocked requests proving it, and the summary says so instead of naming every account as a separate failure. |
@@ -73,13 +73,12 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 ```
  Telegram chat ──► commands & inline menus ──► FastAPI + APScheduler
                                                       │  sweep
-                     ┌────────────────────────────────┼────────────────────────────┐
-                     ▼                                ▼                            ▼
-        Instagram API (web + graphql)     Public profile page          Anonymous media downloader
-    via Cloudflare Worker edge proxy      direct · Chrome TLS          stories · highlights · posts
-    90s cache · full profile fields       og: counts, name, avatar     reels · full-res avatars
-    story/live status · highlights        (fallback when the API 401s)
-                     └────────────────────────────────┼────────────────────────────┘
+                                 ┌────────────────────┴────────────────────┐
+                                 ▼                                         ▼
+                  Instagram API (web + graphql)              Anonymous media downloader
+              via Cloudflare Worker edge proxy · 90s cache   stories · highlights · posts
+           (profile fields, story/live status, highlights)   reels · full-res avatars
+                                 └────────────────────┬────────────────────┘
                                                       ▼
                                                  PostgreSQL
                                     snapshots · diffs · media hashes · dedup
@@ -89,13 +88,14 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
                                        formatted alert + photos/videos
 ```
 
-**Three independent doors mean one being blocked never takes the bot down.**
+**Two independent doors, with different jobs.**
 
-1. **The API**, routed through a free Cloudflare Worker on edge IPs — full profile fields, story/live status, and the highlight catalog. This is the authoritative source and the one Instagram gates hardest.
-2. **The public profile page**, tried automatically when the API answers 401. Its Open Graph block carries the follower/following/post counts, display name and avatar — the fields the bot actually alerts on. It is fetched *directly*, so it carries `curl_cffi`'s real Chrome TLS fingerprint (a Worker hop cannot: its runtime fingerprint would contradict a Chrome User-Agent), and it sends no `x-ig-app-id`, so it reads as a page view rather than a private-API call. Live data, never a cache — it reports only the fields it can actually see.
-3. **A login-free media downloader** for story/post/reel media and full-resolution avatars, on infrastructure that cloud-IP blocks don't touch.
+1. **The API**, routed through a free Cloudflare Worker on edge IPs — full profile fields, story/live status, and the highlight catalog. It is the **only** source of record for profile data. When it's blocked the bot says so; it does not substitute a number from somewhere else.
+2. **A login-free media downloader** for story/post/reel media and full-resolution avatars, on infrastructure that cloud-IP blocks don't touch. This is why media keeps arriving during an API outage.
 
-`/probe <username>` tests all three and tells you which are answering right now.
+> A third door — Instagram's public profile page, parsed from its Open Graph block — was built and then **withdrawn**. Verified against a real profile it reported 677 following where Instagram showed 577, while followers and posts matched exactly. Nothing distinguishes a good number from a bad one at read time, so it can't back a change alert. The parser survives for `/probe`, where the page is reported as *reachability*, never stored as fact. See [the write-up](docs/2026-08-11-gate-blocks-and-the-second-door.md).
+
+`/probe <username>` tests every source and tells you which are answering right now.
 
 ---
 
@@ -139,7 +139,7 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 - Chrome TLS fingerprint impersonation (`curl_cffi`) to clear 401/403 walls on the direct path
 - 90-second reel-data cache — sweeps and card opens never re-ask Instagram for the same data
 - Fast-fail circuit breaker on blocked endpoints instead of retry storms
-- **Three independent doors to Instagram** — the API through the edge proxy, the public profile page as a fallback, and a login-free media downloader. When the API gate shuts, follower/following/post counts still arrive from the page, and stories/posts keep flowing from the downloader
+- **Two independent doors to Instagram** — the API through the edge proxy for profile data, and a login-free media downloader for stories/posts/reels. When the API gate shuts, media keeps flowing; profile fields report an honest failure rather than a number from a source that can't be trusted
 - Sweeps check one account at a time — the same request rhythm as a manual recheck, since bursts are what trip Instagram's anonymous rate limiter
 - Rate-limit guard that tells a throttle from an outage: if some accounts are answering, it widens the gap and pauses until the window clears; if **nothing** is answering it stops the sweep outright, because no pace helps a shut gate and every extra request keeps it shut
 - Blocked-request amplification is budgeted per path — one proxied call is already 8 upstream attempts, so a sweep asks once (14 accounts multiply everything), while an on-demand check retries across Cloudflare colos, which the gate answers differently

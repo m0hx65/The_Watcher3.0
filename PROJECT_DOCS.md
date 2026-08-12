@@ -280,21 +280,36 @@ x-ig-app-id: 936619743392459
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
 
-**Public-page fallback:** When the API path ends in 401/403, the client tries
-`instagram.com/<username>/` and parses the Open Graph block
-(`app/monitor/public_page.py`) for follower/following/post counts, display name
-and avatar. Deliberately **not** routed through the Worker: sent directly it
-carries `curl_cffi`'s real Chrome TLS fingerprint, whereas a Worker `fetch()`
-would carry Cloudflare's runtime fingerprint under a Chrome User-Agent — a
-contradiction that is itself a bot signal. It also sends no `x-ig-app-id`, so
-it reads as a page view rather than a private-API call.
+**Public-page fallback — built, then WITHDRAWN (2026-08-12).** When the API
+ended in 401/403 the client used to try `instagram.com/<username>/` and parse
+the Open Graph block (`app/monitor/public_page.py`) for counts, display name and
+avatar. It was removed from the data path after verification against a real
+profile: the page reported **677 following where Instagram showed 577**, with
+followers and posts matching exactly. So the counts are not uniformly stale —
+they are simply untrustworthy, and nothing distinguishes a good one from a bad
+one at read time. Serving them put a wrong number on the account card as
+current, which the standing rule forbids: an honest failure beats wrong data.
 
-The result is marked `source="public_page"` and `partial=True`. It reports only
-what it saw: the bio, privacy and verification flags are **absent, not blank**.
-(`og:description` does contain a bio, but a truncated one — storing that would
-fire a bio-change alert on every sweep against the API's full text.) Callers
-carry unseen fields forward from the previous snapshot rather than writing
-`None`, and the change detector treats `None` as "unknown", never as "".
+A blocked fetch now returns the failure. `probe_public_page()` and the parser
+remain for `/probe`, which reports the page as *reachability* and labels the
+counts as unused.
+
+Two mechanisms built for it are still in force, because they guard anything
+partial that might arrive later:
+
+- **Source-scoped diffing** (`crud.get_latest_snapshot_by_source`). The API and
+  the page disagreed about the same account at the same moment, so alternating
+  between them "detected" a change on every flip. Each source is diffed against
+  its own history; carry-forward still uses the newest snapshot from any source,
+  because "what we last knew" and "what is safe to diff" are different questions.
+- **Bidi normalization** (`public_page.strip_bidi`). Instagram's `og:title`
+  wraps RTL display names in invisible direction marks and its API does not, so
+  an Arabic name reported as `لِ → ‎لِ‎` — two visibly identical strings. Marks
+  are stripped at parse time and ignored in text comparison.
+
+`crud.purge_partial_snapshots()` runs once at startup and deletes the rows the
+withdrawn source already wrote, because the account card reads the newest
+snapshot and would otherwise keep stating a wrong number as current.
 
 Parsing is bounded — capped at `</head>`, matched one tag at a time, and run
 off the event loop. An earlier version used a lazy `(.*?)` under `re.DOTALL`

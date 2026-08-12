@@ -2478,9 +2478,7 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # One attempt per source, and no internal fallback — each door is measured
     # on its own, and the whole probe stays under a few seconds per source.
-    api = await service.instagram.fetch_profile(
-        username, auth_attempts=1, allow_fallback=False
-    )
+    api = await service.instagram.fetch_profile(username, auth_attempts=1)
     if api.success:
         followers = (api.parsed or {}).get("followers_count")
         lines.append(
@@ -2498,10 +2496,12 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     got = page.get("parsed")
     if got:
         lines.append(
-            f"✅ <b>Public page</b> — followers: "
+            f"ℹ️ <b>Public page</b> — followers: "
             f"<b>{fmt_number(got.get('followers_count') or 0)}</b>, "
             f"following: <b>{fmt_number(got.get('following_count') or 0)}</b>, "
-            f"posts: <b>{fmt_number(got.get('posts_count') or 0)}</b>"
+            f"posts: <b>{fmt_number(got.get('posts_count') or 0)}</b>\n"
+            "<i>reachability only — these counts are NOT used, they were "
+            "verified wrong against a real profile</i>"
         )
     else:
         lines.append(
@@ -2523,8 +2523,8 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     lines.append("")
-    if api.success or got:
-        lines.append("<i>A profile source works — stats can flow.</i>")
+    if api.success:
+        lines.append("<i>The API answers — profile stats are live.</i>")
     elif service.stories is not None and any("✅ <b>saveinsta" in ln for ln in lines):
         lines.append(
             "<i>Profile stats are blocked, but media still works — stories and "

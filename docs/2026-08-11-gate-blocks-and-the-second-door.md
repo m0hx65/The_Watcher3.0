@@ -82,7 +82,13 @@ block it" shaped the original proxy design.
 
 ---
 
-## 4. The second door
+## 4. The second door — built, then withdrawn (2026-08-12)
+
+> **Outcome first:** this source was removed from the data path a day after it
+> shipped. Verified against a real profile, the page reported **677 following
+> where Instagram showed 577**, while followers (118) and posts (0) matched
+> exactly. Read the rest as the reasoning that led there, and section 4b for
+> why it did not survive contact with ground truth.
 
 Instagram's plain profile page is a different endpoint with different gating.
 Its Open Graph block carries follower/following/post counts, display name and
@@ -113,6 +119,34 @@ flags. Three rules keep that from becoming false alerts:
    reports.
 
 ---
+
+## 4b. Why it was withdrawn
+
+Two symptoms appeared in the first full day, and one screenshot ended it.
+
+**Phantom changes.** Accounts flip-flopped — `@8dvuu` went 103 → 124 → 103 →
+124 across sweeps — because the API and the page disagreed and the sweep
+alternated between them. Each flip "detected" a change. The giveaway was
+`Full name changed لِ → ‎لِ‎`: two visibly identical strings differing only by
+the bidi marks Instagram's `og:title` adds to RTL names.
+
+**A private account got a story check.** `bool(parsed.get("is_private"))` turned
+the page's *absent* privacy flag into `False`, so a private target was reported
+public, entered the story phase, and got a "⭕ NO STORY" line for stories the
+bot cannot and must not see. `bool(None)` is `False`, and "I could not see it"
+is not "it is false".
+
+Source-scoped diffing fixed the flip-flop, and the privacy flag now falls back
+to the last known value. But then the owner checked a profile by hand:
+Instagram said **577 following**, the bot's card said **677**. Followers and
+posts matched. That is the fact that settled it — the page's numbers are not
+reliably anything, and no amount of careful diffing makes an untrustworthy
+number safe to show.
+
+**Lesson:** "live, from a different endpoint" is not the same as "correct". A
+second source needs its values verified against ground truth before it is
+allowed to back an alert — being fresh and being right are independent
+properties, and only one of them was ever checked.
 
 ## 5. The incident: a regex that took the service down
 

@@ -224,10 +224,56 @@ class _MockSession:
         pass
 
 
-async def test_fallback_runs_only_after_a_block() -> None:
+async def test_purge_removes_partial_snapshots() -> None:
+    """The rows the withdrawn source already wrote have to go: the card reads
+    the newest snapshot, so leaving one means it keeps stating a wrong number
+    as current."""
+    from app.database.models import AccountSnapshot, Base
+    from app.database.session import engine, get_session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with get_session() as session:
+        account = MonitoredAccount(username="purgeme", active=True)
+        session.add(account)
+        await session.flush()
+        account_id = account.id
+        session.add(AccountSnapshot(
+            account_id=account_id, username="purgeme", http_status=200,
+            following_count=577, raw_response={"data": {"user": {"id": "9"}}},
+        ))
+        await session.flush()
+        session.add(AccountSnapshot(
+            account_id=account_id, username="purgeme", http_status=200,
+            following_count=677, raw_response={"source": "public_page"},
+        ))
+
+    async with get_session() as session:
+        removed = await crud.purge_partial_snapshots(session)
+    async with get_session() as session:
+        latest = await crud.get_latest_snapshot(session, account_id)
+
+    # Earlier tests in this file also wrote partial rows, so the count covers
+    # every one of them — the contract is "none survive", not "exactly one".
+    expect("partial rows are removed", removed >= 1, repr(removed))
+    expect("the authoritative row survives",
+           latest is not None and latest.following_count == 577,
+           repr(latest and latest.following_count))
+
+    async with get_session() as session:
+        again = await crud.purge_partial_snapshots(session)
+    expect("a second run is a no-op", again == 0, repr(again))
+    await engine.dispose()
+
+
+async def test_a_blocked_api_fails_and_never_uses_the_page() -> None:
+    """The page was withdrawn as a data source: verified against a real profile
+    it reported 677 following where Instagram showed 577. A wrong number
+    presented as current is worse than an honest failure, so a blocked fetch
+    must fail — even though the page would have answered."""
     def handler(url: str, params: dict, headers: dict) -> _MockResponse:
         if "instagram.com/rein__saad/" in url:
-            return _MockResponse(200, text=PAGE_CLASSIC)
+            return _MockResponse(200, text=PAGE_CLASSIC)  # would have answered
         return _MockResponse(401, {})
 
     session = _MockSession(handler)
@@ -239,13 +285,11 @@ async def test_fallback_runs_only_after_a_block() -> None:
     finally:
         settings.ig_proxy_url = old
 
-    expect("a blocked API falls back to the public page", result.success,
-           repr(result.error))
-    expect("the result is marked partial", result.partial, result.source)
-    expect("the counts came through",
-           (result.parsed or {}).get("followers_count") == 1234, repr(result.parsed))
-    expect("the page was fetched directly, not through the worker",
-           any("instagram.com/rein__saad/" in u for u in session.urls),
+    expect("a blocked API reports the block", not result.success)
+    expect("the 401 is preserved", result.http_status == 401, repr(result.http_status))
+    expect("no page data is substituted", result.parsed is None, repr(result.parsed))
+    expect("the page is not even fetched",
+           not any("instagram.com/rein__saad/" in u for u in session.urls),
            repr(session.urls))
 
 
@@ -427,7 +471,8 @@ async def main() -> int:
     test_bidi_marks_never_alert()
     await test_sources_are_diffed_separately()
     await test_partial_reading_keeps_a_private_account_private()
-    await test_fallback_runs_only_after_a_block()
+    await test_a_blocked_api_fails_and_never_uses_the_page()
+    await test_purge_removes_partial_snapshots()
     await test_no_fallback_when_the_api_answers()
     await test_blocked_page_keeps_the_original_error()
 

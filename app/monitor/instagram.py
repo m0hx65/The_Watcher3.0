@@ -480,7 +480,6 @@ class InstagramClient:
         username: str,
         *,
         auth_attempts: Optional[int] = None,
-        allow_fallback: bool = True,
     ) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff.
 
@@ -492,8 +491,8 @@ class InstagramClient:
         someone waiting on it should try every colo it can. Ignored on the
         direct path, which has its own full retry budget.
 
-        `allow_fallback=False` asks the API door only — used by /probe, which
-        tests each source separately and would otherwise measure them combined.
+        A blocked fetch returns the failure. It does NOT fall through to the
+        public profile page — see the note at the end of this method.
         """
         username = username.strip().lstrip("@")
         headers = _build_headers()
@@ -623,15 +622,20 @@ class InstagramClient:
                 )
                 await asyncio.sleep(min(15.0, (2 ** attempt) + jitter))
 
-        # The API door is shut. Before reporting a failure, try the other one:
-        # the public profile page is a different endpoint with different gating,
-        # and it costs a single direct request (not another 8-attempt worker
-        # call). It answers with fewer fields, never with stale ones.
-        if allow_fallback and last_status in (401, 403):
-            fallback = await self.fetch_profile_via_public_page(username)
-            if fallback is not None:
-                return fallback
-
+        # NO public-page fallback here — deliberately.
+        #
+        # It shipped as a second door and had to be withdrawn: verified against
+        # the real profile on 2026-08-12, the page reported 677 following for an
+        # account Instagram itself showed as 577. Followers and posts matched,
+        # so the numbers are not uniformly stale — they are simply not
+        # trustworthy, and there is no way to tell a good one from a bad one at
+        # read time. Serving them meant the account card stated a wrong number
+        # as current, which the owner's standing rule forbids outright: an
+        # honest failure beats wrong data.
+        #
+        # The parser and `probe_public_page` remain for /probe, where the page
+        # is reported as diagnostics rather than stored as fact.
+        #
         # Record the terminal outcome once per fetch (retries within a single
         # fetch are one logical attempt against the endpoint).
         fetch_health.record_status(IG_PROFILE, last_status)
@@ -639,39 +643,6 @@ class InstagramClient:
             username=username,
             http_status=last_status,
             error=last_error or f"failed after {self.max_retries} attempts",
-        )
-
-    async def fetch_profile_via_public_page(
-        self, username: str
-    ) -> Optional[ProfileFetchResult]:
-        """Profile counts from the public page's Open Graph block, or None.
-
-        Deliberately NOT routed through the Worker: sent directly, this request
-        carries curl_cffi's real Chrome TLS fingerprint, while a Worker hop
-        would carry Cloudflare's runtime fingerprint under a Chrome
-        User-Agent — the mismatch being one of the things the gate reads. It
-        also sends no `x-ig-app-id`, so it looks like a page view rather than a
-        private-API call.
-
-        Returns None when the page is blocked or carries no counts, leaving the
-        caller's original error intact. Never returns zeros for missing data.
-        """
-        outcome = await self.probe_public_page(username)
-        parsed = outcome.get("parsed")
-        if parsed is None:
-            return None
-
-        fetch_health.record_status(IG_PROFILE, 200)
-        logger.info(
-            "@{} answered on the public page after the API blocked us — "
-            "partial data ({} of {} fields)",
-            username, len(parsed), len(PARTIAL_FIELDS),
-        )
-        return ProfileFetchResult(
-            username=username,
-            http_status=200,
-            parsed=parsed,
-            source="public_page",
         )
 
     async def probe_public_page(self, username: str) -> dict[str, Any]:
