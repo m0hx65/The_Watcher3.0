@@ -134,8 +134,26 @@ def detect_changes(
     current: AccountSnapshot,
     *,
     new_pic_hash: Optional[str] = None,
+    observed_fields: Optional[set[str]] = None,
 ) -> ChangeSet:
-    """Build a structured changeset between two snapshots."""
+    """Build a structured changeset between two snapshots.
+
+    `observed_fields` restricts which fields may raise an alert. A partial
+    reading (the public page) stores carried-forward values for the fields it
+    could not see, so that the card still shows what we last knew — but those
+    values arrived from the OTHER source, and diffing them here re-reports a
+    change the API already alerted on:
+
+        API  100 → 101 posts   → alert (correct)
+        page snapshot inherits 101, becomes the page baseline
+        API  101 → 102 posts   → alert (correct)
+        page snapshot inherits 102, diffs against the page baseline's 101
+                               → alert AGAIN for the same change
+
+    Carrying a value forward is a statement about storage, not an observation.
+    Only what this reading actually saw can be a change; everything else is
+    unknown and stays silent.
+    """
     changeset = ChangeSet(username=current.username)
 
     if previous is None:
@@ -144,6 +162,8 @@ def detect_changes(
         return changeset
 
     for field_name, label in FIELD_LABELS.items():
+        if observed_fields is not None and field_name not in observed_fields:
+            continue
         old_val = getattr(previous, field_name, None)
         new_val = getattr(current, field_name, None)
         if _is_meaningful_change(field_name, old_val, new_val):

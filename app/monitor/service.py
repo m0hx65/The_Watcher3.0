@@ -1483,7 +1483,15 @@ class MonitorService:
             # baseline is this source's own history, so the first reading from
             # a new door establishes a baseline silently instead of reporting
             # every field it disagrees with as a change.
-            changeset = detect_changes(previous, snapshot, new_pic_hash=new_pic_hash)
+            # A partial reading may only alert on what it actually observed —
+            # the carried-forward fields above came from the other door and
+            # would otherwise re-report a change the API already announced.
+            changeset = detect_changes(
+                previous,
+                snapshot,
+                new_pic_hash=new_pic_hash,
+                observed_fields=set(parsed) if fetch.partial else None,
+            )
             if previous is None or changeset.has_changes:
                 await crud.insert_snapshot(session, snapshot)
                 # Keep only the latest 200 snapshots per account

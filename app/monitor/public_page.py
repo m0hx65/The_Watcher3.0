@@ -11,6 +11,14 @@ below — but the payload the page itself renders from, inlined in a script tag:
 Same shape the API returns, same numbers the app shows, and it includes the
 privacy flag — so a private account is never mistaken for a public one.
 
+What it does NOT carry, on any capture measured so far: `all_media_count` is
+null for public and private accounts alike, so the post count never comes from
+here. Nor do reels_count, story_count or is_business exist in the payload. The
+avatar it gives is the 150×150 variant — SMALLER than the API's
+profile_pic_url_hd (~320px), and it cannot be upsized: the CDN signature covers
+the size transform, so editing `stp=` earns a 403 "URL signature mismatch"
+(measured 2026-08-12).
+
 ## Why not the og: tags (this parser's first version, withdrawn 2026-08-12)
 
 Because they are a stale cache, and a page can carry both at once. Verified on
@@ -124,7 +132,13 @@ def _text(value: Any) -> Optional[str]:
 
 
 def _count(value: Any) -> Optional[int]:
-    """Counts only. `null` means Instagram didn't say — never read as zero."""
+    """Counts only. `null` means Instagram didn't say — never read as zero.
+
+    `all_media_count` is null on EVERY logged-out page view measured so far —
+    private (@65xim) and public (@b_rand_s, 1,006 posts by its own og: tag)
+    alike. So the post count is simply not available from this door; a `0` here
+    would read as "they deleted every post" on an account that has a thousand.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return int(value)

@@ -126,6 +126,46 @@ def test_unknown_text_field_is_not_a_change() -> None:
            _is_meaningful_change("biography", "old", "new"))
 
 
+def test_a_carried_forward_field_never_alerts() -> None:
+    """The page cannot see the post count (all_media_count is null for public
+    and private accounts alike), so a page snapshot stores the last known one.
+    That value came from the API, which already alerted on it — diffing it on
+    the page's own timeline reports the same change a second time."""
+    from app.database.models import AccountSnapshot
+    from app.monitor.change_detector import detect_changes
+
+    # Previous page reading: inherited posts=101 from the API at the time.
+    previous = AccountSnapshot(
+        username="dup", http_status=200, followers_count=10, posts_count=101,
+    )
+    # This page reading saw followers only; posts=102 was inherited from a
+    # later API check that ALREADY announced 101 -> 102.
+    current = AccountSnapshot(
+        username="dup", http_status=200, followers_count=10, posts_count=102,
+    )
+    observed = {"username", "followers_count", "following_count", "is_private"}
+
+    naive = detect_changes(previous, current)
+    expect("without the guard the carried value looks like a change",
+           naive.find("posts_count") is not None)
+
+    guarded = detect_changes(previous, current, observed_fields=observed)
+    expect("an unobserved field never alerts",
+           guarded.find("posts_count") is None,
+           repr([c.field for c in guarded.changes]))
+    expect("and nothing else is invented", not guarded.has_changes,
+           repr([c.field for c in guarded.changes]))
+
+    # What the page DID see still reports normally.
+    moved = AccountSnapshot(
+        username="dup", http_status=200, followers_count=12, posts_count=102,
+    )
+    real = detect_changes(previous, moved, observed_fields=observed)
+    expect("an observed field still alerts",
+           real.find("followers_count") is not None,
+           repr([c.field for c in real.changes]))
+
+
 class _MockResponse:
     def __init__(self, status_code: int, body: Any = None, text: str = "") -> None:
         self.status_code = status_code
@@ -442,6 +482,7 @@ async def test_partial_reading_keeps_a_private_account_private() -> None:
 async def main() -> int:
     test_the_fixture_is_a_valid_page()
     test_unknown_text_field_is_not_a_change()
+    test_a_carried_forward_field_never_alerts()
     test_bidi_marks_never_alert()
     await test_sources_are_diffed_separately()
     await test_partial_reading_keeps_a_private_account_private()

@@ -92,6 +92,19 @@ def _strip_cdn_size(url: str) -> Optional[str]:
     Removing the constraint asks the CDN for the original stored image rather
     than a downscaled thumbnail.  The technique is the same one used by
     InstaRaider (github.com/akurtovic/InstaRaider).
+
+    MEASURED 2026-08-12: it no longer works on a signed URL. Instagram's `oh`
+    signature covers the `stp` transform, so the stripped variant comes back
+    `403 text/plain "URL signature mismatch"` — confirmed twice on one avatar
+    (strip s150x150 -> 403; reuse the s150 signature on the s100 transform ->
+    403; each variant fetched with ITS OWN signature -> 200). Every size of an
+    avatar is separately signed, so there is no URL-editing path to a larger
+    image; the anonymous ceiling stays profile_pic_url_hd (~320px), or the
+    media downloader's full-resolution avatar.
+
+    The attempt is kept because hash_url falls back correctly (403 -> None ->
+    retry the original), and an unsigned/legacy URL would still benefit — but
+    on today's URLs it costs one guaranteed-403 round trip per download.
     """
     if "fbcdn.net" not in url and "cdninstagram.com" not in url:
         return None

@@ -56,6 +56,18 @@ REAL_PAGE = r"""<!DOCTYPE html><html><head>
 <script type="application/json" data-sjs>{"require":[["RelayPrefetchedStreamCache","next",[],["adp_PolarisLoggedOutDesktopWWWProfileRootContentQueryRelayPreloader_6a7c",{"__bbox":{"complete":true,"result":{"data":{"xig_user_by_username":{"pk":"7880052534","username":"65xim","profile_pic_url":"https:\/\/scontent-sea5-1.cdninstagram.com\/v\/t51.82787-19\/556145850.jpg?stp=dst-jpg&_nc_cat=105","is_private":true,"is_unpublished":false,"latest_reel_media":null,"biography":"فـلـس palestine\nCyber security engineer","full_name":"Mohamad","is_verified":false,"account_badges":[],"bio_links":[],"linked_fb_info":null,"is_memorialized":false,"pronouns":[],"follower_count":118,"following_count":577,"all_media_count":null,"id":"17841407816045006","lox_highlights_connection":{"edges":[],"page_info":{"end_cursor":null,"has_next_page":false}},"is_coppa_enforced":false,"has_any_clips":false}},"extensions":{"is_final":true}},"sequence_number":0}}]]]}</script>
 </body></html>"""
 
+# A second real capture (2026-08-12), this one a PUBLIC account with 1,006 posts.
+# It settles two questions the private capture could not:
+#   * og: is stale here too — "47 Following" against the payload's 44;
+#   * all_media_count is null for a PUBLIC account as well, so the post count is
+#     simply not available from this door.
+REAL_PAGE_PUBLIC = r"""<!DOCTYPE html><html><head>
+<meta property="og:title" content="Brands Brands (&#064;b_rand_s) &#x2022; Instagram photos and videos" />
+<meta property="og:description" content="11K Followers, 47 Following, 1,006 Posts - See Instagram photos and videos from Brands Brands (&#064;b_rand_s)" />
+</head><body>
+<script type="application/json" data-sjs>{"require":[["RelayPrefetchedStreamCache","next",[],["adp_PolarisLoggedOutDesktopWWWProfileRootContentQueryRelayPreloader_6a7c",{"__bbox":{"complete":true,"result":{"data":{"xig_user_by_username":{"pk":"54222996077","username":"b_rand_s","profile_pic_url":"https:\/\/scontent-sea5-1.cdninstagram.com\/v\/t51.75761-19\/504076967_17992596584804078_3391207303348888903_n.jpg?stp=dst-jpg_s150x150_tt6&_nc_cat=108&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLnd3dy42MjUuQzMifQ%3D%3D&oh=00_AQFVWV8n91K3M9I6duD-rpyw6s69LHNdXNcLy7l3rOmayA&oe=6A824646","is_private":false,"is_unpublished":false,"latest_reel_media":1786476076,"biography":"-online store\nWe ship happiness all over Syria","full_name":"Brands Brands","is_verified":false,"account_badges":[],"bio_links":[],"is_memorialized":false,"pronouns":[],"follower_count":10939,"following_count":44,"all_media_count":null,"id":"17841454122337874","is_coppa_enforced":false,"has_any_clips":true}},"extensions":{"is_final":true}},"sequence_number":0}}]]]}</script>
+</body></html>"""
+
 LOGIN_WALL = """<html><head>
 <meta property="og:title" content="Instagram" />
 <meta property="og:description" content="Create an account or log in to Instagram." />
@@ -98,6 +110,38 @@ def test_null_count_is_absent_never_zero() -> None:
     assert parsed
     expect("a null post count is absent, not 0", "posts_count" not in parsed,
            repr(parsed.get("posts_count")))
+
+
+def test_public_capture_uses_the_payload_too() -> None:
+    """The public account settles that og: staleness isn't a private-account
+    quirk, and that the post count is missing from this door for everyone."""
+    parsed = parse_public_profile(REAL_PAGE_PUBLIC, "b_rand_s")
+    expect("the public capture parses", parsed is not None)
+    assert parsed
+    expect("following is the payload's 44, NOT og:description's 47",
+           parsed.get("following_count") == 44, repr(parsed.get("following_count")))
+    expect("followers is the exact 10939, not og's rounded '11K'",
+           parsed.get("followers_count") == 10939, repr(parsed.get("followers_count")))
+    expect("a public account is reported public", parsed.get("is_private") is False)
+    expect("the numeric id is pk, not the app-scoped id",
+           parsed.get("instagram_id") == "54222996077", repr(parsed.get("instagram_id")))
+    # og: claims 1,006 posts; the payload says null. Absent beats a wrong 0 —
+    # and beats trusting the tag that is demonstrably stale on the same page.
+    expect("the post count is ABSENT even for a public account with 1,006 posts",
+           "posts_count" not in parsed, repr(parsed.get("posts_count")))
+
+
+def test_the_pages_avatar_is_the_small_variant() -> None:
+    """Pins what this door can and cannot do for profile pictures: it serves
+    the 150x150 variant, which is smaller than the API's profile_pic_url_hd
+    (~320px). Measured 2026-08-12: stripping the size out of the URL to get a
+    bigger one returns 403 'URL signature mismatch' — the signature covers the
+    transform, so there is no upgrade path here."""
+    parsed = parse_public_profile(REAL_PAGE_PUBLIC, "b_rand_s")
+    assert parsed
+    url = parsed.get("profile_pic_url") or ""
+    expect("the avatar URL is unescaped", url.startswith("https://scontent"), repr(url[:40]))
+    expect("and is the 150x150 variant", "s150x150" in url, repr(url))
 
 
 def test_login_wall_and_junk_yield_nothing() -> None:
@@ -145,6 +189,8 @@ def main() -> int:
     test_real_capture_uses_the_payload_not_the_meta_tag()
     test_privacy_flag_is_read_not_guessed()
     test_null_count_is_absent_never_zero()
+    test_public_capture_uses_the_payload_too()
+    test_the_pages_avatar_is_the_small_variant()
     test_login_wall_and_junk_yield_nothing()
     test_bidi_marks_are_stripped()
     test_large_page_is_bounded()
