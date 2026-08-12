@@ -33,14 +33,20 @@ if str(ROOT) not in sys.path:
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+DB_FILE = ROOT / "test_public_page.db"
+if DB_FILE.exists():
+    DB_FILE.unlink()
+os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}")
 
 from app.config import settings  # noqa: E402
+from app.database import crud  # noqa: E402
+from app.database.models import MonitoredAccount  # noqa: E402
 from app.monitor.change_detector import _is_meaningful_change  # noqa: E402
 from app.monitor.instagram import InstagramClient  # noqa: E402
 from app.monitor.public_page import (  # noqa: E402
     _to_int,
     parse_public_profile,
+    strip_bidi,
 )
 
 FAILURES: list[str] = []
@@ -278,6 +284,138 @@ async def test_blocked_page_keeps_the_original_error() -> None:
     expect("no invented data", result.parsed is None, repr(result.parsed))
 
 
+def test_bidi_marks_never_alert() -> None:
+    """Instagram's og:title wraps RTL names in invisible direction marks; the
+    API doesn't. Alternating between the sources reported "Full name changed
+    لِ → ‎لِ‎" — two visibly identical strings."""
+    plain = "لِ"
+    wrapped = "‎لِ‎"
+    expect("the marks are stripped at parse time", strip_bidi(wrapped) == plain,
+           repr(strip_bidi(wrapped)))
+    expect("and a marks-only difference is not a change",
+           not _is_meaningful_change("full_name", plain, wrapped))
+    expect("a real rename still reports",
+           _is_meaningful_change("full_name", plain, "رالا"))
+
+    page = PAGE_CLASSIC.replace(
+        "Reina Saad (@rein__saad)", f"‎{plain}‎ (@rein__saad)"
+    )
+    parsed = parse_public_profile(page, "rein__saad")
+    assert parsed
+    expect("the parsed name carries no marks", parsed.get("full_name") == plain,
+           repr(parsed.get("full_name")))
+
+
+async def test_sources_are_diffed_separately() -> None:
+    """The API and the public page disagree about the same account at the same
+    moment. Diffing one against the other reported a change on every flip — in
+    both directions, forever."""
+    from app.database.models import AccountSnapshot, Base
+    from app.database.session import engine, get_session
+    from app.database import crud
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with get_session() as session:
+        account = MonitoredAccount(username="flipflop", active=True)
+        session.add(account)
+        await session.flush()
+        account_id = account.id
+        # An API reading, then a page reading that disagrees, then API again.
+        session.add(AccountSnapshot(
+            account_id=account_id, username="flipflop", http_status=200,
+            following_count=103, raw_response={"data": {"user": {"id": "1"}}},
+        ))
+        await session.flush()
+        session.add(AccountSnapshot(
+            account_id=account_id, username="flipflop", http_status=200,
+            following_count=124, raw_response={"source": "public_page"},
+        ))
+        await session.flush()
+
+    async with get_session() as session:
+        api_prev = await crud.get_latest_snapshot_by_source(
+            session, account_id, source=None
+        )
+        page_prev = await crud.get_latest_snapshot_by_source(
+            session, account_id, source="public_page"
+        )
+        newest = await crud.get_latest_snapshot(session, account_id)
+
+    expect("the API baseline is the API row",
+           api_prev is not None and api_prev.following_count == 103,
+           repr(api_prev and api_prev.following_count))
+    expect("the page baseline is the page row",
+           page_prev is not None and page_prev.following_count == 124,
+           repr(page_prev and page_prev.following_count))
+    expect("last-known is still the newest of either",
+           newest is not None and newest.following_count == 124)
+    expect("a page row is identified as partial",
+           crud.snapshot_source(page_prev) == "public_page")
+    expect("an API row is identified as authoritative",
+           crud.snapshot_source(api_prev) is None)
+
+    await engine.dispose()
+
+
+async def test_partial_reading_keeps_a_private_account_private() -> None:
+    """`bool(None)` called a private account public, so private targets entered
+    the story phase and got a "⭕ NO STORY" line — for an account whose stories
+    the bot cannot and must not see."""
+    from unittest.mock import AsyncMock
+
+    from app.database.models import AccountSnapshot, Base
+    from app.database.session import engine, get_session
+    from app.monitor.instagram import ProfileFetchResult
+    from app.monitor.service import MonitorService
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with get_session() as session:
+        account = MonitoredAccount(
+            username="privateuser", active=True, instagram_id="555"
+        )
+        session.add(account)
+        await session.flush()
+        account_id = account.id
+        session.add(AccountSnapshot(
+            account_id=account_id, username="privateuser", http_status=200,
+            is_private=True, followers_count=10, biography="hi",
+            raw_response={"data": {"user": {"id": "555"}}},
+        ))
+
+    service = MonitorService(
+        instagram=AsyncMock(), hasher=AsyncMock(),
+        notifier=AsyncMock(), stories=AsyncMock(),
+    )
+    service.notifier.send_text = AsyncMock(return_value=True)
+    service.hasher.hash_url = AsyncMock(return_value=None)
+
+    # A partial public-page reading carries no privacy flag at all.
+    fetch = ProfileFetchResult(
+        "privateuser", 200,
+        parsed={"username": "privateuser", "followers_count": 11,
+                "following_count": 5, "posts_count": 2},
+        source="public_page",
+    )
+    result = await service._handle_success(account_id, "privateuser", fetch, False)
+
+    expect("a partial reading does not call a private account public",
+           result["is_private"] is True, repr(result["is_private"]))
+    # The page cannot see the bio; the previous one must survive the write and
+    # must not be reported as a change.
+    async with get_session() as session:
+        latest = await crud.get_latest_snapshot(session, account_id)
+    expect("the unseen bio is carried forward, not blanked",
+           latest is not None and latest.biography == "hi",
+           repr(latest and latest.biography))
+    expect("the fresh count from the page IS stored",
+           latest is not None and latest.followers_count == 11,
+           repr(latest and latest.followers_count))
+    await engine.dispose()
+
+
 async def main() -> int:
     test_classic_page_parses()
     test_modern_page_parses()
@@ -286,6 +424,9 @@ async def main() -> int:
     test_login_wall_yields_nothing()
     test_count_parsing()
     test_unknown_text_field_is_not_a_change()
+    test_bidi_marks_never_alert()
+    await test_sources_are_diffed_separately()
+    await test_partial_reading_keeps_a_private_account_private()
     await test_fallback_runs_only_after_a_block()
     await test_no_fallback_when_the_api_answers()
     await test_blocked_page_keeps_the_original_error()

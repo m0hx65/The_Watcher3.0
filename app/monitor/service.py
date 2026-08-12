@@ -1405,7 +1405,15 @@ class MonitorService:
             slim_raw["source"] = fetch.source
 
         async with get_session() as session:
-            previous = await crud.get_latest_snapshot(session, account_id)
+            # Two different reads: the newest snapshot from ANY door (what the
+            # account was last known to look like — the right thing to carry
+            # forward) and the newest from THIS door (the only thing safe to
+            # diff against, since the API and the public page disagree about
+            # the same account at the same moment).
+            last_known = await crud.get_latest_snapshot(session, account_id)
+            previous = await crud.get_latest_snapshot_by_source(
+                session, account_id, source=fetch.source if fetch.partial else None
+            )
 
             # If this fetch produced no usable fingerprint (download failed,
             # non-image payload, or the confirmation pass suppressed a
@@ -1416,14 +1424,14 @@ class MonitorService:
             # a verified fingerprint would swallow a new upload's asset id and
             # permanently hide the change from the URL-identity signal.
             stored_pic_hash = new_pic_hash or (
-                previous.profile_pic_hash if previous else None
+                last_known.profile_pic_hash if last_known else None
             )
             # `pic_unchanged` means this URL carries the SAME asset id as the
             # stored one, so absorbing its fresh signature can't hide an upload.
             stored_pic_url = (
                 web_pic_url
-                if new_pic_hash or pic_unchanged or previous is None
-                else previous.profile_pic_url
+                if new_pic_hash or pic_unchanged or last_known is None
+                else last_known.profile_pic_url
             )
 
             # The public-page fallback sees the counts and the name; it does not
@@ -1439,7 +1447,9 @@ class MonitorService:
             def observed(field: str):
                 if not fetch.partial or field in parsed:
                     return parsed.get(field)
-                return getattr(previous, field, None) if previous else None
+                # Carry forward from the LAST KNOWN value whatever door saw it
+                # last — this is "what we last knew", not "what to diff".
+                return getattr(last_known, field, None) if last_known else None
 
             snapshot = AccountSnapshot(
                 account_id=account_id,
@@ -1460,8 +1470,15 @@ class MonitorService:
                 http_status=200,
                 raw_response=slim_raw or None,
             )
+            # What this account IS, as best we know — this reading's flag, or
+            # the last known one carried into it by `observed`. Used for every
+            # public-only decision below (story phase, post delivery).
+            effective_private = bool(snapshot.is_private)
 
-            # Diff first, persist only when something actually changed.
+            # Diff first, persist only when something actually changed. The
+            # baseline is this source's own history, so the first reading from
+            # a new door establishes a baseline silently instead of reporting
+            # every field it disagrees with as a change.
             changeset = detect_changes(previous, snapshot, new_pic_hash=new_pic_hash)
             if previous is None or changeset.has_changes:
                 await crud.insert_snapshot(session, snapshot)
@@ -1543,9 +1560,9 @@ class MonitorService:
         # New post/reel auto-download for public accounts (login-free via
         # saveinsta). On the first observation we just baseline what's already
         # there; afterwards a rise in the post/reel count delivers the new media.
-        if self.stories is not None and not parsed.get("is_private"):
+        if self.stories is not None and not effective_private:
             await self._handle_new_posts(
-                account_id, username, changeset, first_seen=previous is None
+                account_id, username, changeset, first_seen=last_known is None
             )
 
         return {
@@ -1554,8 +1571,14 @@ class MonitorService:
             "status": 200,
             "changed": changeset.has_changes,
             "change_count": len(changeset.changes) + (1 if changeset.profile_pic_changed else 0),
-            "first_seen": previous is None,
-            "is_private": bool(parsed.get("is_private")),
+            "first_seen": last_known is None,
+            # The PARTIAL public-page reading cannot see the privacy flag, and
+            # `bool(None)` would call a private account public — which is how
+            # private targets ended up in the story phase getting a "NO STORY"
+            # line. Report what the snapshot actually holds (this reading, or
+            # the last known value carried into it), so a missing flag falls
+            # back to what we knew rather than to False.
+            "is_private": bool(effective_private),
             "went_public": self._went_public(changeset),
             "instagram_id": stored_id or parsed.get("instagram_id"),
             # This check's live reel query (None when it didn't answer). The

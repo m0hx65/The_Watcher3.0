@@ -100,6 +100,25 @@ PARTIAL_FIELDS = (
 )
 
 
+# Bidi/formatting controls. Instagram's og:title wraps RTL display names in
+# direction marks (LRM/RLM/isolates) so the preview renders correctly; the API
+# returns the same name without them. Left in, an Arabic name alternating
+# between the two sources reads as "Full name changed  لِ → ‎لِ‎" — two strings
+# that are visibly identical. They carry no meaning for change detection.
+_BIDI_MARKS = dict.fromkeys(
+    (0x200E, 0x200F, 0x061C, 0x2066, 0x2067, 0x2068, 0x2069, 0x202A,
+     0x202B, 0x202C, 0x202D, 0x202E, 0xFEFF, 0x200B),
+    None,
+)
+
+
+def strip_bidi(text: Optional[str]) -> Optional[str]:
+    """Remove invisible direction/zero-width marks from a display string."""
+    if not text:
+        return text
+    return text.translate(_BIDI_MARKS).strip()
+
+
 def _to_int(raw: str) -> Optional[int]:
     """Parse a count as rendered for humans: 1,234 / 12.3K / 4.5M / 1.2B.
 
@@ -178,9 +197,9 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
         "posts_count": posts,
     }
 
-    title = _TITLE_RE.match(tags.get("title", ""))
+    title = _TITLE_RE.match(strip_bidi(tags.get("title", "")) or "")
     if title:
-        full_name = title.group(1).strip()
+        full_name = strip_bidi(title.group(1))
         if full_name:
             parsed["full_name"] = full_name
         # The page is the authority on its own handle — it reflects a rename

@@ -148,6 +148,59 @@ async def get_latest_snapshot(
     return result.scalar_one_or_none()
 
 
+def snapshot_source(snapshot: Optional[AccountSnapshot]) -> Optional[str]:
+    """Which door produced this snapshot: None for the authoritative API,
+    otherwise the marker written into raw_response (e.g. "public_page")."""
+    if snapshot is None:
+        return None
+    raw = snapshot.raw_response
+    if isinstance(raw, dict):
+        source = raw.get("source")
+        if isinstance(source, str) and source != "api":
+            return source
+    return None
+
+
+async def get_latest_snapshot_by_source(
+    session: AsyncSession,
+    account_id: int,
+    *,
+    source: Optional[str],
+    scan_limit: int = 25,
+) -> Optional[AccountSnapshot]:
+    """Newest successful snapshot recorded from the SAME source.
+
+    Diffing across sources is what produced phantom changes: Instagram's API and
+    its public profile page disagree about the same account at the same moment —
+    different follower/following counts, and RTL display names carrying bidi
+    marks on one surface but not the other. Alternating between them therefore
+    "detected" a change on every flip, in both directions.
+
+    So each source is diffed against its own history. A real change still
+    surfaces from whichever door is answering, and when the API comes back it
+    diffs against the last API reading, so nothing that happened during an
+    outage is lost.
+
+    The marker lives in raw_response rather than a column because the schema is
+    created with `create_all` and has no migration path; scanning the newest few
+    rows is cheap, and snapshots are only written when something changed.
+    """
+    stmt = (
+        select(AccountSnapshot)
+        .where(
+            AccountSnapshot.account_id == account_id,
+            AccountSnapshot.http_status == 200,
+        )
+        .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
+        .limit(scan_limit)
+    )
+    result = await session.execute(stmt)
+    for snapshot in result.scalars():
+        if snapshot_source(snapshot) == source:
+            return snapshot
+    return None
+
+
 async def get_previous_snapshot(
     session: AsyncSession, account_id: int, before_id: int
 ) -> Optional[AccountSnapshot]:

@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 from app.database.models import AccountSnapshot
 from app.monitor.media_hasher import PHASH_PREFIX, pic_asset_id
+from app.monitor.public_page import strip_bidi
 from app.utils.logger import logger
 
 # A v2 fingerprint is "p2:<dhash>:<ahash>:<mean>" — two independent 256-bit
@@ -284,7 +285,11 @@ def _is_meaningful_change(field_name: str, old: Any, new: Any) -> bool:
         # for a cleared bio, so a real removal still reports as "" vs text.
         if old is None or new is None:
             return False
-        old_s = old.strip()
-        new_s = new.strip()
+        # Invisible direction/zero-width marks are presentation, not content.
+        # Instagram's public page wraps RTL names in them and its API doesn't,
+        # so without this an Arabic name reads as "changed" from one visibly
+        # identical string to another every time the source flips.
+        old_s = (strip_bidi(old) or "").strip()
+        new_s = (strip_bidi(new) or "").strip()
         return old_s != new_s
     return old != new
