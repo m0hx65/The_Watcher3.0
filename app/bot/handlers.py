@@ -574,11 +574,26 @@ async def _render_account_card(
             lines.append("<b>Latest snapshot</b>")
         if snapshot.full_name:
             lines.append(f"Name: <code>{esc(snapshot.full_name)}</code>")
+        # The bio is public even on a private account, and it is the field that
+        # changes most often without any other visible sign.
+        if snapshot.biography:
+            lines.append(f"Bio: <code>{esc(truncate(snapshot.biography, 300))}</code>")
         lines.append(
             f"Followers: <b>{fmt_number(snapshot.followers_count)}</b> · "
             f"Following: <b>{fmt_number(snapshot.following_count)}</b>"
         )
         lines.append(f"Posts: <b>{fmt_number(snapshot.posts_count)}</b>")
+        # A "—" for posts is not a zero and not a bug: the public-page fallback
+        # (which answers while the API is 401-blocked) has no post count at all
+        # — Instagram sends `all_media_count: null` to a logged-out viewer, for
+        # public and private accounts alike. Say so, rather than leaving a dash
+        # that reads as "the bot lost the number".
+        snapshot_source = crud.snapshot_source(snapshot)
+        if snapshot_source == "public_page":
+            lines.append(
+                "<i>Read from the public page (the API was blocked) — it "
+                "carries no post count, reels or highlights.</i>"
+            )
         flags: list[str] = []
         if snapshot.is_private:
             flags.append("🔒 private")

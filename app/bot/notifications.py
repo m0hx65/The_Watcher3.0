@@ -333,6 +333,26 @@ def _render_change_block(change) -> str:
                 f"Old: {fmt_number(old)}\n"
                 f"New: {fmt_number(new)}{delta}"
             )
+        if field == "posts_count":
+            # For a private account this is the ONLY sign that they posted —
+            # the media is unreachable, so the count is the whole event. A line
+            # reading "Posts: 41 → 42" buries it among the follower stats; say
+            # what happened.
+            if (new or 0) > (old or 0):
+                headline = (
+                    "📸 <b>posted a new post</b>" if diff == 1
+                    else f"📸 <b>posted {fmt_number(diff)} new posts</b>"
+                )
+            else:
+                headline = (
+                    "🗑 <b>removed a post</b>" if diff == 1
+                    else f"🗑 <b>removed {fmt_number(diff)} posts</b>"
+                )
+            return (
+                f"{headline}\n"
+                f"Old: {fmt_number(old)}\n"
+                f"New: {fmt_number(new)}{delta}"
+            )
         return (
             f"<b>{label.capitalize()}:</b> {fmt_number(old)} → {fmt_number(new)}{delta}"
         )
