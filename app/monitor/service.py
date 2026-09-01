@@ -2499,6 +2499,11 @@ class MonitorService:
             result = await self.grab_public_backlog(
                 account_id, username, instagram_id=instagram_id,
                 final_attempt=attempts >= _PUBLIC_GRAB_MAX_ATTEMPTS,
+                # A real transition always rides in on a change set that
+                # contains is_private, so the profile card has already told the
+                # chat it went public. A pending RETRY has no such card this
+                # sweep, so there the grab is the only thing that can speak.
+                transition_announced=went_public,
             )
         finally:
             self._public_grabs_in_flight.discard(account_id)
@@ -2522,6 +2527,7 @@ class MonitorService:
         *,
         instagram_id: Optional[str] = None,
         final_attempt: bool = False,
+        transition_announced: bool = False,
     ) -> dict:
         """Send a newly-public account's backlog — everything the chat hasn't had.
 
@@ -2537,6 +2543,11 @@ class MonitorService:
         Routed to the account's forum topic when topics are enabled, and
         cancellable with /kill. `final_attempt` only changes the wording when
         nothing could be listed (no "it'll retry" promise on the last try).
+        `transition_announced` says the profile card has already reported the
+        flip to the chat, so a grab with nothing new to send says nothing at
+        all: an account toggling private/public costs ONE line, not two. It
+        still speaks when something is delivered, or when the sources didn't
+        answer and a retry is coming — silence there would hide real news.
 
         Returns {"posts", "highlights", "stories", "total", "fetched",
         "skipped"}: the three counts and `total` are what was SENT; `fetched`
@@ -2641,16 +2652,23 @@ class MonitorService:
 
             if not new_total:
                 # The flap case: it was public before, everything it has was
-                # already delivered (or baselined) then. One line, no media.
-                await self.notifier.send_text(
-                    f"🔓 <b>@{esc(username)}</b> is PUBLIC again — nothing new "
-                    f"to send: all {fetched} item(s) it has were already "
-                    "delivered here (or baselined).",
-                    message_thread_id=thread_id,
-                )
+                # already delivered (or baselined) then. Nothing to send — and
+                # when the profile card already announced the flip, nothing to
+                # SAY either, so a rapid toggle costs one line per flip instead
+                # of two. Only a flip nobody has reported yet gets a line here.
+                if not transition_announced:
+                    await self.notifier.send_text(
+                        f"🔓 <b>@{esc(username)}</b> is PUBLIC again — nothing "
+                        f"new to send: all {fetched} item(s) it has were "
+                        "already delivered here (or baselined).",
+                        message_thread_id=thread_id,
+                    )
                 logger.info(
-                    "Public backlog for @{}: {} item(s) listed, all already seen",
+                    "Public backlog for @{}: {} item(s) listed, all already "
+                    "seen — {}",
                     username, fetched,
+                    "staying quiet (the profile card announced the flip)"
+                    if transition_announced else "reported to the chat",
                 )
                 return {**empty, "fetched": fetched, "skipped": skipped}
 

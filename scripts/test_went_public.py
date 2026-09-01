@@ -9,9 +9,13 @@ transition recover on a later sweep, bounded so a genuinely empty account can't
 retry forever; a grab that listed the account but found nothing new is a
 success, not a retry.
 
-Covers: the transition detector, the dedup-aware grab, the retry ledger, the
-concurrent-grab guard, and the check_username wiring (including a full
-private/public flip-flop end to end). Runs offline on sqlite with fakes.
+A flip also costs ONE message, not two: the profile change card already says
+the account went public, so a grab with nothing new to send stays quiet.
+
+Covers: the transition detector, the dedup-aware grab, the one-line collapse,
+the retry ledger, the concurrent-grab guard, and the check_username wiring
+(including a full private/public flip-flop end to end). Runs offline on sqlite
+with fakes.
 """
 
 from __future__ import annotations
@@ -285,6 +289,51 @@ async def test_grab_empty_reports_retry() -> None:
            str(texts))
 
 
+async def test_grab_quiet_when_card_announced() -> None:
+    """A flip costs ONE line, not two.
+
+    The profile change card already tells the chat an account went public, so a
+    grab with nothing new to send must add nothing. It must still speak when it
+    delivers, and when the sources didn't answer (a retry is coming)."""
+    aid = await _add_account("quiet_flap")
+    fake = FakeStories(posts=[_item("q1")])
+    service = _make_service(fake)
+
+    # First flip: something new, so the grab speaks regardless.
+    result = await service.grab_public_backlog(
+        aid, "quiet_flap", transition_announced=True
+    )
+    expect("announced flip still delivers new media", result["total"] == 1, repr(result))
+    expect("delivering grab still speaks", len(_texts(service)) > 0)
+
+    # Second flip: nothing new AND the card already said it went public.
+    _reset_notifier(service)
+    result = await service.grab_public_backlog(
+        aid, "quiet_flap", transition_announced=True
+    )
+    expect("announced flip with nothing new sends no media",
+           result["total"] == 0 and _media_sent(service) == 0, repr(result))
+    expect("announced flip with nothing new says NOTHING",
+           _texts(service) == [], str(_texts(service)))
+    expect("still reports what it listed (so no retry is scheduled)",
+           result["fetched"] == 1 and result["skipped"] == 1, repr(result))
+
+    # Same state, but nobody announced it (a pending retry): the grab speaks.
+    _reset_notifier(service)
+    await service.grab_public_backlog(aid, "quiet_flap", transition_announced=False)
+    expect("unannounced flip with nothing new does speak",
+           any("nothing new" in t for t in _texts(service)), str(_texts(service)))
+
+    # Sources silent: worth a line even when the card announced the flip,
+    # because it tells the user a retry is coming.
+    _reset_notifier(service)
+    silent = _make_service(FakeStories())
+    aid2 = await _add_account("quiet_empty")
+    await silent.grab_public_backlog(aid2, "quiet_empty", transition_announced=True)
+    expect("announced flip STILL reports a failed grab",
+           any("retry" in t.lower() for t in _texts(silent)), str(_texts(silent)))
+
+
 async def test_grab_kill_during_listing() -> None:
     """/kill while the sources are still being listed: nothing sent, no chatter."""
     aid = await _add_account("killed")
@@ -344,6 +393,8 @@ async def test_ledger_retries_then_gives_up() -> None:
     expect("flag advanced after an empty grab", flag == "2", repr(flag))
     expect("first attempt is not flagged final",
            service.grab_public_backlog.await_args.kwargs.get("final_attempt") is False)
+    expect("a real transition is flagged as already announced by the card",
+           service.grab_public_backlog.await_args.kwargs.get("transition_announced") is True)
 
     # Subsequent sweeps retry off the flag alone (went_public=False now).
     for _ in range(_PUBLIC_GRAB_MAX_ATTEMPTS + 2):
@@ -354,6 +405,9 @@ async def test_ledger_retries_then_gives_up() -> None:
     expect("grab attempted exactly max times",
            service.grab_public_backlog.await_count == _PUBLIC_GRAB_MAX_ATTEMPTS,
            str(service.grab_public_backlog.await_count))
+    expect("a pending retry is NOT flagged announced (no card fired that sweep)",
+           service.grab_public_backlog.await_args_list[-1].kwargs.get(
+               "transition_announced") is False)
     expect("last attempt is flagged final (wording: giving up)",
            service.grab_public_backlog.await_args_list[-1].kwargs.get("final_attempt") is True)
 
@@ -506,8 +560,12 @@ async def test_flip_flop_end_to_end() -> None:
     await service.check_username("flapper")  # 4: public (flip #2) → nothing new
     expect("e2e: second flip re-sends NOTHING", _media_sent(service) == 0, str(_media_sent(service)))
     texts = _texts(service)
-    expect("e2e: second flip says nothing new (one line)",
-           sum("nothing new" in t for t in texts) == 1, str(texts))
+    # The whole point of the collapse: one flip, one message.
+    expect("e2e: second flip costs exactly ONE message", len(texts) == 1, str(texts))
+    expect("e2e: that message is the profile card announcing the flip",
+           texts and "PRIVATE" in texts[0] and "PUBLIC" in texts[0], str(texts))
+    expect("e2e: the grab adds no second line",
+           not any("nothing new" in t for t in texts), str(texts))
     expect("e2e: second flip never claims to grab the whole account",
            not any("whole account" in t for t in texts), str(texts))
 
@@ -540,6 +598,7 @@ async def main() -> int:
     await test_grab_flap_never_resends()
     await test_grab_respects_baseline()
     await test_grab_empty_reports_retry()
+    await test_grab_quiet_when_card_announced()
     await test_grab_kill_during_listing()
     await test_ledger_clears_on_success()
     await test_ledger_clears_when_nothing_new()
