@@ -75,6 +75,9 @@ _RETRIABLE_STATUSES = (401, 403, 429, 0)
 # How many sweeps a private→public backlog grab may retry before giving up, so a
 # genuinely empty (or permanently unreachable) account can't retry forever.
 _PUBLIC_GRAB_MAX_ATTEMPTS = 3
+# How many feed posts/reels one backlog grab lists — the same window the
+# on-demand download-all panel uses.
+_PUBLIC_GRAB_POST_LIMIT = 100
 
 
 class _SweepThrottle:
@@ -268,6 +271,12 @@ class MonitorService:
         # and nothing is left half-written.
         self._active_downloads: int = 0
         self._download_cancel = asyncio.Event()
+        # Accounts whose private→public backlog grab is running right now. A
+        # manual Recheck landing mid-sweep (or two Rechecks back to back) must
+        # not start a second grab of the same account: both would load the
+        # seen-set before either had marked anything, and the chat would get
+        # every item twice.
+        self._public_grabs_in_flight: set[int] = set()
 
     # ---------- On-demand download cancellation (/kill) ----------
 
@@ -2452,9 +2461,11 @@ class MonitorService:
         The transition is a one-shot event, but the grab can fail transiently
         (saveinsta rate-limited at that moment). A per-account pending flag,
         persisted BEFORE the long grab so an interruption is never lost, retries
-        it on later sweeps until it delivers something — bounded by
+        it on later sweeps until the sources answer — bounded by
         _PUBLIC_GRAB_MAX_ATTEMPTS so a genuinely empty account can't retry
-        forever.
+        forever. "Answered" is the bar, not "delivered": a grab that listed the
+        account and found nothing the chat hasn't already received is a
+        success, not a reason to come back and list it again next sweep.
         """
         if self.stories is None or not settings.auto_grab_on_public:
             return False
@@ -2468,16 +2479,35 @@ class MonitorService:
         if attempts == 0:
             return False  # not pending and not a transition — normal phase
 
+        if account_id in self._public_grabs_in_flight:
+            # Another check (a manual Recheck mid-sweep, say) is already
+            # grabbing this account. It owns the media; a second grab would
+            # send everything twice.
+            logger.info(
+                "Backlog grab for @{} already in flight — not starting another",
+                username,
+            )
+            return True
+
         # Persist the pending state before the (long, cancellable) grab so a
         # mid-grab cancellation or sweep timeout is retried, not silently lost.
         async with get_session() as session:
             await crud.set_setting(session, key, str(attempts))
 
-        result = await self.grab_public_backlog(
-            account_id, username, instagram_id=instagram_id
-        )
+        self._public_grabs_in_flight.add(account_id)
+        try:
+            result = await self.grab_public_backlog(
+                account_id, username, instagram_id=instagram_id,
+                final_attempt=attempts >= _PUBLIC_GRAB_MAX_ATTEMPTS,
+            )
+        finally:
+            self._public_grabs_in_flight.discard(account_id)
 
-        cleared = result["total"] > 0 or attempts >= _PUBLIC_GRAB_MAX_ATTEMPTS
+        # The sources answering at all — even with nothing new to send — is
+        # what settles the transition. Only a grab that came back empty-handed
+        # (rate-limited source, or an account with nothing on it) is retried.
+        answered = result.get("fetched", 0) > 0 or result.get("total", 0) > 0
+        cleared = answered or attempts >= _PUBLIC_GRAB_MAX_ATTEMPTS
         async with get_session() as session:
             if cleared:
                 await crud.delete_setting(session, key)
@@ -2486,62 +2516,197 @@ class MonitorService:
         return True
 
     async def grab_public_backlog(
-        self, account_id: int, username: str, *, instagram_id: Optional[str] = None
+        self,
+        account_id: int,
+        username: str,
+        *,
+        instagram_id: Optional[str] = None,
+        final_attempt: bool = False,
     ) -> dict:
-        """Send a newly-public account's whole backlog: posts, highlights, story.
+        """Send a newly-public account's backlog — everything the chat hasn't had.
 
-        Reuses the on-demand download paths, which ignore the seen-dedup set (so
-        everything is delivered) and mark each item seen afterward (so the next
-        sweep won't re-send it). Routed to the account's forum topic when topics
-        are enabled, and cancellable with /kill. Returns
-        {"posts", "highlights", "stories", "total"}.
+        Posts/reels, highlight items and the current story are LISTED first,
+        filtered against the account's seen-set, and only then delivered. So
+        the first time an account opens up, all of it comes through; if it then
+        flips private and public again (and again), only what is genuinely new
+        since the last grab goes out — never the whole account over again. The
+        on-demand download buttons deliberately ignore the seen-set, because
+        someone pressing them is asking for a re-send; this path deliberately
+        honors it, because nobody asked.
+
+        Routed to the account's forum topic when topics are enabled, and
+        cancellable with /kill. `final_attempt` only changes the wording when
+        nothing could be listed (no "it'll retry" promise on the last try).
+
+        Returns {"posts", "highlights", "stories", "total", "fetched",
+        "skipped"}: the three counts and `total` are what was SENT; `fetched`
+        is how many items the sources listed (0 means nothing came back — an
+        empty account, or the anonymous source is rate-limited — which is the
+        caller's retry signal); `skipped` is how many listed items had already
+        been delivered or baselined.
         """
+        empty = {
+            "posts": 0, "highlights": 0, "stories": 0,
+            "total": 0, "fetched": 0, "skipped": 0,
+        }
         if self.stories is None:
-            return {"posts": 0, "highlights": 0, "stories": 0, "total": 0}
-
+            return dict(empty)
+        username = username.strip().lstrip("@").lower()
         thread_id = await self.topic_for(account_id, username)
-        await self.notifier.send_text(
-            f"🔓 <b>@{esc(username)}</b> just went PUBLIC — grabbing the whole "
-            "account (posts, reels, highlights, story)…",
-            message_thread_id=thread_id,
-        )
 
         # One outer scope so /kill can stop the whole sequence between phases,
         # not just within one download (the scope nests safely).
         async with self.download_scope():
-            posts = await self.download_posts(
-                username, message_thread_id=thread_id
+            # ---- list everything first; nothing is sent yet ----
+            try:
+                posts = await self.stories.fetch_posts(
+                    username, limit=_PUBLIC_GRAB_POST_LIMIT
+                )
+            except Exception as exc:  # pragma: no cover - network failure path
+                logger.warning(
+                    "Backlog post listing failed for @{}: {}", username, exc
+                )
+                posts = []
+
+            # list_highlights persists the catalog for monitored accounts, so
+            # the normal story phase's next diff starts from what was seen here
+            # instead of re-baselining it.
+            listing = await self.list_highlights(username)
+            catalog = {hid: title for hid, title in listing.get("items", [])}
+            highlight_items = await self._gather_highlight_items(
+                username, catalog, cancellable=True
             )
-            highlights = await self.download_all_highlights(
-                username, message_thread_id=thread_id
-            )
-            story = await self.fetch_and_send_stories(
-                username, message_thread_id=thread_id
+            if highlight_items:
+                # Every reel was just listed — that IS the full re-scan, so
+                # the normal phase needn't list them all again next sweep.
+                async with get_session() as session:
+                    await crud.set_setting(
+                        session,
+                        self._highlight_scan_key(account_id),
+                        str(time.time()),
+                    )
+
+            try:
+                stories = await self.stories.fetch_stories(username)
+            except Exception as exc:  # pragma: no cover - network failure path
+                logger.warning(
+                    "Backlog story listing failed for @{}: {}", username, exc
+                )
+                stories = []
+
+            fetched = sum(
+                1 for item in (*posts, *highlight_items, *stories) if item.pk
             )
 
-        p = posts.get("count", 0)
-        h = highlights.get("count", 0)
-        s = story.get("count", 0)
+            if self._download_cancel.is_set():
+                # /kill landed during the listing. The user stopped it on
+                # purpose; report what was listed so the ledger doesn't
+                # schedule a retry they didn't ask for.
+                logger.info(
+                    "/kill — backlog grab for @{} stopped before delivery",
+                    username,
+                )
+                return {**empty, "fetched": fetched}
+
+            # ---- keep only what the chat hasn't received ----
+            async with get_session() as session:
+                seen_pks = await crud.get_seen_story_pks(session, account_id)
+
+            def unseen(items: list) -> list:
+                return [i for i in items if i.pk and i.pk not in seen_pks]
+
+            new_posts = unseen(posts)
+            new_highlights = unseen(highlight_items)
+            new_stories = unseen(stories)
+            new_total = len(new_posts) + len(new_highlights) + len(new_stories)
+            skipped = fetched - new_total
+
+            if not fetched:
+                if final_attempt:
+                    msg = (
+                        f"🔓 <b>@{esc(username)}</b> is public now, but nothing "
+                        "could be grabbed (empty account, or the anonymous "
+                        "source stayed rate-limited) — giving up on the "
+                        "automatic grab; the Download all panel still works."
+                    )
+                else:
+                    msg = (
+                        f"🔓 <b>@{esc(username)}</b> is public now, but nothing "
+                        "could be grabbed this time (empty account, or the "
+                        "anonymous source is rate-limited — it'll retry)."
+                    )
+                await self.notifier.send_text(msg, message_thread_id=thread_id)
+                logger.info("Public backlog for @{}: nothing listed", username)
+                return dict(empty)
+
+            if not new_total:
+                # The flap case: it was public before, everything it has was
+                # already delivered (or baselined) then. One line, no media.
+                await self.notifier.send_text(
+                    f"🔓 <b>@{esc(username)}</b> is PUBLIC again — nothing new "
+                    f"to send: all {fetched} item(s) it has were already "
+                    "delivered here (or baselined).",
+                    message_thread_id=thread_id,
+                )
+                logger.info(
+                    "Public backlog for @{}: {} item(s) listed, all already seen",
+                    username, fetched,
+                )
+                return {**empty, "fetched": fetched, "skipped": skipped}
+
+            # ---- deliver just the new items ----
+            breakdown = (
+                f"{len(new_posts)} post/reel, {len(new_highlights)} highlight, "
+                f"{len(new_stories)} story item(s)"
+            )
+            if skipped:
+                banner = (
+                    f"🔓 <b>@{esc(username)}</b> is PUBLIC again — grabbing "
+                    f"what's new since last time: {breakdown} "
+                    f"({skipped} already delivered)…"
+                )
+            else:
+                banner = (
+                    f"🔓 <b>@{esc(username)}</b> just went PUBLIC — grabbing "
+                    f"the whole account: {breakdown}…"
+                )
+            await self.notifier.send_text(banner, message_thread_id=thread_id)
+
+            p = h = s = 0
+            if new_posts:
+                p = await self._deliver_story_items(
+                    account_id, username, new_posts, seen_pks,
+                    message_thread_id=thread_id, cancellable=True,
+                )
+            if new_highlights:
+                h = await self._deliver_story_items(
+                    account_id, username, new_highlights, seen_pks,
+                    message_thread_id=thread_id, cancellable=True,
+                )
+            if new_stories:
+                s = await self._deliver_story_items(
+                    account_id, username, new_stories, seen_pks,
+                    message_thread_id=thread_id, cancellable=True,
+                )
+
         total = p + h + s
-
-        if total:
-            await self.notifier.send_text(
-                f"✅ <b>@{esc(username)}</b> backlog grabbed — "
-                f"{p} post/reel, {h} highlight, {s} story item(s).",
-                message_thread_id=thread_id,
-            )
-        else:
-            await self.notifier.send_text(
-                f"🔓 <b>@{esc(username)}</b> is public now, but nothing could be "
-                "grabbed this time (empty account, or the anonymous source is "
-                "rate-limited — it'll retry).",
-                message_thread_id=thread_id,
-            )
-        logger.info(
-            "Public backlog for @{}: {} post/reel, {} highlight, {} story item(s)",
-            username, p, h, s,
+        summary = (
+            f"✅ <b>@{esc(username)}</b> backlog grabbed — "
+            f"{p} post/reel, {h} highlight, {s} story item(s)."
         )
-        return {"posts": p, "highlights": h, "stories": s, "total": total}
+        missed = new_total - total
+        if missed:
+            summary += f" {missed} item(s) not sent (download failed or stopped)."
+        await self.notifier.send_text(summary, message_thread_id=thread_id)
+        logger.info(
+            "Public backlog for @{}: {} post/reel, {} highlight, {} story "
+            "item(s) sent; {} listed, {} already seen, {} not sent",
+            username, p, h, s, fetched, skipped, missed,
+        )
+        return {
+            "posts": p, "highlights": h, "stories": s,
+            "total": total, "fetched": fetched, "skipped": skipped,
+        }
 
     # ---------- On-demand actions ----------
     # These work for ANY public username, monitored or not. When the account is

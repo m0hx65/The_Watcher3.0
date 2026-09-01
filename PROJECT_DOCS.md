@@ -675,7 +675,7 @@ All settings are read from environment variables (or a `.env` file locally).
 |---|---|---|
 | `STORY_STATUS_HEARTBEAT` | `true` | Posts a story/live status line on every check, so every public account's state is always stated (`⭕ NO STORY` included). Never sent on top of the media that already announced the same story. `false` = announced only when it changes |
 | `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight's media. New reels are always listed immediately. `0` = every sweep (~12× traffic) |
-| `AUTO_GRAB_ON_PUBLIC` | `true` | Deliver the whole backlog when a target flips private → public |
+| `AUTO_GRAB_ON_PUBLIC` | `true` | Deliver the backlog (only items not already delivered/baselined — repeated flips never re-send) when a target flips private → public |
 | `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel (`0` disables) |
 | `FOLLOWER_ANOMALY_ABS_MIN` | `500` | Follower-jump alert fires only when the change is large in **both** absolute and relative terms |
 | `FOLLOWER_ANOMALY_PCT_MIN` | `0.10` | The relative half of that test |
