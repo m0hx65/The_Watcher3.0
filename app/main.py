@@ -212,6 +212,7 @@ async def root() -> JSONResponse:
                 "/accounts",
                 "/accounts/{username}/recheck",
                 "/sweep",
+                "/home-fetch/jobs",
             ],
         }
     )

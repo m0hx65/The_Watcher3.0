@@ -29,6 +29,7 @@ from app.bot import keyboards
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
+from app.monitor import home_fetch
 from app.monitor.analytics import compute_rhythm, render_rhythm
 from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
@@ -715,9 +716,8 @@ def instagram_route() -> str:
         # PROXY_URL wraps the whole session, so it applies to the hop that
         # reaches the worker — not to the worker's own egress to Instagram.
         route += " + outbound proxy"
-    if settings.home_fetch_url:
-        home = urlparse(settings.home_fetch_url).hostname or settings.home_fetch_url
-        route += f" · profile page via home fetcher ({home})"
+    if settings.home_fetch_token:
+        route += f" · home fetcher {home_fetch.broker.describe()}"
     return route
 
 
@@ -2591,10 +2591,10 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"({fmt_number(page.get('bytes') or 0)} bytes)"
         )
 
-    # The same page, fetched by the home fetcher — a PC on a connection
-    # Instagram trusts (tools/home_fetcher). Measured on its own so "the
-    # page is blocked" and "the PC is off" stay distinguishable.
-    if settings.home_fetch_url:
+    # The same page, fetched by the home fetcher — a phone or PC on a
+    # connection Instagram trusts (tools/home_fetcher). Measured on its own so
+    # "the page is blocked" and "the phone is off" stay distinguishable.
+    if settings.home_fetch_token:
         await show("⏳ Asking the home fetcher…")
         home = await service.instagram.probe_home_page(username)
         home_got = home.get("parsed")

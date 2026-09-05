@@ -105,7 +105,8 @@ User (Telegram)
         The API is skipped for the rest of the sweep once it has refused
         SWEEP_BREAKER_THRESHOLD lookups in a row with none answering; the
         page doors still run — this host's own request, then the home
-        fetcher (HOME_FETCH_URL, a PC on a trusted connection)
+        fetcher (HOME_FETCH_TOKEN: a phone/PC on a trusted connection that
+        polls /home-fetch/jobs for work)
     c.  If (b) is blocked but (a) answered: an id-only PARTIAL reading —
         username + picture live, everything else carried forward, labelled
     d.  MediaHasher.hash_url()  →  download + perceptual hash
@@ -541,17 +542,21 @@ this design:
 
 ### 6.8 Home page fetcher
 
-`tools/home_fetcher/home_fetcher.py` — a stdlib + curl_cffi HTTP service you
-run on your own PC, whose connection Instagram trusts. One job: fetch
-`instagram.com/<username>/` with Chrome impersonation and return Instagram's
-status and HTML untouched (`GET /page/<username>`, header `X-Watcher-Token`).
-Exposed for free with a stable HTTPS URL via `tailscale funnel --bg 8787`;
-the bot reads `HOME_FETCH_URL` / `HOME_FETCH_TOKEN` and
-`InstagramClient.probe_home_page` parses the same Relay payload the direct
-page door does, so the reading is a normal `source="public_page"` partial.
-Order on the username side: the API (unless skipped for the sweep), this
-host's page request, the home fetcher. An unreachable fetcher (PC off) is a
-fast, quiet failure — the sweep stays id-only. About 700 KB per page.
+`tools/home_fetcher/home_fetcher.py` — a stdlib-only worker (curl_cffi used
+when present) you run on a device whose connection Instagram trusts: an old
+Android phone in Termux, or your PC. It PULLS work: `GET /home-fetch/jobs`
+long-polls the bot (header `X-Watcher-Token`), the worker fetches
+`instagram.com/<username>/` with Chrome's navigation headers, and POSTs
+Instagram's status and HTML to `/home-fetch/jobs/<id>` (gzip). Nothing dials
+into the home network — it sits behind carrier-grade NAT and an unrooted phone
+can run neither a port forward nor a Tailscale Funnel. `app/monitor/home_fetch.py`
+is the in-memory broker that matches jobs to waiting checks;
+`InstagramClient.probe_home_page` parses the same Relay payload the direct page
+door does, so the reading is a normal `source="public_page"` partial. Order on
+the username side: the API (unless skipped for the sweep), this host's page
+request, the home fetcher. A worker that has not polled for 90 s is "not
+connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
+page from Instagram, ~150 KB compressed to the bot.
 
 The durable fix within a login-free design is a residential/mobile proxy
 (`IG_PROXY_URL` unset, `PROXY_URL` set), which gets a consumer-ASN IP *and*

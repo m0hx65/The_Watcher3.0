@@ -45,6 +45,7 @@ from app.config import settings  # noqa: E402
 from app.database import crud  # noqa: E402
 from app.database.models import AccountSnapshot, Base, MonitoredAccount  # noqa: E402
 from app.database.session import engine, get_session  # noqa: E402
+from app.monitor import home_fetch  # noqa: E402
 from app.monitor import service as service_mod  # noqa: E402
 from app.monitor.instagram import IdProbe, InstagramClient, ProfileFetchResult  # noqa: E402
 from app.monitor.service import MonitorService, _SweepThrottle  # noqa: E402
@@ -579,13 +580,30 @@ async def test_fetch_profile_can_skip_the_api() -> None:
     expect("and the API as not asked", result.api_status is None, repr(result.api_status))
 
 
+class FakeBroker:
+    """Stands in for the home fetcher's broker: a connected worker that
+    answers with scripted pages, or a worker that is off."""
+
+    def __init__(self, pages: dict, *, connected: bool = True) -> None:
+        self.pages = pages
+        self.connected = connected
+        self.asked: list[str] = []
+
+    def describe(self) -> str:
+        return "connected (worker fake)" if self.connected else "not connected (fake is off)"
+
+    async def request_page(self, username: str, *, timeout: float = 30.0):
+        self.asked.append(username)
+        return self.pages.get(username)
+
+
 async def test_home_door_answers_when_this_host_is_refused() -> None:
     """The measured state: this host's page request is bounced with a 429,
-    the PC's is not. The home fetcher's answer is the same page, parsed the
+    the phone's is not. The home fetcher's answer is the same page, parsed the
     same way, and marked partial like any page reading."""
-    old_proxy, old_home, old_token = settings.ig_proxy_url, settings.home_fetch_url, settings.home_fetch_token
+    old_proxy, old_token = settings.ig_proxy_url, settings.home_fetch_token
+    old_broker = home_fetch.broker
     settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
-    settings.home_fetch_url = "https://my-pc.tail1234.ts.net/"
     settings.home_fetch_token = "sekrit"
 
     def handler(url: str, params: dict) -> _MockResponse:
@@ -593,15 +611,15 @@ async def test_home_door_answers_when_this_host_is_refused() -> None:
             return _MockResponse(401, {})
         if url.startswith("https://www.instagram.com/pageuser/"):
             return _MockResponse(429, {}, text="")
-        if url == "https://my-pc.tail1234.ts.net/page/pageuser":
-            return _MockResponse(200, {}, text=PAGE)
         return _MockResponse(500, {}, text="unexpected " + url)
 
     try:
+        home_fetch.broker = FakeBroker({
+            "pageuser": home_fetch.PageResult(200, PAGE, "https://www.instagram.com/pageuser/"),
+        })
         session = _MockSession(handler)
         async with InstagramClient(max_retries=5, session=session) as client:
             result = await client.fetch_profile("pageuser", auth_attempts=1)
-        home_calls = [r for r in session.requests if "my-pc" in r["url"]]
         expect("the home fetcher answered", result.success and result.source == "public_page",
                repr(result))
         expect("with the page's numbers",
@@ -610,35 +628,32 @@ async def test_home_door_answers_when_this_host_is_refused() -> None:
         expect("the API's refusal is still on record", result.api_status == 401,
                repr(result.api_status))
         expect("this host's own page request came first",
-               [r["url"] for r in session.requests][-2].startswith("https://www.instagram.com/pageuser/"),
+               [r["url"] for r in session.requests][-1].startswith("https://www.instagram.com/pageuser/"),
                repr([r["url"] for r in session.requests]))
-        expect("the home fetcher was asked once, with the token",
-               len(home_calls) == 1 and home_calls[0]["headers"].get("X-Watcher-Token") == "sekrit",
-               repr(home_calls))
+        expect("the home fetcher was asked once, by username",
+               home_fetch.broker.asked == ["pageuser"], repr(home_fetch.broker.asked))
 
-        # The PC is off: the door fails fast and the check reads as blocked.
-        def off(url: str, params: dict) -> _MockResponse:
-            if "my-pc" in url:
-                raise ConnectionError("no route to host")
-            return _MockResponse(401 if "workers.dev" in url else 429, {}, text="")
-        session = _MockSession(off)
+        # The phone is off: the door answers at once and the check reads as blocked.
+        home_fetch.broker = FakeBroker({}, connected=False)
+        session = _MockSession(handler)
         async with InstagramClient(max_retries=5, session=session) as client:
             result = await client.fetch_profile("pageuser", auth_attempts=1)
-        expect("an unreachable home fetcher leaves the block intact",
+        expect("a phone that is off leaves the block intact",
                not result.success and result.http_status == 401, repr(result))
+        expect("and is not even asked", home_fetch.broker.asked == [], repr(home_fetch.broker.asked))
 
         # Instagram's own 404 through the home fetcher is a real 404.
-        def gone(url: str, params: dict) -> _MockResponse:
-            if "my-pc" in url:
-                return _MockResponse(404, {}, text="<html>not found</html>")
-            return _MockResponse(401 if "workers.dev" in url else 429, {}, text="")
-        session = _MockSession(gone)
+        home_fetch.broker = FakeBroker({
+            "pageuser": home_fetch.PageResult(404, "<html>not found</html>", ""),
+        })
+        session = _MockSession(handler)
         async with InstagramClient(max_retries=5, session=session) as client:
             result = await client.fetch_profile("pageuser", auth_attempts=1)
         expect("a page 404 is handed up as a 404", result.http_status == 404 and not result.success,
                repr(result))
     finally:
-        settings.ig_proxy_url, settings.home_fetch_url, settings.home_fetch_token = old_proxy, old_home, old_token
+        settings.ig_proxy_url, settings.home_fetch_token = old_proxy, old_token
+        home_fetch.broker = old_broker
 
 
 async def test_probe_reports_what_instagram_said() -> None:

@@ -1,71 +1,99 @@
-"""The Watcher -home page fetcher.
+"""The Watcher — home page fetcher (worker).
 
-Runs on a machine whose internet connection Instagram trusts (your PC, on your
-home line or behind your VPN) and fetches ONE thing on the bot's behalf: the
-public profile page ``instagram.com/<username>/``. Its embedded payload carries
-the follower/following counts, the bio and the privacy flag that Instagram no
-longer hands to datacenter IPs -Render's and Cloudflare's alike, as measured
-on 2026-09-05. The bot asks this service only after its own attempt was
-refused, and only for that page. Nothing is stored here, nothing else is
-fetched, and no Instagram login is involved.
+Runs on a device whose internet connection Instagram trusts — an old phone in
+Termux, or your PC — and does ONE job for the bot: it polls the bot for
+profile pages to fetch, fetches ``instagram.com/<username>/`` from here, and
+posts Instagram's answer back. That page's embedded payload carries the
+follower/following counts, the bio and the privacy flag that Instagram no
+longer hands to datacenter IPs (Render's and Cloudflare's alike, measured
+2026-09-05), but still hands to a home line or a VPN.
 
-Run it:
+Nothing dials into your network: this script only makes outbound HTTPS
+requests, so it works behind carrier-grade NAT, on a phone, without root, and
+without any tunnel. Nothing is stored, nothing else is fetched, no Instagram
+login is involved.
 
-    python home_fetcher.py
+Setup — two values, in a file named ``home_fetcher.env`` next to this script
+(or as environment variables):
 
-It listens on 127.0.0.1:8787 and prints its access token. Expose it with a
-free, stable HTTPS URL (Tailscale Funnel, one command, survives reboots):
+    WATCHER_URL=https://<your-bot>.onrender.com
+    HOME_FETCH_TOKEN=<any long random string — the same one you set on Render>
 
-    tailscale funnel --bg 8787
+    python home_fetcher.py --new-token     prints a fresh random token to use
+    python home_fetcher.py                 runs the worker
 
-Then set two environment variables on the bot (Render → Environment):
-
-    HOME_FETCH_URL   = https://<machine>.<tailnet>.ts.net
-    HOME_FETCH_TOKEN = <the token this script printed>
-
-Endpoints:
-
-    GET /health            -> {"ok": true, "requests": N}
-    GET /page/<username>   -> Instagram's own status code and HTML, plus an
-                              X-IG-Final-Url header. Requires the header
-                              X-Watcher-Token: <token>.
-
-Only Python 3.9+ and curl_cffi are needed (``pip install curl_cffi``). The
-Chrome TLS impersonation matters: Instagram only embeds the payload for a
-request that looks like a real browser navigation.
+Only Python 3.9+ is needed. curl_cffi (``pip install curl_cffi``) is used
+when installed — it impersonates Chrome down to the TLS handshake — but the
+standard library works too: measured 2026-09-05, Instagram embeds the payload
+for any request carrying Chrome's navigation headers from a trusted IP. The
+header set is what it reads; the TLS fingerprint is not. That is what lets
+this run in Termux, where curl_cffi does not install.
 """
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
 import secrets
+import socket
 import sys
-import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
 
 try:
     from curl_cffi import requests as curl_requests
-except ImportError:  # pragma: no cover - startup guidance, not logic
-    sys.exit("curl_cffi is required:  pip install curl_cffi")
+except ImportError:
+    curl_requests = None  # the standard-library engine below is used instead
+if os.environ.get("HOME_FETCH_ENGINE", "").lower() == "stdlib":
+    curl_requests = None  # force the engine a phone will use, e.g. for a test on a PC
 
-BIND = os.environ.get("HOME_FETCH_BIND", "127.0.0.1:8787")
-TOKEN_FILE = Path(__file__).with_name("home_fetcher.token")
+HERE = Path(__file__).resolve().parent
+ENV_FILE = HERE / "home_fetcher.env"
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+# How long one poll waits at the bot for a job before asking again. The bot
+# caps this at 25 s; keep the read timeout comfortably above it.
+POLL_WAIT_SECONDS = 25
+POLL_READ_TIMEOUT = 45
+IG_TIMEOUT_SECONDS = 25
 # Be a polite neighbour to your own IP: at most one Instagram request every
 # this many seconds, whatever the bot asks for. The bot already paces itself.
 MIN_GAP_SECONDS = 2.0
-IG_TIMEOUT_SECONDS = 25
 
-_lock = threading.Lock()
+_session = (
+    curl_requests.Session(impersonate="chrome120", timeout=IG_TIMEOUT_SECONDS)
+    if curl_requests is not None else None
+)
+ENGINE = "curl_cffi (Chrome impersonation)" if _session is not None else "stdlib urllib"
+
+# A top-level page navigation, as Chrome sends it. Only the stdlib engine
+# needs these spelled out; curl_cffi's impersonation adds them itself.
+_NAV_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip",
+    "Sec-Ch-Ua": '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 _last_request_at = 0.0
-_request_count = 0
-_session = curl_requests.Session(impersonate="chrome120", timeout=IG_TIMEOUT_SECONDS)
 
 
 def _log(message: str) -> None:
@@ -73,112 +101,166 @@ def _log(message: str) -> None:
     print(f"{stamp} | {message}", flush=True)
 
 
-def load_token() -> str:
-    """The shared secret the bot must present. From the environment when set,
-    otherwise from a file next to this script -created on first run."""
-    env = os.environ.get("HOME_FETCH_TOKEN", "").strip()
-    if env:
-        return env
-    if TOKEN_FILE.exists():
-        stored = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        if stored:
-            return stored
-    token = secrets.token_urlsafe(32)
-    TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
-    return token
+def load_settings() -> tuple[str, str, str]:
+    """WATCHER_URL, HOME_FETCH_TOKEN and a worker name — from the environment,
+    else from home_fetcher.env next to this script (KEY=VALUE lines)."""
+    values: dict[str, str] = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    url = (os.environ.get("WATCHER_URL") or values.get("WATCHER_URL") or "").rstrip("/")
+    token = os.environ.get("HOME_FETCH_TOKEN") or values.get("HOME_FETCH_TOKEN") or ""
+    worker = (
+        os.environ.get("HOME_FETCH_WORKER") or values.get("HOME_FETCH_WORKER")
+        or socket.gethostname() or "worker"
+    )
+    return url, token, worker
 
 
-TOKEN = load_token()
-
+# ------------------------------------------------------------ Instagram
 
 def fetch_profile_page(username: str) -> tuple[int, bytes, str]:
     """One Instagram request, paced. Returns (status, body, final_url)."""
-    global _last_request_at, _request_count
-    with _lock:
-        wait = MIN_GAP_SECONDS - (time.monotonic() - _last_request_at)
-        if wait > 0:
-            time.sleep(wait)
-        _last_request_at = time.monotonic()
-        _request_count += 1
-    response = _session.get(
-        f"https://www.instagram.com/{username}/",
-        headers={"Accept-Language": "en-US,en;q=0.9"},
-        allow_redirects=True,
-    )
-    final_url = getattr(response, "url", "") or ""
-    return response.status_code, response.content or b"", final_url
+    global _last_request_at
+    wait = MIN_GAP_SECONDS - (time.monotonic() - _last_request_at)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_at = time.monotonic()
+    url = f"https://www.instagram.com/{username}/"
+    if _session is not None:
+        response = _session.get(
+            url, headers={"Accept-Language": "en-US,en;q=0.9"}, allow_redirects=True,
+        )
+        final_url = getattr(response, "url", "") or ""
+        return response.status_code, response.content or b"", final_url
+    return _fetch_with_stdlib(url)
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "WatcherHomeFetcher/1.0"
+def _fetch_with_stdlib(url: str) -> tuple[int, bytes, str]:
+    """The same navigation, through urllib. Redirects are followed; a 4xx/5xx
+    is returned as Instagram sent it rather than raised."""
+    request = urllib.request.Request(url, headers=_NAV_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=IG_TIMEOUT_SECONDS) as response:
+            status = response.status
+            raw = response.read()
+            encoding = response.headers.get("Content-Encoding", "")
+            final_url = response.geturl()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        raw = error.read()
+        encoding = error.headers.get("Content-Encoding", "") if error.headers else ""
+        final_url = error.geturl() or url
+    body = gzip.decompress(raw) if encoding == "gzip" and raw[:2] == b"\x1f\x8b" else raw
+    return status, body, final_url
 
-    def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib signature
-        pass  # we log ourselves, once per request, with the outcome
 
-    def _send(self, status: int, body: bytes, content_type: str,
-              extra: Optional[dict[str, str]] = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for key, value in (extra or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(body)
+# --------------------------------------------------------------- the bot
 
-    def _json(self, status: int, payload: dict) -> None:
-        self._send(status, json.dumps(payload).encode("utf-8"), "application/json")
+def _bot_request(method: str, url: str, token: str, worker: str, *,
+                 body: bytes = b"", headers: dict | None = None,
+                 timeout: float = POLL_READ_TIMEOUT) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, data=body if method == "POST" else None, method=method)
+    request.add_header("X-Watcher-Token", token)
+    request.add_header("X-Watcher-Worker", worker)
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib name
-        path = self.path.split("?", 1)[0]
-        if path == "/health":
-            self._json(200, {"ok": True, "requests": _request_count})
-            return
-        if not path.startswith("/page/"):
-            self._json(404, {"error": "unknown path"})
-            return
-        if self.headers.get("X-Watcher-Token", "") != TOKEN:
-            _log(f"refused {self.client_address[0]} -bad or missing token")
-            self._json(401, {"error": "bad token"})
-            return
-        username = path[len("/page/"):].strip("/").lstrip("@")
-        if not USERNAME_RE.match(username):
-            self._json(400, {"error": "bad username"})
-            return
+
+def run(url: str, token: str, worker: str) -> int:
+    _log(f"polling {url} as '{worker}'  (engine: {ENGINE})")
+    backoff = 5.0
+    while True:
+        try:
+            status, raw = _bot_request(
+                "GET", f"{url}/home-fetch/jobs?wait={POLL_WAIT_SECONDS}", token, worker,
+            )
+        except (urllib.error.URLError, socket.timeout, OSError) as exc:
+            _log(f"bot unreachable ({exc}) - retrying in {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff = min(60.0, backoff * 2)
+            continue
+        if status == 401:
+            _log("the bot rejected the token - check HOME_FETCH_TOKEN on both sides; retrying in 60s")
+            time.sleep(60)
+            continue
+        if status == 404:
+            _log("the bot says the home fetcher is disabled (HOME_FETCH_TOKEN not set on Render) - retrying in 60s")
+            time.sleep(60)
+            continue
+        if status != 200:
+            _log(f"bot answered HTTP {status} - retrying in {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff = min(60.0, backoff * 2)
+            continue
+        backoff = 5.0
+        try:
+            job = json.loads(raw.decode("utf-8")).get("job")
+        except (ValueError, UnicodeDecodeError):
+            job = None
+        if not job:
+            continue  # nothing to do this round — poll again at once
+
+        username = str(job.get("username", "")).lstrip("@")
+        job_id = str(job.get("id", ""))
+        if not USERNAME_RE.match(username) or not job_id:
+            _log(f"ignoring a malformed job: {job!r}")
+            continue
+
         started = time.monotonic()
         try:
-            status, body, final_url = fetch_profile_page(username)
+            ig_status, body, final_url = fetch_profile_page(username)
         except Exception as exc:  # network failure on our side
-            _log(f"@{username}: Instagram request failed -{exc!r}")
-            self._json(502, {"error": f"instagram request failed: {exc!r}"})
-            return
+            _log(f"@{username}: Instagram request failed - {exc!r}")
+            ig_status, body, final_url = 0, b"", ""
         has_payload = b"xig_user_by_username" in body
         _log(
-            f"@{username}: Instagram answered HTTP {status}, {len(body)} bytes, "
-            f"payload={'yes' if has_payload else 'no'} "
-            f"({time.monotonic() - started:.1f}s)"
+            f"@{username}: Instagram answered HTTP {ig_status}, {len(body)} bytes, "
+            f"payload={'yes' if has_payload else 'no'} ({time.monotonic() - started:.1f}s)"
         )
-        self._send(
-            status, body, "text/html; charset=utf-8",
-            {"X-IG-Final-Url": final_url, "X-IG-Payload": "1" if has_payload else "0"},
-        )
+        try:
+            code, _ = _bot_request(
+                "POST", f"{url}/home-fetch/jobs/{job_id}", token, worker,
+                body=gzip.compress(body),
+                headers={
+                    "Content-Type": "text/html; charset=utf-8",
+                    "Content-Encoding": "gzip",
+                    "X-IG-Status": str(ig_status),
+                    "X-IG-Final-Url": final_url,
+                },
+                timeout=60,
+            )
+            if code != 200:
+                _log(f"@{username}: the bot answered HTTP {code} to the delivery")
+        except (urllib.error.URLError, socket.timeout, OSError) as exc:
+            _log(f"@{username}: could not deliver to the bot ({exc})")
 
 
 def main() -> int:
-    if "--print-token" in sys.argv:
-        print(TOKEN)
+    if "--new-token" in sys.argv:
+        print(secrets.token_urlsafe(32))
         return 0
-    host, _, port = BIND.rpartition(":")
-    server = ThreadingHTTPServer((host or "127.0.0.1", int(port or 8787)), Handler)
-    _log(f"listening on http://{host or '127.0.0.1'}:{port or 8787}")
-    _log(f"access token: {TOKEN}")
-    _log("set HOME_FETCH_TOKEN to that value on the bot, and HOME_FETCH_URL to "
-         "the public URL you expose this on (e.g. `tailscale funnel --bg 8787`)")
+    url, token, worker = load_settings()
+    if not url or not token:
+        _log(
+            "WATCHER_URL and HOME_FETCH_TOKEN are required - put them in "
+            f"{ENV_FILE.name} next to this script or in the environment"
+        )
+        return 2
     try:
-        server.serve_forever()
+        return run(url, token, worker)
     except KeyboardInterrupt:
         _log("stopping")
-    return 0
+        return 0
 
 
 if __name__ == "__main__":

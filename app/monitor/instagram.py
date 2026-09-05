@@ -22,6 +22,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException, Timeout
 
 from app.config import settings
+from app.monitor import home_fetch
 from app.monitor.health import IG_PROFILE, IG_REEL, fetch_health
 from app.monitor.public_page import PARTIAL_FIELDS, parse_public_profile
 from app.utils.logger import logger
@@ -858,9 +859,9 @@ class InstagramClient:
         """Fetch the public page and report what came back, in detail.
 
         Returns {"status", "bytes", "parsed", "error", "door"}. Two doors, in
-        order: this host's own request, then — when `HOME_FETCH_URL` is set and
-        `allow_home` — the home fetcher, a machine whose connection Instagram
-        trusts (see tools/home_fetcher). Every outcome is logged at INFO: this
+        order: this host's own request, then — when `HOME_FETCH_TOKEN` is set
+        and `allow_home` — the home fetcher, a device whose connection
+        Instagram trusts (see tools/home_fetcher). Every outcome is logged: this
         path only runs when the API is already blocked, so it is rare, and it
         is the one measurement that says whether anything can still reach
         Instagram. Learning that from a log needs the log to contain it.
@@ -868,7 +869,7 @@ class InstagramClient:
         result = await self._probe_page_direct(username)
         if result.get("parsed") is not None or not allow_home:
             return result
-        if not settings.home_fetch_url:
+        if not settings.home_fetch_token:
             return result
         home = await self.probe_home_page(username)
         if home.get("parsed") is not None or home.get("status") == 404:
@@ -925,58 +926,57 @@ class InstagramClient:
     async def probe_home_page(self, username: str) -> dict[str, Any]:
         """The public page, fetched by the home fetcher (tools/home_fetcher).
 
-        The service returns Instagram's own status and HTML untouched, so a
-        404 here is Instagram's 404 and a 429 is Instagram rate-limiting the
-        home connection — distinguishable from the service being unreachable
-        (status 0, the PC is off or the tunnel is down), which is expected and
-        costs the sweep nothing but this one quick failure.
+        The worker on the owner's phone or PC polls this bot for jobs; the
+        broker hands it this username and waits for the HTML. Instagram's own
+        status comes back untouched, so a 404 here is Instagram's 404 and a
+        429 is Instagram rate-limiting the home connection — distinguishable
+        from the worker not being connected (the phone is off), which is
+        expected and costs the check nothing but this one quick answer.
         """
         username = username.strip().lstrip("@")
         result: dict[str, Any] = {
             "status": 0, "bytes": 0, "parsed": None, "error": None,
             "door": "home",
         }
-        base = (settings.home_fetch_url or "").rstrip("/")
-        if not base:
-            result["error"] = "HOME_FETCH_URL not set"
+        if not settings.home_fetch_token:
+            result["error"] = "HOME_FETCH_TOKEN not set"
             return result
-        headers = {"Accept-Language": "en-US,en;q=0.9"}
-        if settings.home_fetch_token:
-            headers["X-Watcher-Token"] = settings.home_fetch_token
-        try:
-            response = await self._session.get(
-                f"{base}/page/{username}", headers=headers
-            )
-        except Exception as exc:
-            result["error"] = f"home fetcher unreachable: {exc!r}"
+        broker = home_fetch.broker
+        if not broker.connected:
+            result["error"] = f"home fetcher {broker.describe()}"
             logger.info(
-                "Home fetcher unreachable for @{} ({}) — is the PC on and the "
-                "tunnel up?", username, exc,
+                "Home fetcher {} — skipping the home door for @{}",
+                broker.describe(), username,
             )
+            return result
+        page = await broker.request_page(
+            username, timeout=float(settings.request_timeout) + 10.0
+        )
+        if page is None:
+            result["error"] = "home fetcher took the job but did not answer in time"
             return result
 
-        body = getattr(response, "text", "") or ""
-        result["status"] = response.status_code
-        result["bytes"] = len(body)
-        if response.status_code != 200:
-            result["error"] = f"HTTP {response.status_code}"
+        result["status"] = page.status
+        result["bytes"] = len(page.body)
+        if page.status != 200:
+            result["error"] = f"HTTP {page.status}"
             logger.info(
                 "Home fetcher: Instagram answered HTTP {} for @{} ({} bytes)",
-                response.status_code, username, len(body),
+                page.status, username, len(page.body),
             )
             return result
-        parsed = await asyncio.to_thread(parse_public_profile, body, username)
+        parsed = await asyncio.to_thread(parse_public_profile, page.body, username)
         result["parsed"] = parsed
         if parsed is None:
             result["error"] = "no profile payload in the page"
             logger.info(
                 "Home fetcher: page for @{} served ({} bytes) but carried no "
                 "profile payload — login wall or markup change",
-                username, len(body),
+                username, len(page.body),
             )
         else:
             logger.info(
                 "Public page for @{} answered via the home fetcher ({} bytes)",
-                username, len(body),
+                username, len(page.body),
             )
         return result

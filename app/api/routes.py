@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import secrets
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -11,6 +13,7 @@ from telegram import Update
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
+from app.monitor import home_fetch
 from app.monitor.health import fetch_health
 from app.monitor.service import MonitorService
 from app.utils.logger import logger
@@ -131,6 +134,76 @@ async def trigger_sweep(
     logger.info("Sweep triggered via HTTP")
     asyncio.create_task(scheduler.trigger_now())
     return {"ok": True}
+
+
+# ---------- Home fetcher (tools/home_fetcher) ----------
+#
+# A device on a connection Instagram trusts — the owner's phone or PC — polls
+# here for profile pages to fetch and posts Instagram's answer back. Pull, not
+# push: the home line is behind carrier-grade NAT and an unrooted phone can
+# neither forward a port nor run a Tailscale Funnel, so nothing dials in.
+
+def _check_home_token(token: Optional[str]) -> None:
+    expected = settings.home_fetch_token
+    if not expected:
+        raise HTTPException(
+            status_code=404, detail="home fetcher disabled (HOME_FETCH_TOKEN not set)"
+        )
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token"
+        )
+
+
+@router.get("/home-fetch/jobs")
+async def home_fetch_next_job(
+    wait: float = home_fetch.POLL_WAIT_MAX_SECONDS,
+    x_watcher_token: Optional[str] = Header(default=None),
+    x_watcher_worker: Optional[str] = Header(default=None),
+) -> dict:
+    """Long-poll for the next page to fetch. Answers {"job": null} after
+    `wait` seconds (capped) when there is nothing to do; the worker asks
+    again at once. Each poll marks the worker as connected."""
+    _check_home_token(x_watcher_token)
+    job = await home_fetch.broker.next_job(
+        wait=wait, worker=(x_watcher_worker or "unnamed")[:40]
+    )
+    if job is None:
+        return {"job": None}
+    return {"job": {"id": job.id, "username": job.username}}
+
+
+@router.post("/home-fetch/jobs/{job_id}")
+async def home_fetch_deliver(
+    job_id: str,
+    request: Request,
+    x_watcher_token: Optional[str] = Header(default=None),
+    x_ig_status: Optional[str] = Header(default=None),
+    x_ig_final_url: Optional[str] = Header(default=None),
+) -> dict:
+    """Instagram's answer for one job: its status in X-IG-Status, the HTML as
+    the body (gzip-compressed when Content-Encoding says so). {"ok": false}
+    means the check that asked has already given up — nothing to do."""
+    _check_home_token(x_watcher_token)
+    raw = await request.body()
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except (OSError, EOFError):
+            raise HTTPException(status_code=400, detail="body is not valid gzip")
+    try:
+        ig_status = int(x_ig_status or 0)
+    except ValueError:
+        ig_status = 0
+    accepted = home_fetch.broker.deliver(
+        job_id,
+        home_fetch.PageResult(
+            status=ig_status,
+            body=raw.decode("utf-8", "replace"),
+            final_url=x_ig_final_url or "",
+        ),
+    )
+    return {"ok": accepted}
 
 
 @router.post(settings.telegram_webhook_path)

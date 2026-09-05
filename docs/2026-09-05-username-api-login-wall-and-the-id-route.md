@@ -119,14 +119,18 @@ route stays deployed so the question is one request away.
 
 The free way around it shipped the same evening: **the owner's own PC as a
 fourth door.** The owner's curl from home — through Proton VPN, no less —
-got the page every time, so `tools/home_fetcher` runs there, fetches only
-`instagram.com/<username>/` with Chrome impersonation, and is exposed with a
-free Tailscale Funnel URL. The bot asks it after its own page request is
-refused, parses the same payload, and books the API door by what the API
-itself said (`api_status`) so a page answer never re-opens it. Proton VPN
-offers no standalone SOCKS5 proxy, and a Tailscale exit node inside the
-Render container was the other free option — rejected for needing container
-surgery and for coupling the whole bot to the PC being on. With the fetch
-service, a PC that is off costs one quick failure and an id-only sweep. Until then the bot says what it knows and
+got the page every time — and so does Python's standard library with Chrome's
+navigation headers, which turned out to be what Instagram reads (the TLS
+fingerprint is not). So `tools/home_fetcher` runs on an old Android phone in
+Termux (or a PC) and **polls the bot** for pages to fetch, posting Instagram's
+answer back: nothing dials into the home network, which sits behind
+carrier-grade NAT (a 10.x WAN address) where an unrooted phone can run neither
+a port forward nor a Tailscale Funnel. The bot asks it after its own page
+request is refused, parses the same payload, and books the API door by what
+the API itself said (`api_status`) so a page answer never re-opens it. Proton
+VPN offers no standalone SOCKS5 proxy; a Tailscale exit node inside the Render
+container was rejected for needing container surgery and coupling the whole
+bot to the device being on. A phone that is off costs one quick "not
+connected" and an id-only sweep. Until then the bot says what it knows and
 dates what it doesn't — per the standing rule: an honest gap over a stale
 number.

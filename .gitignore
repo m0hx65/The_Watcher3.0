@@ -38,3 +38,4 @@ htmlcov/
 
 # The home page fetcher's shared secret (tools/home_fetcher)
 tools/home_fetcher/home_fetcher.token
+tools/home_fetcher/home_fetcher.env
