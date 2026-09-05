@@ -542,6 +542,60 @@ async def test_a_door_found_shut_last_sweep_is_knocked_once() -> None:
     expect("and the DB forgets the verdict", not await _door_closed_in_db())
 
 
+async def test_a_sweep_hands_the_phone_the_whole_list_up_front() -> None:
+    """The measured failure: each check waited 30 s on its own page and timed
+    out while the phone's answer arrived seconds later. Now the sweep hands
+    the home fetcher every username at the start (door known shut) or at the
+    first refusal (door not yet known), and checks use pages already in hand."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    names = [f"pre{i}" for i in range(4)]
+    try:
+        # Door known shut: prefetched before the first check.
+        fake = FakeBroker({}, connected=True)
+        home_fetch.broker = fake
+        await _sweep_with(
+            lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+            lambda i: _answered(i, f"pre{int(i) - 1000}"),
+            names, door_known_closed=True,
+        )
+        expect("every username was handed over up front",
+               sorted(fake.prefetched) == sorted(names), repr(fake.prefetched))
+        expect("and only once", len(fake.prefetched) == 4, repr(fake.prefetched))
+
+        # Door not yet known: the first refusal triggers it.
+        fake = FakeBroker({}, connected=True)
+        home_fetch.broker = fake
+        late = [f"late{i}" for i in range(3)]
+        await _sweep_with(
+            lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+            lambda i: _answered(i, f"late{int(i) - 1000}"),
+            late, door_known_closed=False,
+        )
+        expect("the first refusal hands over the whole list",
+               sorted(fake.prefetched) == sorted(late), repr(fake.prefetched))
+        expect("the verdict was written during the sweep", await _door_closed_in_db())
+
+        # A page the phone already delivered is used by the real client without
+        # asking again — even if the phone has since dropped off.
+        fake = FakeBroker({}, connected=False)
+        fake.cache["pageuser"] = home_fetch.PageResult(200, PAGE, "https://www.instagram.com/pageuser/")
+        home_fetch.broker = fake
+        session = _MockSession(lambda url, p: _MockResponse(401 if "workers.dev" in url else 429, {}, text=""))
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("pageuser", auth_attempts=1, api=False, cached_page_ok=True)
+            fresh = await client.fetch_profile("pageuser", auth_attempts=1, api=False, cached_page_ok=False)
+        expect("a sweep's check reads the prefetched page from the cache",
+               result.success and result.source == "public_page"
+               and (result.parsed or {}).get("following_count") == 567, repr(result))
+        expect("without asking the phone", fake.asked == [], repr(fake.asked))
+        expect("a manual check wants a fresh page, and with the phone off it gets none",
+               not fresh.success and fresh.http_status == 401, repr(fresh))
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
 async def test_a_manual_check_skips_a_door_known_to_be_shut() -> None:
     """Someone is waiting on a Recheck: no ten-second knocks on a door the
     last sweep found shut. The id route and the pages still run."""
@@ -662,11 +716,22 @@ class FakeBroker:
         self.pages = pages
         self.connected = connected
         self.asked: list[str] = []
+        self.prefetched: list[str] = []
+        self.cache: dict = {}
 
     def describe(self) -> str:
         return "connected (worker fake)" if self.connected else "not connected (fake is off)"
 
-    async def request_page(self, username: str, *, timeout: float = 30.0):
+    def cached(self, username: str):
+        return self.cache.get(username)
+
+    def prefetch(self, usernames: list[str]) -> int:
+        if not self.connected:
+            return 0
+        self.prefetched.extend(usernames)
+        return len(usernames)
+
+    async def request_page(self, username: str, *, timeout: float = 30.0, fresh: bool = False):
         self.asked.append(username)
         return self.pages.get(username)
 
@@ -834,6 +899,7 @@ async def main() -> int:
     await test_retry_rounds_re_ask_by_id_when_the_door_is_shut()
     test_retriable_looks_at_both_routes()
     await test_a_door_found_shut_last_sweep_is_knocked_once()
+    await test_a_sweep_hands_the_phone_the_whole_list_up_front()
     await test_a_manual_check_skips_a_door_known_to_be_shut()
     await test_a_shut_gate_is_counted_honestly()
 

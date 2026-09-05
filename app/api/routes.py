@@ -169,15 +169,18 @@ async def _send_alert(request: Request, text: str) -> None:
 async def home_fetch_next_job(
     request: Request,
     wait: float = home_fetch.POLL_WAIT_MAX_SECONDS,
+    batch: int = 1,
     x_watcher_token: Optional[str] = Header(default=None),
     x_watcher_worker: Optional[str] = Header(default=None),
     x_watcher_battery: Optional[str] = Header(default=None),
     x_watcher_charging: Optional[str] = Header(default=None),
 ) -> dict:
-    """Long-poll for the next page to fetch. Answers {"job": null} after
+    """Long-poll for the next pages to fetch — up to `batch` of them (capped),
+    waiting only for the first. Answers {"job": null, "jobs": []} after
     `wait` seconds (capped) when there is nothing to do; the worker asks
     again at once. Each poll marks the worker as connected and, when the
-    device reports its battery, may raise the low-battery alert."""
+    device reports its battery, may raise the low-battery alert. `job` is
+    the first of `jobs`, kept for workers that take one at a time."""
     _check_home_token(x_watcher_token)
     battery: Optional[int] = None
     if x_watcher_battery is not None:
@@ -195,12 +198,12 @@ async def home_fetch_next_job(
     )
     if alert:
         asyncio.create_task(_send_alert(request, alert))
-    job = await home_fetch.broker.next_job(
-        wait=wait, worker=(x_watcher_worker or "unnamed")[:40]
+    jobs = await home_fetch.broker.next_job(
+        wait=wait, worker=(x_watcher_worker or "unnamed")[:40],
+        max_jobs=batch,
     )
-    if job is None:
-        return {"job": None}
-    return {"job": {"id": job.id, "username": job.username}}
+    handed = [{"id": job.id, "username": job.username} for job in jobs]
+    return {"job": handed[0] if handed else None, "jobs": handed}
 
 
 @router.post("/home-fetch/jobs/{job_id}")

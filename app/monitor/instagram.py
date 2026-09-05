@@ -637,12 +637,16 @@ class InstagramClient:
         auth_attempts: Optional[int] = None,
         allow_fallback: bool = True,
         api: bool = True,
+        cached_page_ok: bool = False,
     ) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff.
 
         `api=False` skips the username API and goes straight to the page doors
         — a sweep sets it once that API has refused every lookup so far, so the
         remaining accounts don't each spend a blocked Worker call on it.
+        `cached_page_ok` lets the home door serve a page the phone already
+        delivered for this sweep (prefetched); manual checks leave it False
+        and get a fresh page.
 
         `auth_attempts` caps how many times a 401/403 is re-asked THROUGH THE
         WORKER, where one call is already 6 upstream attempts. Sweeps pass 1
@@ -808,7 +812,9 @@ class InstagramClient:
         timings: dict[str, float] = {"api": time.monotonic() - started}
         if allow_fallback and last_status in (401, 403):
             page_started = time.monotonic()
-            fallback = await self.fetch_profile_via_public_page(username)
+            fallback = await self.fetch_profile_via_public_page(
+                username, cached_page_ok=cached_page_ok
+            )
             timings["page"] = time.monotonic() - page_started
             if fallback is not None:
                 fallback.api_status = api_status
@@ -827,7 +833,7 @@ class InstagramClient:
         )
 
     async def fetch_profile_via_public_page(
-        self, username: str
+        self, username: str, *, cached_page_ok: bool = False
     ) -> Optional[ProfileFetchResult]:
         """Profile data from the page's embedded Relay payload, or None.
 
@@ -846,7 +852,9 @@ class InstagramClient:
         Returns None when the page is blocked or carries no payload, leaving the
         caller's original error intact. Never returns zeros for missing data.
         """
-        outcome = await self.probe_public_page(username)
+        outcome = await self.probe_public_page(
+            username, cached_page_ok=cached_page_ok
+        )
         parsed = outcome.get("parsed")
         if parsed is None:
             if outcome.get("status") == 404:
@@ -885,6 +893,7 @@ class InstagramClient:
         *,
         allow_home: bool = True,
         force_direct: bool = False,
+        cached_page_ok: bool = False,
     ) -> dict[str, Any]:
         """Fetch the public page and report what came back, in detail.
 
@@ -918,7 +927,7 @@ class InstagramClient:
         if not settings.home_fetch_token:
             return result
         clock = time.monotonic()
-        home = await self.probe_home_page(username)
+        home = await self.probe_home_page(username, cached_ok=cached_page_ok)
         timings["home"] = time.monotonic() - clock
         home["timings"] = timings
         if home.get("parsed") is not None or home.get("status") == 404:
@@ -1010,15 +1019,21 @@ class InstagramClient:
             )
         return result
 
-    async def probe_home_page(self, username: str) -> dict[str, Any]:
+    async def probe_home_page(
+        self, username: str, *, cached_ok: bool = False
+    ) -> dict[str, Any]:
         """The public page, fetched by the home fetcher (tools/home_fetcher).
 
         The worker on the owner's phone or PC polls this bot for jobs; the
-        broker hands it this username and waits for the HTML. Instagram's own
-        status comes back untouched, so a 404 here is Instagram's 404 and a
-        429 is Instagram rate-limiting the home connection — distinguishable
-        from the worker not being connected (the phone is off), which is
-        expected and costs the check nothing but this one quick answer.
+        broker hands it this username and keeps the answer. With `cached_ok`
+        (sweeps) a page the phone already delivered for this sweep is used at
+        once — the sweep asked for the whole list up front, so this is the
+        common case; a check only waits when its page is still on its way.
+        Instagram's own status comes back untouched, so a 404 here is
+        Instagram's 404 and a 429 is Instagram rate-limiting the home
+        connection — distinguishable from the worker not being connected (the
+        phone is off), which is expected and costs the check nothing but this
+        one quick answer.
         """
         username = username.strip().lstrip("@")
         result: dict[str, Any] = {
@@ -1029,19 +1044,23 @@ class InstagramClient:
             result["error"] = "HOME_FETCH_TOKEN not set"
             return result
         broker = home_fetch.broker
-        if not broker.connected:
-            result["error"] = f"home fetcher {broker.describe()}"
-            logger.info(
-                "Home fetcher {} — skipping the home door for @{}",
-                broker.describe(), username,
-            )
-            return result
-        page = await broker.request_page(
-            username, timeout=float(settings.request_timeout) + 10.0
-        )
+        page = broker.cached(username) if cached_ok else None
         if page is None:
-            result["error"] = "home fetcher took the job but did not answer in time"
-            return result
+            if not broker.connected:
+                result["error"] = f"home fetcher {broker.describe()}"
+                logger.info(
+                    "Home fetcher {} — skipping the home door for @{}",
+                    broker.describe(), username,
+                )
+                return result
+            page = await broker.request_page(
+                username,
+                timeout=float(settings.request_timeout) + 10.0,
+                fresh=not cached_ok,
+            )
+            if page is None:
+                result["error"] = "home fetcher took the job but did not answer in time"
+                return result
 
         result["status"] = page.status
         result["bytes"] = len(page.body)

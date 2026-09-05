@@ -559,7 +559,16 @@ door does, so the reading is a normal `source="public_page"` partial. Order on
 the username side: the API (unless skipped for the sweep), this host's page
 request, the home fetcher. A worker that has not polled for 90 s is "not
 connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
-page from Instagram, ~150 KB compressed to the bot.
+page from Instagram, a few KB (the extracted payload) back to the bot.
+
+The sweep never waits on the phone by design. It hands the broker its whole
+list up front (`broker.prefetch`) — at sweep start when the username API is
+known shut, else at the first refusal — and the phone works through it, a
+batch per poll (`?batch=8`), uploading in the background, while the sweep
+does its id probes. Each check then finds its page in the broker's cache
+(`cached_page_ok`, fresh for 15 min; manual checks ask fresh) and only waits
+when it is still on its way. Every delivery logs the pickup and delivery
+latency, so a slow link shows up as numbers, not as a slow sweep.
 
 This host's own page request is bounded to 12 s and, after three refusals in
 a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so

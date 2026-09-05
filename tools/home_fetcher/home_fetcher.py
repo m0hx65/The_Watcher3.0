@@ -13,6 +13,14 @@ requests, so it works behind carrier-grade NAT, on a phone, without root, and
 without any tunnel. Nothing is stored, nothing else is fetched, no Instagram
 login is involved.
 
+Built for a slow link (a phone on a VPN):
+
+- one poll brings back a whole batch of jobs, not one;
+- only the page's few-kilobyte payload is sent back, not the 700 KB page;
+- uploads run in the background, so the next fetch never waits on the last
+  upload, and the bot never waits on the phone — it hands the whole sweep's
+  list over up front and picks each page up when it needs it.
+
 Setup — two values, in a file named ``home_fetcher.env`` next to this script
 (or as environment variables):
 
@@ -41,9 +49,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -62,11 +72,18 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 # caps this at 25 s; keep the read timeout comfortably above it.
 POLL_WAIT_SECONDS = 25
 POLL_READ_TIMEOUT = 45
+# How many jobs to ask for per poll (the bot caps this too).
+POLL_BATCH = 8
 IG_TIMEOUT_SECONDS = 25
 # Be a polite neighbour to your own IP: at most one Instagram request every
-# this many seconds, whatever the bot asks for. The bot already paces itself
-# (about one account every 2-3 s), so this only bites on back-to-back retries.
+# this many seconds, whatever the bot asks for.
 MIN_GAP_SECONDS = 1.0
+# Uploads run here so a slow link never holds up the next fetch or poll.
+UPLOAD_THREADS = 2
+UPLOAD_TIMEOUT = 90
+# When the page carries no payload (login wall, 404, block page) the bot only
+# needs enough of it to say what it was.
+NO_PAYLOAD_BODY_LIMIT = 64 * 1024
 
 _session = (
     curl_requests.Session(impersonate="chrome120", timeout=IG_TIMEOUT_SECONDS)
@@ -98,11 +115,13 @@ _NAV_HEADERS = {
 }
 
 _last_request_at = 0.0
+_log_lock = threading.Lock()
 
 
 def _log(message: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{stamp} | {message}", flush=True)
+    with _log_lock:
+        print(f"{stamp} | {message}", flush=True)
 
 
 def load_settings() -> tuple[str, str, str]:
@@ -163,18 +182,64 @@ def _fetch_with_stdlib(url: str) -> tuple[int, bytes, str]:
     return status, body, final_url
 
 
+# ----------------------------------------------------------- the payload
+
+_PAYLOAD_KEY = '"xig_user_by_username":'
+_OBJECT_LIMIT = 200_000
+
+
+def _extract_object(text: str, start: int) -> Optional[str]:
+    """The JSON object beginning at `start`, by brace matching — the same
+    walk the bot's parser does (app/monitor/public_page.py), tracking string
+    and escape state, bounded by _OBJECT_LIMIT."""
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, min(len(text), start + _OBJECT_LIMIT)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return None
+
+
+def extract_payload(body: bytes) -> Optional[bytes]:
+    """The profile payload out of the page, wrapped so the bot's parser reads
+    it exactly as it reads the page — a few KB instead of 700 KB. None when
+    the page carries none (login wall, 404, block page)."""
+    text = body.decode("utf-8", "replace")
+    at = text.find(_PAYLOAD_KEY)
+    if at < 0:
+        return None
+    raw = _extract_object(text, at + len(_PAYLOAD_KEY))
+    if raw is None:
+        return None
+    return ('{"data":{' + _PAYLOAD_KEY + raw + "}}").encode("utf-8")
+
+
 # ------------------------------------------------------------- the device
 
 def read_battery() -> tuple[Optional[int], Optional[bool]]:
     """Battery percent and whether it is charging, or (None, None) when the
     device does not say. Android exposes both in sysfs, readable without root
-    on most phones; Termux:API's `termux-battery-status` is the fallback. A
-    desktop PC reports nothing, which is fine. The bot turns a low reading
-    into a Telegram alert, so a phone that fell off its charger is noticed
-    before it dies and the page door closes."""
-    # sysfs first. On many phones (MIUI among them) SELinux refuses Termux
-    # even a stat() here — Python then raises PermissionError from exists(),
-    # so every touch is guarded and any refusal means "ask elsewhere".
+    on some phones; Termux:API's `termux-battery-status` is the supported
+    route (MIUI forbids sysfs). A desktop PC reports nothing, which is fine.
+    The bot turns a low reading into a Telegram alert."""
     base = Path("/sys/class/power_supply")
     for name in ("battery", "Battery", "BAT0", "BAT1"):
         try:
@@ -188,8 +253,6 @@ def read_battery() -> tuple[Optional[int], Optional[bool]]:
         except (OSError, ValueError):
             pass
         return percent, charging
-    # Termux:API (the add-on app plus `pkg install termux-api`) exposes the
-    # battery to Termux the supported way.
     try:
         if shutil.which("termux-battery-status"):
             out = subprocess.run(
@@ -217,7 +280,7 @@ def _device_headers() -> dict[str, str]:
 # --------------------------------------------------------------- the bot
 
 def _bot_request(method: str, url: str, token: str, worker: str, *,
-                 body: bytes = b"", headers: dict | None = None,
+                 body: bytes = b"", headers: Optional[dict] = None,
                  timeout: float = POLL_READ_TIMEOUT) -> tuple[int, bytes]:
     request = urllib.request.Request(url, data=body if method == "POST" else None, method=method)
     request.add_header("X-Watcher-Token", token)
@@ -231,18 +294,53 @@ def _bot_request(method: str, url: str, token: str, worker: str, *,
         return error.code, error.read()
 
 
+def deliver(url: str, token: str, worker: str, job_id: str, username: str,
+            ig_status: int, body: bytes, final_url: str, fetch_seconds: float) -> None:
+    """Upload one answer (runs in a background thread). The payload alone
+    when the page has one; otherwise the head of whatever came back, so the
+    bot can log what it was."""
+    payload = extract_payload(body) if ig_status == 200 else None
+    data = payload if payload is not None else body[:NO_PAYLOAD_BODY_LIMIT]
+    started = time.monotonic()
+    try:
+        code, _ = _bot_request(
+            "POST", f"{url}/home-fetch/jobs/{job_id}", token, worker,
+            body=gzip.compress(data, compresslevel=6),
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Encoding": "gzip",
+                "X-IG-Status": str(ig_status),
+                "X-IG-Final-Url": final_url,
+                "X-IG-Payload": "1" if payload is not None else "0",
+            },
+            timeout=UPLOAD_TIMEOUT,
+        )
+    except (urllib.error.URLError, socket.timeout, OSError) as exc:
+        _log(f"@{username}: could not deliver to the bot ({exc})")
+        return
+    _log(
+        f"@{username}: Instagram HTTP {ig_status} in {fetch_seconds:.1f}s, "
+        f"payload={'yes' if payload is not None else 'no'}, "
+        f"delivered {len(data) / 1024:.0f} KB in {time.monotonic() - started:.1f}s"
+        + ("" if code == 200 else f" (bot answered HTTP {code})")
+    )
+
+
 def run(url: str, token: str, worker: str) -> int:
     _log(f"polling {url} as '{worker}'  (engine: {ENGINE})")
     percent, charging = read_battery()
     if percent is not None:
         state = "charging" if charging else "not charging" if charging is not None else "unknown"
         _log(f"battery {percent}% ({state}) - reported to the bot with every poll")
+    uploads = ThreadPoolExecutor(max_workers=UPLOAD_THREADS, thread_name_prefix="upload")
     backoff = 5.0
     while True:
+        poll_started = time.monotonic()
         try:
             status, raw = _bot_request(
-                "GET", f"{url}/home-fetch/jobs?wait={POLL_WAIT_SECONDS}", token, worker,
-                headers=_device_headers(),
+                "GET",
+                f"{url}/home-fetch/jobs?wait={POLL_WAIT_SECONDS}&batch={POLL_BATCH}",
+                token, worker, headers=_device_headers(),
             )
         except (urllib.error.URLError, socket.timeout, OSError) as exc:
             _log(f"bot unreachable ({exc}) - retrying in {backoff:.0f}s")
@@ -264,45 +362,32 @@ def run(url: str, token: str, worker: str) -> int:
             continue
         backoff = 5.0
         try:
-            job = json.loads(raw.decode("utf-8")).get("job")
+            data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            job = None
-        if not job:
+            data = {}
+        jobs = data.get("jobs")
+        if not jobs and data.get("job"):
+            jobs = [data["job"]]  # an older bot build hands out one at a time
+        if not jobs:
             continue  # nothing to do this round — poll again at once
 
-        username = str(job.get("username", "")).lstrip("@")
-        job_id = str(job.get("id", ""))
-        if not USERNAME_RE.match(username) or not job_id:
-            _log(f"ignoring a malformed job: {job!r}")
-            continue
-
-        started = time.monotonic()
-        try:
-            ig_status, body, final_url = fetch_profile_page(username)
-        except Exception as exc:  # network failure on our side
-            _log(f"@{username}: Instagram request failed - {exc!r}")
-            ig_status, body, final_url = 0, b"", ""
-        has_payload = b"xig_user_by_username" in body
-        _log(
-            f"@{username}: Instagram answered HTTP {ig_status}, {len(body)} bytes, "
-            f"payload={'yes' if has_payload else 'no'} ({time.monotonic() - started:.1f}s)"
-        )
-        try:
-            code, _ = _bot_request(
-                "POST", f"{url}/home-fetch/jobs/{job_id}", token, worker,
-                body=gzip.compress(body),
-                headers={
-                    "Content-Type": "text/html; charset=utf-8",
-                    "Content-Encoding": "gzip",
-                    "X-IG-Status": str(ig_status),
-                    "X-IG-Final-Url": final_url,
-                },
-                timeout=60,
+        _log(f"{len(jobs)} job(s) received after a {time.monotonic() - poll_started:.1f}s poll")
+        for job in jobs:
+            username = str(job.get("username", "")).lstrip("@")
+            job_id = str(job.get("id", ""))
+            if not USERNAME_RE.match(username) or not job_id:
+                _log(f"ignoring a malformed job: {job!r}")
+                continue
+            started = time.monotonic()
+            try:
+                ig_status, body, final_url = fetch_profile_page(username)
+            except Exception as exc:  # network failure on our side
+                _log(f"@{username}: Instagram request failed - {exc!r}")
+                ig_status, body, final_url = 0, b"", ""
+            uploads.submit(
+                deliver, url, token, worker, job_id, username,
+                ig_status, body, final_url, time.monotonic() - started,
             )
-            if code != 200:
-                _log(f"@{username}: the bot answered HTTP {code} to the delivery")
-        except (urllib.error.URLError, socket.timeout, OSError) as exc:
-            _log(f"@{username}: could not deliver to the bot ({exc})")
 
 
 def main() -> int:

@@ -72,8 +72,9 @@ async def test_round_trip() -> None:
     broker = HomeFetchBroker()
 
     async def worker() -> None:
-        job = await broker.next_job(wait=5.0, worker="xiaomi")
-        assert job is not None and job.username == "target"
+        jobs = await broker.next_job(wait=5.0, worker="xiaomi")
+        assert jobs and jobs[0].username == "target"
+        job = jobs[0]
         await asyncio.sleep(0.05)  # "fetching"
         ok = broker.deliver(job.id, PageResult(200, "<html>page</html>", "https://www.instagram.com/target/"))
         expect("the delivery is accepted", ok)
@@ -115,11 +116,65 @@ async def test_an_abandoned_job_is_not_handed_out() -> None:
     # A worker polls, then a check asks and gives up before the worker polls
     # again; the next poll must not receive the stale job.
     first = await broker.next_job(wait=0.05, worker="phone")
-    expect("idle poll returns nothing", first is None)
+    expect("idle poll returns nothing", first == [])
     result = await broker.request_page("gone", timeout=0.05)
     expect("the check gave up", result is None)
     stale = await broker.next_job(wait=0.2, worker="phone")
-    expect("the abandoned job is dropped, not handed out", stale is None, repr(stale))
+    expect("the job is still handed out — its answer serves the retry",
+           len(stale) == 1 and stale[0].username == "gone", repr(stale))
+    expect("and a delivery for it is kept", broker.deliver(stale[0].id, PageResult(200, "late")))
+    expect("in the cache", broker.cached("gone") is not None)
+
+
+async def test_prefetch_batches_and_caches() -> None:
+    """The sweep hands over its whole list; one poll takes a batch; answers
+    are kept for the checks that come by later — and a manual check that
+    insists on a fresh page gets one."""
+    broker = HomeFetchBroker()
+    expect("nothing is queued for a worker that is not there",
+           broker.prefetch(["a", "b"]) == 0)
+    await broker.next_job(wait=0.05, worker="xiaomi")  # now it is
+    expect("three usernames, three jobs", broker.prefetch(["a", "b", "c"]) == 3)
+    expect("re-asking queues nothing twice", broker.prefetch(["a", "b", "c"]) == 0)
+    expect("pending counts them", broker.pending == 3, repr(broker.pending))
+    jobs = await broker.next_job(wait=0.5, worker="xiaomi", max_jobs=8)
+    expect("one poll takes the whole batch", [j.username for j in jobs] == ["a", "b", "c"],
+           repr([j.username for j in jobs]))
+    for job in jobs:
+        expect(f"delivery for {job.username} is kept although nobody waits",
+               broker.deliver(job.id, PageResult(200, f"<page {job.username}>")))
+    expect("nothing pending afterwards", broker.pending == 0)
+    started = time.monotonic()
+    hit = await broker.request_page("a", timeout=5.0)
+    expect("a check finds its page at once", hit is not None and hit.body == "<page a>"
+           and time.monotonic() - started < 0.1, repr(hit))
+    expect("cached() sees it too", broker.cached("b") is not None)
+
+    # A manual check insists on a fresh page: a new job, joined by the check.
+    async def worker() -> None:
+        jobs = await broker.next_job(wait=5.0, worker="xiaomi", max_jobs=8)
+        assert len(jobs) == 1 and jobs[0].username == "a", repr(jobs)
+        broker.deliver(jobs[0].id, PageResult(200, "<fresh a>"))
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0.02)
+    fresh = await broker.request_page("a", timeout=5.0, fresh=True)
+    await task
+    expect("fresh=True went to the phone", fresh is not None and fresh.body == "<fresh a>", repr(fresh))
+
+    # A check arriving while its prefetched job is in flight joins it.
+    broker.prefetch(["d"])
+
+    async def slow_worker() -> None:
+        jobs = await broker.next_job(wait=5.0, worker="xiaomi", max_jobs=8)
+        await asyncio.sleep(0.05)
+        broker.deliver(jobs[0].id, PageResult(200, "<page d>"))
+
+    task = asyncio.create_task(slow_worker())
+    joined = await broker.request_page("d", timeout=5.0)
+    await task
+    expect("a check joins the prefetch in flight", joined is not None and joined.body == "<page d>",
+           repr(joined))
 
 
 def test_low_battery_alerts_once_and_rearms() -> None:
@@ -178,16 +233,17 @@ async def test_endpoints() -> None:
 
             r = await client.get("/home-fetch/jobs?wait=0.1",
                                  headers={"X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi"})
-            expect("idle poll -> no job", r.status_code == 200 and r.json() == {"job": None}, r.text)
+            expect("idle poll -> no job", r.status_code == 200 and r.json() == {"job": None, "jobs": []}, r.text)
             expect("the poll registered the worker", home_fetch.broker.connected,
                    home_fetch.broker.describe())
 
             # Full round trip through HTTP: a check asks while the worker polls.
             async def worker() -> None:
-                poll = await client.get("/home-fetch/jobs?wait=5",
+                poll = await client.get("/home-fetch/jobs?wait=5&batch=8",
                                         headers={"X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi"})
                 job = poll.json()["job"]
                 assert job and job["username"] == "target", poll.text
+                expect("jobs lists the batch", poll.json()["jobs"] == [job], poll.text)
                 delivery = await client.post(
                     f"/home-fetch/jobs/{job['id']}",
                     content=gzip.compress(b"<html>from the phone</html>"),
@@ -249,6 +305,7 @@ async def main() -> int:
     await test_round_trip()
     await test_a_silent_worker_costs_only_the_timeout()
     await test_an_abandoned_job_is_not_handed_out()
+    await test_prefetch_batches_and_caches()
     test_low_battery_alerts_once_and_rearms()
     await test_endpoints()
     print()

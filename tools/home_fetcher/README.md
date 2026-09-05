@@ -15,10 +15,16 @@ Your home line, your VPN, your phone's data plan: all get the page every time.
 ## How it works
 
 The worker **polls the bot** for work over ordinary outbound HTTPS: it asks
-`GET /home-fetch/jobs`, is handed a username, fetches
-`instagram.com/<username>/` from where it sits, and posts Instagram's answer
-back to `POST /home-fetch/jobs/<id>`. The bot parses the same payload it parses
-from its own page reading and stores it as a normal page reading.
+`GET /home-fetch/jobs`, is handed a batch of usernames, fetches
+`instagram.com/<username>/` for each from where it sits, and posts Instagram's
+answer back to `POST /home-fetch/jobs/<id>`. The bot parses the same payload it
+parses from its own page reading and stores it as a normal page reading.
+
+It is built for a slow link (a phone on a VPN): one poll brings a whole batch;
+only the page's few-kilobyte payload goes back, not the 700 KB page; uploads
+run in the background so the next fetch never waits on the last upload; and
+the bot never waits on the phone — a sweep hands it the whole list up front
+and each check picks up its page when it gets there.
 
 Nothing dials into your network, so it works behind carrier-grade NAT (your
 router's 10.x WAN address), on a phone, without root, and without any tunnel.
@@ -83,9 +89,9 @@ the bot uses it whenever it happens to be polling during a sweep.
 
 ## What to expect
 
-- Each page is about 700 KB from Instagram and about 150 KB compressed on
-  its way to the bot. For 17 accounts at three sweeps a day that is roughly
-  1.1 GB a month downloaded on the phone's connection.
+- Each page is about 700 KB from Instagram and a few KB on its way back to
+  the bot (just the payload). For 17 accounts at three sweeps a day that is
+  roughly 1.1 GB a month downloaded on the phone's connection.
 - The worker paces itself to one Instagram request per second, on top of
   the bot's own pacing (about one account every 2-3 seconds).
 - Your VPN, if any, is fine: the request goes out the same way your browser's
@@ -95,5 +101,5 @@ the bot uses it whenever it happens to be polling during a sweep.
 
 | Call | Auth | Meaning |
 |---|---|---|
-| `GET /home-fetch/jobs?wait=25` | `X-Watcher-Token`, `X-Watcher-Worker` | Long-poll: `{"job": {"id", "username"}}` or `{"job": null}` |
-| `POST /home-fetch/jobs/<id>` | same, plus `X-IG-Status`, `X-IG-Final-Url`, gzip body | Instagram's status and HTML, as received |
+| `GET /home-fetch/jobs?wait=25&batch=8` | `X-Watcher-Token`, `X-Watcher-Worker`, `X-Watcher-Battery`, `X-Watcher-Charging` | Long-poll: `{"jobs": [{"id", "username"}, …]}` (`job` = the first, for old workers) |
+| `POST /home-fetch/jobs/<id>` | same, plus `X-IG-Status`, `X-IG-Final-Url`, `X-IG-Payload`, gzip body | Instagram's status and the page's payload (or the head of the page when it has none) |

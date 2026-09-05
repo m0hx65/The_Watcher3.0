@@ -29,6 +29,7 @@ from app.monitor.change_detector import (
     detect_changes,
     pic_fingerprints_differ,
 )
+from app.monitor import home_fetch
 from app.monitor.instagram import (
     IdProbe,
     InstagramClient,
@@ -165,6 +166,12 @@ class _SweepThrottle:
             breaker_threshold if username_door_threshold is None
             else username_door_threshold
         )
+        # Sweep-wide bookkeeping the per-account check needs: the whole list
+        # (so the first refusal can hand it to the home fetcher up front), and
+        # two once-per-sweep latches.
+        self.sweep_usernames: list[str] = []
+        self.pages_prefetched = False
+        self.door_recorded = False
         self._cooldown = max(0.0, cooldown)  # 0 = open immediately, never pause
         self._max_pauses = max(0, max_pauses)
         self._extra = 0.0
@@ -551,8 +558,12 @@ class MonitorService:
         the knock answers.
         """
         if not self._username_api_door_loaded:
-            async with get_session() as session:
-                raw = await crud.get_setting(session, _USERNAME_API_DOOR_KEY)
+            try:
+                async with get_session() as session:
+                    raw = await crud.get_setting(session, _USERNAME_API_DOOR_KEY)
+            except Exception as exc:  # a DB hiccup must not stop a check
+                logger.warning("Could not read the username API verdict: {}", exc)
+                raw = None
             self._username_api_closed_at = _parse_utc(raw)
             self._username_api_door_loaded = True
         closed_at = self._username_api_closed_at
@@ -568,17 +579,22 @@ class MonitorService:
         timestamp) or answering (forgets it). A sweep that neither closed the
         door nor got an answer from it — nothing asked — leaves it as it was."""
         self._username_api_door_loaded = True
-        if closed:
-            now = datetime.now(timezone.utc)
-            self._username_api_closed_at = now
-            async with get_session() as session:
-                await crud.set_setting(session, _USERNAME_API_DOOR_KEY, now.isoformat())
-            return
-        if answered and self._username_api_closed_at is not None:
-            self._username_api_closed_at = None
-            async with get_session() as session:
-                await crud.delete_setting(session, _USERNAME_API_DOOR_KEY)
-            logger.info("The username API answered again — the door is open")
+        try:
+            if closed:
+                now = datetime.now(timezone.utc)
+                self._username_api_closed_at = now
+                async with get_session() as session:
+                    await crud.set_setting(
+                        session, _USERNAME_API_DOOR_KEY, now.isoformat()
+                    )
+                return
+            if answered and self._username_api_closed_at is not None:
+                self._username_api_closed_at = None
+                async with get_session() as session:
+                    await crud.delete_setting(session, _USERNAME_API_DOOR_KEY)
+                logger.info("The username API answered again — the door is open")
+        except Exception as exc:  # the in-memory verdict still stands
+            logger.warning("Could not persist the username API verdict: {}", exc)
 
     async def check_username(
         self, username: str, *, notify_unchanged: bool = False
@@ -797,6 +813,14 @@ class MonitorService:
             cooldown=settings.sweep_breaker_cooldown_seconds,
             username_door_threshold=1 if known_closed else None,
         )
+        throttle.sweep_usernames = [uname for _, uname in targets]
+        if known_closed:
+            # Every account will need its page: hand the phone the whole list
+            # now, so its round trips overlap the sweep instead of gating
+            # each check. (When the verdict is not yet known, the first
+            # refusal does the same — see _staggered_check.)
+            throttle.pages_prefetched = True
+            self._prefetch_pages(throttle.sweep_usernames)
         results = await asyncio.gather(
             *(
                 self._staggered_check(throttle, aid, uname)
@@ -1195,6 +1219,22 @@ class MonitorService:
         return text, len(rows), accounts
 
     @staticmethod
+    def _prefetch_pages(usernames: list[str]) -> None:
+        """Ask the home fetcher for every page a sweep will need, up front."""
+        if not settings.home_fetch_token:
+            return
+        queued = home_fetch.broker.prefetch(usernames)
+        if queued:
+            logger.info(
+                "Handed the home fetcher {} profile page(s) up front", queued
+            )
+        elif not home_fetch.broker.connected:
+            logger.info(
+                "Home fetcher {} — pages will be asked for per check",
+                home_fetch.broker.describe(),
+            )
+
+    @staticmethod
     def _breaker_skipped_result(username: str) -> dict:
         """A deferred account looks like a retriable failure, so the existing
         retry pass (sequential, after a cooldown) or the next sweep picks it up
@@ -1236,6 +1276,20 @@ class MonitorService:
                 id_status=result.get("id_status"),
                 api_status=result.get("api_status", _NOT_GIVEN),
             )
+            # The first refusal of the username API is the moment to hand the
+            # home fetcher the rest of the list: every account after this one
+            # will need its page.
+            if not throttle.pages_prefetched and (
+                throttle.username_door_closed
+                or result.get("api_status") in (401, 403)
+            ):
+                throttle.pages_prefetched = True
+                self._prefetch_pages(throttle.sweep_usernames)
+            # And the verdict is written the moment it is reached, not at the
+            # end of the sweep — a restart mid-sweep must not forget it.
+            if throttle.username_door_closed and not throttle.door_recorded:
+                throttle.door_recorded = True
+                await self._remember_username_api_door(closed=True, answered=False)
             return result
 
     @staticmethod
@@ -1418,6 +1472,9 @@ class MonitorService:
                 else settings.ig_sweep_auth_attempts
             ),
             api=not skip_username_api,
+            # A sweep may use the page the phone already delivered for it;
+            # someone waiting on a manual check gets a fresh one.
+            cached_page_ok=not thorough,
         )
         timings["username side"] = time.monotonic() - clock
         timings.update(fetch.timings)
