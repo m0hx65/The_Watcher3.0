@@ -739,6 +739,28 @@ def _guards_line() -> str:
     return f"🛡 Guards: {breaker} · {anomaly}"
 
 
+async def _door_line(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """One line on the username API's door, only while a sweep's verdict that
+    it refuses every lookup still stands — the reason checks are quick and
+    counts come from the page rather than the API."""
+    monitor = context.application.bot_data.get("monitor")
+    if monitor is None or not hasattr(monitor, "username_api_known_closed"):
+        return ""
+    try:
+        closed = await monitor.username_api_known_closed()
+    except Exception:  # pragma: no cover - a status line must never fail /status
+        return ""
+    if not closed:
+        return ""
+    since = getattr(monitor, "username_api_closed_since", None)
+    when = f" since {fmt_timestamp(since)}" if since else ""
+    return (
+        f"🚪 Profile API: refusing username lookups{when} — knocked once per "
+        "sweep, skipped on manual checks; the ID route and the profile page "
+        "carry the checks\n"
+    )
+
+
 async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     async with get_session() as session:
         stats = await crud.stats_summary(session)
@@ -798,6 +820,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     health_lines = render_health_lines(fetch_health.snapshot())
     health_block = ("\n\n" + "\n".join(health_lines)) if health_lines else ""
 
+    door_line = await _door_line(context)
     return (
         "<b>📊 Watcher status</b>\n\n"
         f"Accounts: <b>{stats['accounts_total']}</b> "
@@ -814,6 +837,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"{dark_line}"
         f"{stakeout_line}\n"
         f"{_route_line()}\n"
+        f"{door_line}"
         f"{_guards_line()}"
         f"{health_block}"
     )

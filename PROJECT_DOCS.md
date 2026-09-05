@@ -398,7 +398,10 @@ sweep itself is paced by `_SweepThrottle`:
   in a row with none answering closes THAT door for the rest of the sweep —
   the remaining accounts are checked by id only, and the retry rounds re-ask
   anything still blocked by id only — while the gate counts as shut only when
-  the id route answered nothing either. A check where either route answered is a success for
+  the id route answered nothing either. The verdict is remembered
+  (`username_api_closed_at` in app_settings, `USERNAME_API_RECHECK_SECONDS`):
+  the next sweep knocks once instead of THRESHOLD times, manual checks skip
+  the API, and one answering knock reopens it. A check where either route answered is a success for
   pacing.
 - **Retry rounds** (`SWEEP_RETRY_ROUNDS`, cooldown doubling 30s → 60s → 120s,
   bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a

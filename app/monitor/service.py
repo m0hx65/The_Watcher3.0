@@ -80,6 +80,11 @@ _SWEEP_BREAKER_MAX_PAUSES = 2
 # surfaced by _handle_failure), not a block to retry.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
 
+# app_settings key holding when a sweep last found the username API refusing
+# every lookup. Read by the next sweep (one knock instead of a threshold's
+# worth) and by manual checks (skip it), cleared when a knock answers 200.
+_USERNAME_API_DOOR_KEY = "username_api_closed_at"
+
 # `record(api_status=...)` default: "not given" is not the same as None. None
 # means the username API was deliberately not asked; not given means the
 # caller only knows the overall status, which then stands for the API door.
@@ -91,6 +96,19 @@ _PUBLIC_GRAB_MAX_ATTEMPTS = 3
 # How many feed posts/reels one backlog grab lists — the same window the
 # on-demand download-all panel uses.
 _PUBLIC_GRAB_POST_LIMIT = 100
+
+
+def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
+    """An ISO timestamp from app_settings as an aware UTC datetime, or None."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 class _SweepThrottle:
@@ -135,10 +153,18 @@ class _SweepThrottle:
         concurrency: int = 1,
         cooldown: float = 0.0,
         max_pauses: int = _SWEEP_BREAKER_MAX_PAUSES,
+        username_door_threshold: Optional[int] = None,
     ) -> None:
         self._base = max(0.0, base_stagger)
         self._max = max(self._base, max_stagger)
         self._threshold = breaker_threshold  # 0 disables the guard
+        # How many refused username lookups in a row (none answering) close
+        # that door for the sweep. Defaults to the breaker threshold; a sweep
+        # that already knows the door was shut last time passes 1 — one knock.
+        self._user_threshold = (
+            breaker_threshold if username_door_threshold is None
+            else username_door_threshold
+        )
         self._cooldown = max(0.0, cooldown)  # 0 = open immediately, never pause
         self._max_pauses = max(0, max_pauses)
         self._extra = 0.0
@@ -210,6 +236,15 @@ class _SweepThrottle:
         return self._successes
 
     @property
+    def username_door_answered(self) -> bool:
+        """True once the username API itself answered 200 this sweep."""
+        return self._user_successes > 0
+
+    @property
+    def username_door_threshold(self) -> int:
+        return self._user_threshold
+
+    @property
     def current_stagger(self) -> float:
         return min(self._max, self._base + self._extra)
 
@@ -250,10 +285,10 @@ class _SweepThrottle:
                 self._peak_user_blocks, self._consecutive_user_blocks
             )
             if (
-                self._threshold
+                self._user_threshold
                 and not self._username_door_closed
                 and self._user_successes == 0
-                and self._consecutive_user_blocks >= self._threshold
+                and self._consecutive_user_blocks >= self._user_threshold
             ):
                 self._username_door_closed = True
                 logger.warning(
@@ -356,6 +391,11 @@ class MonitorService:
         self.notifier = notifier
         self.stories = stories
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
+        # When a sweep last found the username API refusing every lookup
+        # (None = it was answering). Loaded from app_settings on first use so
+        # the memory survives a restart; see username_api_known_closed().
+        self._username_api_closed_at: Optional[datetime] = None
+        self._username_api_door_loaded = False
         # account_id -> forum topic (message_thread_id). Resolved lazily and
         # cached so each account's alerts land in its own thread.
         self._topic_cache: dict[int, int] = {}
@@ -495,6 +535,51 @@ class MonitorService:
             created += 1
         return {"ok": True, "created": created, "existing": existing, "error": None}
 
+    @property
+    def username_api_closed_since(self) -> Optional[datetime]:
+        """When the username API was last found shut, or None. Loaded lazily —
+        None before the first check of the process may simply mean unread."""
+        return self._username_api_closed_at
+
+    async def username_api_known_closed(self) -> bool:
+        """True while the last sweep's verdict — the username API refused
+        every lookup — is recent enough to trust (USERNAME_API_RECHECK_SECONDS).
+
+        The verdict is what turns a fifty-second wait at the start of every
+        sweep and a thirty-second wait on every manual check into nothing:
+        the door is knocked once per sweep and left alone otherwise, until
+        the knock answers.
+        """
+        if not self._username_api_door_loaded:
+            async with get_session() as session:
+                raw = await crud.get_setting(session, _USERNAME_API_DOOR_KEY)
+            self._username_api_closed_at = _parse_utc(raw)
+            self._username_api_door_loaded = True
+        closed_at = self._username_api_closed_at
+        if closed_at is None:
+            return False
+        age = datetime.now(timezone.utc) - closed_at
+        return age < timedelta(seconds=max(0, settings.username_api_recheck_seconds))
+
+    async def _remember_username_api_door(
+        self, *, closed: bool, answered: bool
+    ) -> None:
+        """Persist a sweep's verdict on the username API: shut (refreshes the
+        timestamp) or answering (forgets it). A sweep that neither closed the
+        door nor got an answer from it — nothing asked — leaves it as it was."""
+        self._username_api_door_loaded = True
+        if closed:
+            now = datetime.now(timezone.utc)
+            self._username_api_closed_at = now
+            async with get_session() as session:
+                await crud.set_setting(session, _USERNAME_API_DOOR_KEY, now.isoformat())
+            return
+        if answered and self._username_api_closed_at is not None:
+            self._username_api_closed_at = None
+            async with get_session() as session:
+                await crud.delete_setting(session, _USERNAME_API_DOOR_KEY)
+            logger.info("The username API answered again — the door is open")
+
     async def check_username(
         self, username: str, *, notify_unchanged: bool = False
     ) -> dict:
@@ -513,8 +598,12 @@ class MonitorService:
                 return {"ok": False, "error": f"@{username} is not monitored"}
             account_id = account.id
 
+        # A door the last sweep found shut is not knocked on here: someone is
+        # waiting, and each knock is a ten-second Worker call for a known
+        # answer. The sweep re-tests it once per pass.
         result = await self._run_check(
-            account_id, username, notify_unchanged=notify_unchanged
+            account_id, username, notify_unchanged=notify_unchanged,
+            skip_username_api=await self.username_api_known_closed(),
         )
 
         if self.stories is not None and result.get("ok"):
@@ -696,12 +785,17 @@ class MonitorService:
         await self.notifier.send_text(
             f"👁 Sweep started — {len(targets)} {noun} queued."
         )
+        # One knock per sweep on a door the last sweep found shut: it reopens
+        # the moment the API answers, and costs ten seconds a sweep instead of
+        # a threshold's worth of blocked Worker calls.
+        known_closed = await self.username_api_known_closed()
         throttle = _SweepThrottle(
             base_stagger=_SWEEP_STAGGER_SECONDS,
             max_stagger=settings.sweep_stagger_max_seconds,
             breaker_threshold=settings.sweep_breaker_threshold,
             concurrency=settings.sweep_concurrency,
             cooldown=settings.sweep_breaker_cooldown_seconds,
+            username_door_threshold=1 if known_closed else None,
         )
         results = await asyncio.gather(
             *(
@@ -716,6 +810,10 @@ class MonitorService:
                 "{} account(s) deferred to the retry pass / next sweep",
                 throttle.peak_consecutive_blocks, throttle.skipped,
             )
+        await self._remember_username_api_door(
+            closed=throttle.username_door_closed,
+            answered=throttle.username_door_answered,
+        )
 
         # account_id -> (fallback username, result dict). Exceptions become
         # failure dicts (flagged "crashed") so the retry pass can rewrite any
@@ -903,12 +1001,23 @@ class MonitorService:
                     "picture and story status are live; followers, bio and "
                     "counts couldn't be read this time and were not guessed."
                 )
-            if throttle.username_door_closed:
+            if throttle.username_door_closed and known_closed:
+                summary += (
+                    "\n🚪 Instagram's profile API is still refusing username "
+                    "lookups (checked once this sweep), so the sweep used the "
+                    "ID route and the profile page."
+                )
+            elif throttle.username_door_closed:
                 summary += (
                     "\n🚪 Instagram's profile API refused every username "
                     f"lookup ({throttle.peak_consecutive_user_blocks} in a "
                     "row), so the rest of the sweep skipped it and used the "
                     "ID route and the profile page."
+                )
+            elif known_closed and throttle.username_door_answered:
+                summary += (
+                    "\n🔓 Instagram's profile API is answering username "
+                    "lookups again — full readings are back."
                 )
             if throttle.pauses:
                 summary += (

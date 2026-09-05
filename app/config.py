@@ -80,6 +80,14 @@ class Settings(BaseSettings):
     # what shuts the gate.
     ig_sweep_auth_attempts: int = Field(default=1, alias="IG_SWEEP_AUTH_ATTEMPTS")
     ig_manual_auth_attempts: int = Field(default=3, alias="IG_MANUAL_AUTH_ATTEMPTS")
+    # How long a sweep's verdict that the username API refused every lookup is
+    # remembered. While it holds, the next sweep knocks on that API once (one
+    # account) instead of SWEEP_BREAKER_THRESHOLD times, and manual checks skip
+    # it altogether — the id route and the page doors still run. The API
+    # reopens the moment a knock answers 200.
+    username_api_recheck_seconds: int = Field(
+        default=43200, alias="USERNAME_API_RECHECK_SECONDS"
+    )
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")

@@ -64,8 +64,9 @@ POLL_WAIT_SECONDS = 25
 POLL_READ_TIMEOUT = 45
 IG_TIMEOUT_SECONDS = 25
 # Be a polite neighbour to your own IP: at most one Instagram request every
-# this many seconds, whatever the bot asks for. The bot already paces itself.
-MIN_GAP_SECONDS = 2.0
+# this many seconds, whatever the bot asks for. The bot already paces itself
+# (about one account every 2-3 s), so this only bites on back-to-back retries.
+MIN_GAP_SECONDS = 1.0
 
 _session = (
     curl_requests.Session(impersonate="chrome120", timeout=IG_TIMEOUT_SECONDS)

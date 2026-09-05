@@ -404,8 +404,26 @@ async def test_no_id_still_gets_the_page_doors_when_the_api_is_skipped() -> None
 
 # ---------- 3. the sweep --------------------------------------------------
 
-async def _sweep_with(profile, probe, usernames: list[str]) -> tuple[dict, list[str], ScriptedInstagram]:
+async def _set_door(closed: bool) -> None:
+    """The last sweep's verdict on the username API, as the DB remembers it."""
+    from datetime import datetime, timezone
+    async with get_session() as session:
+        if closed:
+            await crud.set_setting(session, "username_api_closed_at",
+                                   datetime.now(timezone.utc).isoformat())
+        else:
+            await crud.delete_setting(session, "username_api_closed_at")
+
+
+async def _door_closed_in_db() -> bool:
+    async with get_session() as session:
+        return await crud.get_setting(session, "username_api_closed_at") is not None
+
+
+async def _sweep_with(profile, probe, usernames: list[str], *,
+                      door_known_closed: bool = False) -> tuple[dict, list[str], ScriptedInstagram]:
     """Run check_all over a fresh set of accounts (everything else paused)."""
+    await _set_door(door_known_closed)
     async with get_session() as session:
         for a in await crud.list_accounts(session, only_active=True):
             await crud.set_account_active(session, a.username, False)
@@ -489,6 +507,60 @@ def test_retriable_looks_at_both_routes() -> None:
     expect("a username block is retriable", is_retriable({"ok": False, "status": 401, "id_status": None}))
     expect("a 404 by id is not", not is_retriable({"ok": False, "status": 404, "id_status": 404}))
     expect("a check that asked nothing is not", not is_retriable({"ok": False, "status": None, "id_status": None}))
+
+
+async def test_a_door_found_shut_last_sweep_is_knocked_once() -> None:
+    """The fifty seconds at the start of every sweep: five ten-second Worker
+    calls to an API the previous sweep already found login-walled. Remembered,
+    the door gets one knock — and reopens the moment that knock answers."""
+    names = [f"knock{i}" for i in range(4)]
+    result, texts, ig = await _sweep_with(
+        lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+        lambda i: _answered(i, f"knock{int(i) - 1000}"),
+        names, door_known_closed=True,
+    )
+    summary = texts[-1]
+    expect("exactly one knock on the username API", ig.api_asks() == 1, repr(ig.profile_kwargs))
+    expect("every account still got its pages and id", result["answered"] == 4, repr(result))
+    expect("the summary says the door is still shut, checked once",
+           "still refusing" in summary and "checked once" in summary, summary)
+    expect("the verdict is refreshed in the DB", await _door_closed_in_db())
+
+    # The knock answers: the door reopens for everyone. (Fresh accounts —
+    # usernames are unique in the table.)
+    reopen = [f"reopen{i}" for i in range(4)]
+    result, texts, ig = await _sweep_with(
+        lambda u: _api(u), lambda i: _answered(i, f"reopen{int(i) - 1000}"),
+        reopen, door_known_closed=True,
+    )
+    summary = texts[-1]
+    expect("with the API answering, every account is asked normally",
+           ig.api_asks() == 4, repr(ig.profile_kwargs))
+    expect("the summary announces the reopening", "answering username lookups again" in summary, summary)
+    expect("and the DB forgets the verdict", not await _door_closed_in_db())
+
+
+async def test_a_manual_check_skips_a_door_known_to_be_shut() -> None:
+    """Someone is waiting on a Recheck: no ten-second knocks on a door the
+    last sweep found shut. The id route and the pages still run."""
+    account_id = await _new_account("manual_skip")
+    await _set_door(True)
+    ig = ScriptedInstagram()
+    ig.probe = lambda i: _answered(i, "manual_skip")
+    service = _service(ig)
+    result = await service.check_username("manual_skip")
+    expect("the check is ok (id route)", result.get("ok") is True, repr(result))
+    expect("and the username API was not knocked on",
+           ig.profile_kwargs and ig.profile_kwargs[-1].get("api") is False, repr(ig.profile_kwargs))
+
+    await _set_door(False)
+    ig2 = ScriptedInstagram()
+    ig2.probe = lambda i: _answered(i, "manual_skip")
+    service2 = _service(ig2)
+    await service2.check_username("manual_skip")
+    expect("with the door believed open, a manual check asks the API",
+           ig2.profile_kwargs and ig2.profile_kwargs[-1].get("api", True) is True, repr(ig2.profile_kwargs))
+    await _set_door(False)
 
 
 async def test_a_shut_gate_is_counted_honestly() -> None:
@@ -719,6 +791,8 @@ async def main() -> int:
     await test_a_shut_username_door_does_not_stop_the_sweep()
     await test_retry_rounds_re_ask_by_id_when_the_door_is_shut()
     test_retriable_looks_at_both_routes()
+    await test_a_door_found_shut_last_sweep_is_knocked_once()
+    await test_a_manual_check_skips_a_door_known_to_be_shut()
     await test_a_shut_gate_is_counted_honestly()
 
     await test_fetch_profile_can_skip_the_api()

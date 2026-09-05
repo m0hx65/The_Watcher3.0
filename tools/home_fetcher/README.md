@@ -86,8 +86,8 @@ the bot uses it whenever it happens to be polling during a sweep.
 - Each page is about 700 KB from Instagram and about 150 KB compressed on
   its way to the bot. For 17 accounts at three sweeps a day that is roughly
   1.1 GB a month downloaded on the phone's connection.
-- The worker paces itself to one Instagram request every 2 seconds, on top
-  of the bot's own pacing.
+- The worker paces itself to one Instagram request per second, on top of
+  the bot's own pacing (about one account every 2-3 seconds).
 - Your VPN, if any, is fine: the request goes out the same way your browser's
   does. Instagram's answer depends on the IP, and yours is trusted.
 
