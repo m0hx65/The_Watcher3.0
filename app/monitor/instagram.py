@@ -13,6 +13,7 @@ declared User-Agent — httpx (Python OpenSSL stack) gets 401s where Chrome gets
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -116,6 +117,8 @@ class IdProbe:
     # {"has_public_story", "is_live", "highlights"} — the shape the story
     # phase consumes, so one probe serves the whole check.
     reel_data: Optional[dict[str, Any]] = None
+    # Which route answered: "cache", "worker", "direct", "home" (the phone).
+    via: str = ""
 
     @property
     def answered(self) -> bool:
@@ -305,6 +308,11 @@ class InstagramClient:
         # skipped for a while and the home fetcher (if any) takes over at once.
         self._direct_page_failures = 0
         self._direct_page_blocked_until = 0.0
+        # The Worker's reel route. Refused per colo, and each refusal is ~9 s
+        # of upstream retries; after a few in a row the phone is asked first
+        # for a while, the Worker only when the phone has no answer.
+        self._worker_reel_failures = 0
+        self._worker_reel_blocked_until = 0.0
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -420,6 +428,11 @@ class InstagramClient:
     _DIRECT_PAGE_BREAKER_FAILURES = 3
     _DIRECT_PAGE_COOLDOWN = 1800.0
     _DIRECT_PAGE_TIMEOUT = 12.0
+    # The Worker's reel route: refusals in a row before the phone is asked
+    # first, and for how long. The wait for a live phone answer.
+    _WORKER_REEL_BREAKER_FAILURES = 3
+    _WORKER_REEL_COOLDOWN = 600.0
+    _HOME_REEL_TIMEOUT = 15.0
 
     # How long to skip the reel query after a hard block (401/403) before probing
     # again. Keeps card opens and sweeps fast where the graphql endpoint is
@@ -449,27 +462,106 @@ class InstagramClient:
         _status, parsed = await self._reel_lookup(user_id)
         return parsed
 
-    async def probe_by_id(self, user_id: str) -> IdProbe:
+    async def probe_by_id(
+        self, user_id: str, *, cached_ok: bool = False
+    ) -> IdProbe:
         """Ask Instagram about a NUMERIC id and report exactly what it said.
 
         The sweep's first question per account: the current username (so a
         renamed target is found, not lost), the avatar URL, story/live status
         and the highlight catalog — and, unlike `fetch_reel_user`, the HTTP
         status, so a 404 (the id no longer resolves) is not confused with a
-        401 (blocked). One live request at most; a fresh cached reel answer
-        is reused.
+        401 (blocked).
+
+        Routes, in order: this client's short cache; the phone's prefetched
+        answer (`cached_ok`, sweeps); then the Worker — unless it has been
+        refusing lately, in which case the phone is asked live first and the
+        Worker only when the phone has nothing. The Worker's refusal costs
+        ~9 s of upstream retries; the phone answers in about one.
         """
         probe = IdProbe(user_id=str(user_id or ""))
         if not probe.user_id:
             return probe
         cached = self._cached_reel(probe.user_id)
         if cached is not None:
-            status, parsed = 200, cached
-        else:
-            status, parsed = await self._reel_lookup(probe.user_id)
+            return await self._fill_probe(probe, 200, cached, via="cache")
+
+        phone = settings.home_fetch_token and home_fetch.broker.connected
+        if cached_ok and settings.home_fetch_token:
+            home = home_fetch.broker.cached_reel(probe.user_id)
+            if home is not None:
+                status, parsed = self._parse_home_reel(home)
+                if parsed is not None or status == 404:
+                    return await self._fill_probe(probe, status, parsed, via="home")
+
+        worker_refusing = time.monotonic() < self._worker_reel_blocked_until
+        order = ["home", "worker"] if (phone and worker_refusing) else ["worker", "home"]
+        status, parsed = 0, None
+        for route in order:
+            if route == "worker":
+                status, parsed = await self._reel_lookup(probe.user_id)
+                self._note_worker_reel(status)
+                if status in (200, 404):
+                    return await self._fill_probe(probe, status, parsed, via="worker")
+            elif phone:
+                home = await home_fetch.broker.request_reel(
+                    probe.user_id, timeout=self._HOME_REEL_TIMEOUT, fresh=not cached_ok,
+                )
+                if home is not None:
+                    h_status, h_parsed = self._parse_home_reel(home)
+                    if h_parsed is not None or h_status == 404:
+                        return await self._fill_probe(probe, h_status, h_parsed, via="home")
+                    status = status or h_status
         probe.status = status
+        return probe
+
+    def _note_worker_reel(self, status: int) -> None:
+        if status in (200, 404):
+            self._worker_reel_failures = 0
+            self._worker_reel_blocked_until = 0.0
+            return
+        self._worker_reel_failures += 1
+        if (
+            self._worker_reel_failures >= self._WORKER_REEL_BREAKER_FAILURES
+            and time.monotonic() >= self._worker_reel_blocked_until
+        ):
+            self._worker_reel_blocked_until = time.monotonic() + self._WORKER_REEL_COOLDOWN
+            logger.info(
+                "The Worker's reel route was refused {} times in a row — asking "
+                "the home fetcher first for the next {:.0f} min",
+                self._worker_reel_failures, self._WORKER_REEL_COOLDOWN / 60,
+            )
+
+    @staticmethod
+    def _parse_home_reel(result: "home_fetch.PageResult") -> tuple[int, Optional[dict[str, Any]]]:
+        """The phone's reel answer: Instagram's status, and the parsed user
+        when it is the query's JSON. A 429 is Instagram asking the home IP to
+        wait; a 404 is a real 'no such id'."""
+        if result.status != 200:
+            return int(result.status or 0), None
+        try:
+            payload = json.loads(result.body)
+        except ValueError:
+            return 0, None
+        parsed = _parse_reel_query_user(payload) if isinstance(payload, dict) else None
+        if parsed is None:
+            return 0, None
+        fetch_health.record_status(IG_REEL, 200)
+        return 200, parsed
+
+    async def _fill_probe(
+        self, probe: IdProbe, status: int, parsed: Optional[dict[str, Any]], *, via: str
+    ) -> IdProbe:
+        probe.status = status
+        probe.via = via
         if parsed is None:
             return probe
+        if via in ("home",) and self._cached_reel(probe.user_id) is None:
+            if len(self._reel_cache) > 512:
+                self._reel_cache.clear()
+            self._reel_cache[probe.user_id] = (
+                time.monotonic() + self._REEL_CACHE_TTL, parsed
+            )
         probe.username = parsed.get("username") or None
         probe.profile_pic_url = parsed.get("profile_pic_url") or None
         probe.reel_data = {
@@ -1075,10 +1167,11 @@ class InstagramClient:
         result["parsed"] = parsed
         if parsed is None:
             result["error"] = "no profile payload in the page"
+            head = " ".join(page.body[:160].split())
             logger.info(
                 "Home fetcher: page for @{} served ({} bytes) but carried no "
-                "profile payload — login wall or markup change",
-                username, len(page.body),
+                "profile payload — it starts: {!r}",
+                username, len(page.body), head,
             )
         else:
             logger.info(

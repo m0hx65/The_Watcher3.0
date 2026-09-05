@@ -15,11 +15,18 @@ login is involved.
 
 Built for a slow link (a phone on a VPN):
 
+- one keep-alive connection per thread, IPv4 first — a fresh DNS + TLS setup
+  per request cost ~30 s each on a phone;
 - one poll brings back a whole batch of jobs, not one;
+- two kinds of job: the profile page, and the graphql reel query by numeric
+  id (story/live status, highlights, current username) that the bot's edge
+  proxy keeps getting refused on;
 - only the page's few-kilobyte payload is sent back, not the 700 KB page;
 - uploads run in the background, so the next fetch never waits on the last
   upload, and the bot never waits on the phone — it hands the whole sweep's
-  list over up front and picks each page up when it needs it.
+  list over up front and picks each answer up when it needs it;
+- one Instagram request every 2 s, and a minute's pause when Instagram asks
+  this IP to "wait a few minutes".
 
 Setup — two values, in a file named ``home_fetcher.env`` next to this script
 (or as environment variables):
@@ -93,8 +100,11 @@ POLL_READ_TIMEOUT = 45
 POLL_BATCH = 8
 IG_TIMEOUT_SECONDS = 25
 # Be a polite neighbour to your own IP: at most one Instagram request every
-# this many seconds, whatever the bot asks for.
-MIN_GAP_SECONDS = 1.0
+# this many seconds, whatever the bot asks for. A batch of 17 pages at one per
+# second got this phone's IP a "wait a few minutes" on a few of them.
+MIN_GAP_SECONDS = 2.0
+# How long to stop fetching after Instagram says "wait a few minutes".
+SOFT_BLOCK_PAUSE_SECONDS = 60.0
 # Uploads run here so a slow link never holds up the next fetch or poll.
 UPLOAD_THREADS = 2
 UPLOAD_TIMEOUT = 90
@@ -132,7 +142,22 @@ _NAV_HEADERS = {
 }
 
 _last_request_at = 0.0
+_paused_until = 0.0
 _log_lock = threading.Lock()
+
+# The graphql reel query, the way the logged-out web app sends it.
+_REEL_QUERY_ID = "9957820854288654"
+_API_HEADERS = {
+    "User-Agent": _NAV_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip",
+    "x-ig-app-id": "936619743392459",
+    "Referer": "https://www.instagram.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
 
 
 def _log(message: str) -> None:
@@ -163,27 +188,76 @@ def load_settings() -> tuple[str, str, str]:
 
 # ------------------------------------------------------------ Instagram
 
-def fetch_profile_page(username: str) -> tuple[int, bytes, str]:
-    """One Instagram request, paced. Returns (status, body, final_url)."""
+def _pace() -> None:
+    """One Instagram request every MIN_GAP_SECONDS, and none at all while a
+    soft block is being waited out."""
     global _last_request_at
-    wait = MIN_GAP_SECONDS - (time.monotonic() - _last_request_at)
+    now = time.monotonic()
+    wait = max(MIN_GAP_SECONDS - (now - _last_request_at), _paused_until - now)
     if wait > 0:
         time.sleep(wait)
     _last_request_at = time.monotonic()
+
+
+def _soft_blocked(status: int, body: bytes) -> bool:
+    """Instagram's 'Please wait a few minutes before you try again' — sent as a
+    200 or 401 with a tiny JSON body when an IP has asked too often. Reported
+    to the bot as a 429 (which is what it is) and waited out here."""
+    if status not in (200, 401, 429) or len(body) > 2048:
+        return False
+    return b"Please wait a few minutes" in body or b'"require_login":true' in body
+
+
+def _after_instagram(username: str, status: int, body: bytes) -> int:
+    """Book Instagram's answer: a soft block turns into a 429 and a pause."""
+    global _paused_until
+    if _soft_blocked(status, body):
+        _paused_until = time.monotonic() + SOFT_BLOCK_PAUSE_SECONDS
+        _log(f"@{username}: Instagram asked this IP to wait a few minutes - "
+             f"pausing fetches for {SOFT_BLOCK_PAUSE_SECONDS:.0f}s")
+        return 429
+    return status
+
+
+def fetch_profile_page(username: str) -> tuple[int, bytes, str]:
+    """One Instagram page request, paced. Returns (status, body, final_url)."""
+    _pace()
     url = f"https://www.instagram.com/{username}/"
     if _session is not None:
         response = _session.get(
             url, headers={"Accept-Language": "en-US,en;q=0.9"}, allow_redirects=True,
         )
+        status, body = response.status_code, response.content or b""
         final_url = getattr(response, "url", "") or ""
-        return response.status_code, response.content or b"", final_url
-    return _fetch_with_stdlib(url)
+    else:
+        status, body, final_url = _fetch_with_stdlib(url, _NAV_HEADERS)
+    return _after_instagram(username, status, body), body, final_url
 
 
-def _fetch_with_stdlib(url: str) -> tuple[int, bytes, str]:
-    """The same navigation, through urllib. Redirects are followed; a 4xx/5xx
-    is returned as Instagram sent it rather than raised."""
-    request = urllib.request.Request(url, headers=_NAV_HEADERS)
+def fetch_reel(user_id: str, username: str) -> tuple[int, bytes, str]:
+    """The graphql reel query by numeric id, paced. Returns (status, body, url)."""
+    _pace()
+    query = urllib.parse.urlencode({
+        "query_id": _REEL_QUERY_ID, "user_id": str(user_id),
+        "include_chaining": "false", "include_reel": "true",
+        "include_suggested_users": "false", "include_logged_out_extras": "true",
+        "include_live_status": "true", "include_highlight_reels": "true",
+    })
+    url = f"https://www.instagram.com/graphql/query/?{query}"
+    if _session is not None:
+        response = _session.get(url, headers={k: v for k, v in _API_HEADERS.items()
+                                              if k.lower() not in ("user-agent", "accept-encoding")})
+        status, body = response.status_code, response.content or b""
+        final_url = getattr(response, "url", "") or url
+    else:
+        status, body, final_url = _fetch_with_stdlib(url, _API_HEADERS)
+    return _after_instagram(username, status, body), body, final_url
+
+
+def _fetch_with_stdlib(url: str, headers: dict) -> tuple[int, bytes, str]:
+    """A request through urllib. Redirects are followed; a 4xx/5xx is
+    returned as Instagram sent it rather than raised."""
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=IG_TIMEOUT_SECONDS) as response:
             status = response.status
@@ -385,12 +459,19 @@ def _link_for_thread(url: str, token: str, worker: str) -> BotLink:
 
 
 def deliver(url: str, token: str, worker: str, job_id: str, username: str,
-            ig_status: int, body: bytes, final_url: str, fetch_seconds: float) -> None:
-    """Upload one answer (runs in a background thread). The payload alone
-    when the page has one; otherwise the head of whatever came back, so the
-    bot can log what it was."""
-    payload = extract_payload(body) if ig_status == 200 else None
+            ig_status: int, body: bytes, final_url: str, fetch_seconds: float,
+            kind: str = "page") -> None:
+    """Upload one answer (runs in a background thread). For a page, the
+    payload alone when it has one; for a reel, the query's JSON as it came;
+    otherwise the head of whatever came back, so the bot can log what it was."""
+    if kind == "reel":
+        payload = body if ig_status == 200 and body.lstrip().startswith(b"{") else None
+    else:
+        payload = extract_payload(body) if ig_status == 200 else None
     data = payload if payload is not None else body[:NO_PAYLOAD_BODY_LIMIT]
+    if payload is None and ig_status == 200:
+        head = " ".join(body[:120].decode("utf-8", "replace").split())
+        _log(f"@{username}: {kind} came back without a payload - it starts: {head!r}")
     link = _link_for_thread(url, token, worker)
     started = time.monotonic()
     try:
@@ -414,7 +495,7 @@ def deliver(url: str, token: str, worker: str, job_id: str, username: str,
     )
     link.last_connect_seconds = 0.0
     _log(
-        f"@{username}: Instagram HTTP {ig_status} in {fetch_seconds:.1f}s, "
+        f"@{username}: {kind} - Instagram HTTP {ig_status} in {fetch_seconds:.1f}s, "
         f"payload={'yes' if payload is not None else 'no'}, "
         f"delivered {len(data) / 1024:.0f} KB in {time.monotonic() - started:.1f}s"
         f"{connect_note}"
@@ -437,7 +518,7 @@ def run(url: str, token: str, worker: str) -> int:
             status, raw = link.request(
                 "GET",
                 f"/home-fetch/jobs?wait={POLL_WAIT_SECONDS}&batch={POLL_BATCH}",
-                headers=_device_headers(),
+                headers={**_device_headers(), "X-Watcher-Kinds": "page,reel"},
             )
         except (http.client.HTTPException, OSError) as exc:
             _log(f"bot unreachable ({exc}) - retrying in {backoff:.0f}s")
@@ -475,18 +556,26 @@ def run(url: str, token: str, worker: str) -> int:
         for job in jobs:
             username = str(job.get("username", "")).lstrip("@")
             job_id = str(job.get("id", ""))
+            kind = str(job.get("kind") or "page")
+            user_id = str(job.get("user_id") or "")
             if not USERNAME_RE.match(username) or not job_id:
                 _log(f"ignoring a malformed job: {job!r}")
                 continue
+            if kind == "reel" and not user_id.isdigit():
+                _log(f"ignoring a reel job without a numeric id: {job!r}")
+                continue
             started = time.monotonic()
             try:
-                ig_status, body, final_url = fetch_profile_page(username)
+                if kind == "reel":
+                    ig_status, body, final_url = fetch_reel(user_id, username)
+                else:
+                    ig_status, body, final_url = fetch_profile_page(username)
             except Exception as exc:  # network failure on our side
                 _log(f"@{username}: Instagram request failed - {exc!r}")
                 ig_status, body, final_url = 0, b"", ""
             uploads.submit(
                 deliver, url, token, worker, job_id, username,
-                ig_status, body, final_url, time.monotonic() - started,
+                ig_status, body, final_url, time.monotonic() - started, kind,
             )
 
 

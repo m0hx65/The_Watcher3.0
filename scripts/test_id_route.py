@@ -136,6 +136,17 @@ def test_gate_down_needs_both_routes_blocked() -> None:
     t4.record(401, id_status=404)
     expect("a 404 by id is an answer, not a block", not t4.gate_down)
 
+    # The measured bug: a page-served check (API skipped, id refused) is an
+    # ANSWER, not a block. It read as blocked, and a sweep of them paused
+    # twice for 90 s and ran at the widest gap.
+    t5 = _SweepThrottle(base_stagger=1.0, max_stagger=12.0, breaker_threshold=3, cooldown=90.0)
+    for _ in range(6):
+        t5.record(200, id_status=401, api_status=None)
+    expect("a page answer counts as answered", t5.answered == 6 and not t5.is_open(),
+           repr((t5.answered, t5.is_open())))
+    expect("and never widens the gap", t5.current_stagger == 1.0, repr(t5.current_stagger))
+    expect("nor pauses", t5.pauses == 0, repr(t5.pauses))
+
 
 # ---------- 2. the check path -----------------------------------------------
 
@@ -165,7 +176,7 @@ class ScriptedInstagram:
         """How many fetch_profile calls were allowed to ask the username API."""
         return sum(1 for kw in self.profile_kwargs if kw.get("api", True))
 
-    async def probe_by_id(self, user_id: str) -> IdProbe:
+    async def probe_by_id(self, user_id: str, **kw) -> IdProbe:
         self.probe_calls.append(str(user_id))
         return self.probe(str(user_id))
 
@@ -787,7 +798,11 @@ class FakeBroker:
         self.connected = connected
         self.asked: list[str] = []
         self.prefetched: list[str] = []
+        self.prefetched_reels: list[tuple[str, str]] = []
         self.cache: dict = {}
+        self.reels: dict = {}
+        self.reel_cache: dict = {}
+        self.reel_asked: list[str] = []
         # What the summary line reads.
         self.last_seen_seconds = 5.0
         self.battery = 92
@@ -807,9 +822,24 @@ class FakeBroker:
         self.prefetched.extend(usernames)
         return len(usernames)
 
+    def prefetch_reels(self, users) -> int:
+        if not self.connected:
+            return 0
+        users = list(users)
+        self.prefetched_reels.extend(users)
+        return len(users)
+
+    def cached_reel(self, user_id: str):
+        return self.reel_cache.get(str(user_id))
+
     async def request_page(self, username: str, *, timeout: float = 30.0, fresh: bool = False):
         self.asked.append(username)
         return self.pages.get(username)
+
+    async def request_reel(self, user_id: str, username: str = "", *, timeout: float = 15.0,
+                           fresh: bool = False):
+        self.reel_asked.append(str(user_id))
+        return self.reels.get(str(user_id))
 
 
 async def test_home_door_answers_when_this_host_is_refused() -> None:
@@ -911,6 +941,85 @@ async def test_this_hosts_page_door_is_skipped_after_repeated_refusals() -> None
         home_fetch.broker = old_broker
 
 
+REEL_TEXT = (
+    '{"data":{"user":{"has_public_story":true,"is_live":false,'
+    '"reel":{"id":"42","user":{"id":"42","username":"NewName",'
+    '"profile_pic_url":"https://scontent.cdninstagram.com/v/t51.2885-19/1_2_3_n.jpg?stp=x"}},'
+    '"edge_highlight_reels":{"edges":[]}}}}'
+)
+
+
+async def test_the_phone_answers_the_reel_question() -> None:
+    """The Worker's reel route was refused for nearly every account of a
+    sweep, ~9 s each. The phone's connection answers the same query in one;
+    a sweep gets it prefetched, a refused Worker falls to the phone live, and
+    after a few refusals the phone is asked first."""
+    old_proxy, old_token, old_broker = settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.home_fetch_token = "sekrit"
+    try:
+        # 1. Prefetched by the phone: no request at all.
+        fake = FakeBroker({}, connected=True)
+        fake.reel_cache["42"] = home_fetch.PageResult(200, REEL_TEXT)
+        home_fetch.broker = fake
+        session = _MockSession(lambda url, p: _MockResponse(401, {}))
+        async with InstagramClient(max_retries=1, session=session) as client:
+            probe = await client.probe_by_id("42", cached_ok=True)
+        expect("a sweep's probe reads the phone's prefetched reel",
+               probe.answered and probe.via == "home" and probe.username == "newname"
+               and probe.reel_data == {"has_public_story": True, "is_live": False, "highlights": {}},
+               repr(probe))
+        expect("without asking anyone", session.requests == [] and fake.reel_asked == [],
+               repr((session.requests, fake.reel_asked)))
+
+        # 2. Worker refused, phone asked live.
+        fake = FakeBroker({}, connected=True)
+        fake.reels["42"] = home_fetch.PageResult(200, REEL_TEXT)
+        home_fetch.broker = fake
+        session = _MockSession(lambda url, p: _MockResponse(401, {}))
+        async with InstagramClient(max_retries=1, session=session) as client:
+            probe = await client.probe_by_id("42")
+            expect("a refused Worker falls to the phone live",
+                   probe.answered and probe.via == "home", repr(probe))
+            expect("the Worker was tried first", any("workers.dev" in r["url"] for r in session.requests),
+                   repr(session.requests))
+            expect("the phone was asked once", fake.reel_asked == ["42"], repr(fake.reel_asked))
+            # 3. After enough refusals the phone comes first.
+            for _ in range(3):
+                client._reel_cache.clear()
+                await client.probe_by_id("42")
+            client._reel_cache.clear()
+            before = len(session.requests)
+            probe = await client.probe_by_id("42")
+            expect("with the Worker refusing, the phone is asked first and the Worker not at all",
+                   probe.via == "home" and len(session.requests) == before,
+                   repr((probe.via, len(session.requests) - before)))
+
+        # 4. Instagram's own 404 through the phone is a real 404.
+        fake = FakeBroker({}, connected=True)
+        fake.reels["42"] = home_fetch.PageResult(404, "")
+        home_fetch.broker = fake
+        session = _MockSession(lambda url, p: _MockResponse(401, {}))
+        async with InstagramClient(max_retries=1, session=session) as client:
+            probe = await client.probe_by_id("42")
+        expect("a 404 from the phone means the id is gone", probe.gone and probe.via == "home", repr(probe))
+
+        # 5. The sweep hands reel queries over up front.
+        fake = FakeBroker({}, connected=True)
+        home_fetch.broker = fake
+        names = [f"reelpre{i}" for i in range(3)]
+        await _sweep_with(
+            lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+            lambda i: _answered(i, f"reelpre{int(i) - 1000}"),
+            names, door_known_closed=True,
+        )
+        expect("every account's reel query was handed over",
+               sorted(n for _, n in fake.prefetched_reels) == sorted(names), repr(fake.prefetched_reels))
+    finally:
+        settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker = old_proxy, old_token, old_broker
+        await _set_door(False)
+
+
 async def test_probe_reports_what_instagram_said() -> None:
     old = settings.ig_proxy_url
     settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
@@ -983,6 +1092,7 @@ async def main() -> int:
     await test_fetch_profile_can_skip_the_api()
     await test_home_door_answers_when_this_host_is_refused()
     await test_this_hosts_page_door_is_skipped_after_repeated_refusals()
+    await test_the_phone_answers_the_reel_question()
     await test_probe_reports_what_instagram_said()
 
     await engine.dispose()

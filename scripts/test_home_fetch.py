@@ -206,6 +206,40 @@ def test_low_battery_alerts_once_and_rearms() -> None:
            HomeFetchBroker().note_device(battery=5, charging=None, threshold=20) is None)
 
 
+async def test_reel_jobs_go_only_to_a_worker_that_can_fetch_them() -> None:
+    """A second job kind, the reel query by numeric id. An older worker build
+    fetches pages only and is never handed one; a current build declares
+    both kinds and gets both."""
+    broker = HomeFetchBroker()
+    await broker.next_job(wait=0.05, worker="old")          # pages only
+    expect("no reel prefetch for a pages-only worker", broker.prefetch_reels([("42", "u")]) == 0)
+    expect("and no live reel request either",
+           await broker.request_reel("42", "u", timeout=0.1) is None)
+    await broker.next_job(wait=0.05, worker="new", kinds=["page", "reel"])  # declares reels
+    broker.prefetch(["u"])
+    expect("a reel-capable worker gets reel prefetches", broker.prefetch_reels([("42", "u")]) == 1)
+    jobs = await broker.next_job(wait=0.2, worker="new", kinds=["page", "reel"], max_jobs=8)
+    kinds = sorted((j.kind, j.key, j.user_id) for j in jobs)
+    expect("both kinds are handed out, keyed right",
+           kinds == [("page", "u", None), ("reel", "42", "42")], repr(kinds))
+    reel = next(j for j in jobs if j.kind == "reel")
+    page = next(j for j in jobs if j.kind == "page")
+    expect("the reel job carries the handle for logging", reel.username == "u")
+    expect("delivery lands in the reel cache",
+           broker.deliver(reel.id, PageResult(200, '{"data":{}}')) and broker.cached_reel("42") is not None)
+    expect("and not in the page cache", broker.cached("42") is None)
+    expect("the page delivery lands in the page cache",
+           broker.deliver(page.id, PageResult(200, "<p>")) and broker.cached("u") is not None)
+
+    # A pages-only worker polling while a reel job is queued leaves it there.
+    broker.prefetch_reels([("43", "v")])
+    old = await broker.next_job(wait=0.1, worker="old", kinds=["page"], max_jobs=8)
+    expect("the pages-only worker is handed nothing", old == [], repr(old))
+    expect("the reel job is still pending", broker.pending == 1, repr(broker.pending))
+    again = await broker.next_job(wait=0.1, worker="new", kinds=["page", "reel"], max_jobs=8)
+    expect("and a capable worker still gets it", [j.key for j in again] == ["43"], repr(again))
+
+
 # ---------- 2. the endpoints ------------------------------------------------
 
 def _app() -> FastAPI:
@@ -240,10 +274,12 @@ async def test_endpoints() -> None:
             # Full round trip through HTTP: a check asks while the worker polls.
             async def worker() -> None:
                 poll = await client.get("/home-fetch/jobs?wait=5&batch=8",
-                                        headers={"X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi"})
+                                        headers={"X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi",
+                                                 "X-Watcher-Kinds": "page,reel"})
                 job = poll.json()["job"]
                 assert job and job["username"] == "target", poll.text
                 expect("jobs lists the batch", poll.json()["jobs"] == [job], poll.text)
+                expect("a job names its kind", job["kind"] == "page" and job["user_id"] is None, poll.text)
                 delivery = await client.post(
                     f"/home-fetch/jobs/{job['id']}",
                     content=gzip.compress(b"<html>from the phone</html>"),
@@ -306,6 +342,7 @@ async def main() -> int:
     await test_a_silent_worker_costs_only_the_timeout()
     await test_an_abandoned_job_is_not_handed_out()
     await test_prefetch_batches_and_caches()
+    await test_reel_jobs_go_only_to_a_worker_that_can_fetch_them()
     test_low_battery_alerts_once_and_rearms()
     await test_endpoints()
     print()

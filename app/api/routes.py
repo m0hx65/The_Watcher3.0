@@ -174,6 +174,7 @@ async def home_fetch_next_job(
     x_watcher_worker: Optional[str] = Header(default=None),
     x_watcher_battery: Optional[str] = Header(default=None),
     x_watcher_charging: Optional[str] = Header(default=None),
+    x_watcher_kinds: Optional[str] = Header(default=None),
 ) -> dict:
     """Long-poll for the next pages to fetch — up to `batch` of them (capped),
     waiting only for the first. Answers {"job": null, "jobs": []} after
@@ -198,11 +199,17 @@ async def home_fetch_next_job(
     )
     if alert:
         asyncio.create_task(_send_alert(request, alert))
+    kinds = None
+    if x_watcher_kinds:
+        kinds = [k.strip() for k in x_watcher_kinds.split(",") if k.strip()]
     jobs = await home_fetch.broker.next_job(
         wait=wait, worker=(x_watcher_worker or "unnamed")[:40],
-        max_jobs=batch,
+        max_jobs=batch, kinds=kinds,
     )
-    handed = [{"id": job.id, "username": job.username} for job in jobs]
+    handed = [
+        {"id": job.id, "username": job.username, "kind": job.kind, "user_id": job.user_id}
+        for job in jobs
+    ]
     return {"job": handed[0] if handed else None, "jobs": handed}
 
 

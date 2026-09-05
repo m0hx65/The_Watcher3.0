@@ -101,7 +101,7 @@ class FakeInstagram:
     async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         return make_fetch_result()
 
-    async def probe_by_id(self, user_id: str):
+    async def probe_by_id(self, user_id: str, **kw):
         # The numeric-id probe answers with the same reel data — one reel
         # question per check, whichever phase asks it.
         parsed = await self.fetch_reel_user(user_id)

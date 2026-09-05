@@ -28,10 +28,16 @@ page, uploads run in the background so the next fetch never waits on the last
 upload, and the bot never waits on the phone — a sweep hands it the whole list
 up front and each check picks up its page when it gets there.
 
-The page also answers the story question: its `latest_reel_media` is the
-newest active story's timestamp, 0 when there is none. When Instagram refuses
-the reel route for an account, the bot reads the story status from the page
-the phone delivered instead of reporting it unavailable.
+The worker fetches two kinds of job: the profile page, and the graphql reel
+query by numeric id (current username, avatar, story/live status, highlight
+catalog). The bot's Cloudflare Worker is refused on that query per colo, ~9 s
+per refusal; the phone answers it in about a second, so a sweep hands over
+every account's reel query up front too. The page also answers the story
+question on its own (`latest_reel_media`: 0 = no story, else its timestamp).
+
+Pacing: one Instagram request every 2 seconds. If Instagram tells the phone to
+"wait a few minutes", the worker reports that as a 429 and pauses for a minute
+before fetching again.
 
 Nothing dials into your network, so it works behind carrier-grade NAT (your
 router's 10.x WAN address), on a phone, without root, and without any tunnel.

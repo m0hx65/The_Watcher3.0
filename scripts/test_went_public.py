@@ -503,7 +503,7 @@ class ScriptedInstagram:
     async def fetch_reel_user(self, user_id):
         return None
 
-    async def probe_by_id(self, user_id):
+    async def probe_by_id(self, user_id, **kw):
         # The client's numeric-id probe; this fake has no reel data, so the
         # id route reads as blocked and the check proceeds by username.
         return IdProbe(user_id=str(user_id), status=401)

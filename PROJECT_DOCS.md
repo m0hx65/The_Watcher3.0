@@ -579,6 +579,14 @@ account, `_handle_success` builds the story status from the page
 again, and the highlight catalog is left as stored. The sweep summary ends with
 a home-fetcher line: connection, pages this sweep, battery.
 
+Reel queries go through the phone too (job kind `reel`, keyed by numeric id;
+a worker declares what it fetches in `X-Watcher-Kinds`). `check_all` prefetches
+every account's reel query at sweep start; `probe_by_id(cached_ok=True)` reads
+the phone's answer from the broker's cache first, then the Worker, and after
+three Worker refusals in a row asks the phone live first for 10 minutes. A
+sweep's guard counts a page-served check as answered (`status == 200`), not
+by the API door alone — the bug that paused sweeps and widened the gap.
+
 This host's own page request is bounded to 12 s and, after three refusals in
 a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so
 the home fetcher is asked at once (`/probe` still forces a measurement).

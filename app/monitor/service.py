@@ -304,7 +304,11 @@ class _SweepThrottle:
                     "numeric id only", self._consecutive_user_blocks,
                 )
 
-        answered = user_ok or id_answered
+        # Instagram answered if the username side came back 200 — from the
+        # API or from a page door — or the id route did. Judging this by the
+        # API door alone made every page-served check read as blocked, which
+        # paused sweeps and stretched the gap to its maximum for nothing.
+        answered = status == 200 or user_ok or id_answered
         asked = status is not None or id_status is not None
         blocked = (
             asked
@@ -558,12 +562,21 @@ class MonitorService:
         the knock answers.
         """
         if not self._username_api_door_loaded:
-            try:
-                async with get_session() as session:
-                    raw = await crud.get_setting(session, _USERNAME_API_DOOR_KEY)
-            except Exception as exc:  # a DB hiccup must not stop a check
-                logger.warning("Could not read the username API verdict: {}", exc)
-                raw = None
+            raw = None
+            for attempt in (1, 2):
+                try:
+                    async with get_session() as session:
+                        raw = await crud.get_setting(session, _USERNAME_API_DOOR_KEY)
+                    break
+                except Exception as exc:  # a DB hiccup must not stop a check
+                    logger.warning(
+                        "Could not read the username API verdict (attempt {}): {}",
+                        attempt, exc,
+                    )
+                    if attempt == 1:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return False  # unknown this time; try again next check
             self._username_api_closed_at = _parse_utc(raw)
             self._username_api_door_loaded = True
         closed_at = self._username_api_closed_at
@@ -805,6 +818,16 @@ class MonitorService:
         # the moment the API answers, and costs ten seconds a sweep instead of
         # a threshold's worth of blocked Worker calls.
         known_closed = await self.username_api_known_closed()
+        if known_closed:
+            logger.info(
+                "Username API door: known shut since {} — one knock this sweep",
+                self._username_api_closed_at,
+            )
+        else:
+            logger.info(
+                "Username API door: believed open — up to {} knocks before it "
+                "closes", settings.sweep_breaker_threshold,
+            )
         throttle = _SweepThrottle(
             base_stagger=_SWEEP_STAGGER_SECONDS,
             max_stagger=settings.sweep_stagger_max_seconds,
@@ -815,6 +838,15 @@ class MonitorService:
         )
         throttle.sweep_usernames = [uname for _, uname in targets]
         home_pages_before = home_fetch.broker.delivered
+        # Reel data for every account with a stored id, from the phone,
+        # before the first check. The Worker's reel route is refused per colo
+        # and each refusal costs ~9 s; the phone answers in one, and the
+        # probe finds the answer already in hand.
+        ids_by_name = {a.username: a.instagram_id for a in accounts}
+        self._prefetch_reels([
+            (str(ids_by_name[uname]), uname)
+            for _, uname in targets if ids_by_name.get(uname)
+        ])
         if known_closed:
             # Every account will need its page: hand the phone the whole list
             # now, so its round trips overlap the sweep instead of gating
@@ -1242,6 +1274,16 @@ class MonitorService:
         return f"🏠 Home fetcher ({name}): {state}, {pages} {noun} this sweep{battery}"
 
     @staticmethod
+    def _prefetch_reels(users: list[tuple[str, str]]) -> None:
+        """Ask the home fetcher for every reel query a sweep will need."""
+        if not settings.home_fetch_token or not users:
+            return
+        queued = home_fetch.broker.prefetch_reels(users)
+        if queued:
+            logger.info("Handed the home fetcher {} reel quer{} up front",
+                        queued, "y" if queued == 1 else "ies")
+
+    @staticmethod
     def _prefetch_pages(usernames: list[str]) -> None:
         """Ask the home fetcher for every page a sweep will need, up front."""
         if not settings.home_fetch_token:
@@ -1460,8 +1502,10 @@ class MonitorService:
         probe: Optional[IdProbe] = None
         if instagram_id:
             clock = time.monotonic()
-            probe = await self.instagram.probe_by_id(instagram_id)
-            timings["id"] = time.monotonic() - clock
+            probe = await self.instagram.probe_by_id(
+                instagram_id, cached_ok=not thorough
+            )
+            timings[f"id/{probe.via}" if probe.via else "id"] = time.monotonic() - clock
             if probe.gone:
                 # The id itself no longer resolves: deactivated, deleted or
                 # banned. Not a rename — a rename keeps the id.
