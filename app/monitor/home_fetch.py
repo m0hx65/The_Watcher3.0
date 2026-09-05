@@ -112,6 +112,10 @@ class HomeFetchBroker:
         return time.monotonic() - self._last_poll
 
     @property
+    def worker(self) -> Optional[str]:
+        return self._worker
+
+    @property
     def pending(self) -> int:
         """Jobs queued or in the phone's hands, not yet answered."""
         return len(self._jobs)

@@ -20,11 +20,18 @@ The worker **polls the bot** for work over ordinary outbound HTTPS: it asks
 answer back to `POST /home-fetch/jobs/<id>`. The bot parses the same payload it
 parses from its own page reading and stores it as a normal page reading.
 
-It is built for a slow link (a phone on a VPN): one poll brings a whole batch;
-only the page's few-kilobyte payload goes back, not the 700 KB page; uploads
-run in the background so the next fetch never waits on the last upload; and
-the bot never waits on the phone — a sweep hands it the whole list up front
-and each check picks up its page when it gets there.
+It is built for a slow link (a phone on a VPN): one keep-alive connection per
+thread instead of a fresh DNS lookup + TLS handshake per request (that setup
+cost was ~30 s per request on the phone), IPv4 tried first, one poll brings a
+whole batch, only the page's few-kilobyte payload goes back, not the 700 KB
+page, uploads run in the background so the next fetch never waits on the last
+upload, and the bot never waits on the phone — a sweep hands it the whole list
+up front and each check picks up its page when it gets there.
+
+The page also answers the story question: its `latest_reel_media` is the
+newest active story's timestamp, 0 when there is none. When Instagram refuses
+the reel route for an account, the bot reads the story status from the page
+the phone delivered instead of reporting it unavailable.
 
 Nothing dials into your network, so it works behind carrier-grade NAT (your
 router's 10.x WAN address), on a phone, without root, and without any tunnel.

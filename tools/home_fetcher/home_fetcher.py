@@ -41,6 +41,7 @@ this run in Termux, where curl_cffi does not install.
 from __future__ import annotations
 
 import gzip
+import http.client
 import json
 import os
 import re
@@ -52,11 +53,27 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# IPv4 first. Python tries the addresses a name resolves to one after another,
+# each with the full connect timeout — and on a phone behind a VPN or a
+# carrier NAT the IPv6 route is often dead, so every new connection first
+# spent a timeout on it. Addresses are only reordered, never dropped, so an
+# IPv6-only network still works.
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_first(*args, **kwargs):
+    results = _real_getaddrinfo(*args, **kwargs)
+    return sorted(results, key=lambda info: info[0] != socket.AF_INET)
+
+
+socket.getaddrinfo = _ipv4_first
 
 try:
     from curl_cffi import requests as curl_requests
@@ -279,19 +296,92 @@ def _device_headers() -> dict[str, str]:
 
 # --------------------------------------------------------------- the bot
 
-def _bot_request(method: str, url: str, token: str, worker: str, *,
-                 body: bytes = b"", headers: Optional[dict] = None,
-                 timeout: float = POLL_READ_TIMEOUT) -> tuple[int, bytes]:
-    request = urllib.request.Request(url, data=body if method == "POST" else None, method=method)
-    request.add_header("X-Watcher-Token", token)
-    request.add_header("X-Watcher-Worker", worker)
-    for key, value in (headers or {}).items():
-        request.add_header(key, value)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as error:
-        return error.code, error.read()
+class BotLink:
+    """One keep-alive HTTPS connection to the bot, reopened when it drops.
+
+    A new connection costs a DNS lookup, a TCP connect and a TLS handshake —
+    seconds each on a slow link, and on this phone that added up to ~30 s per
+    request when every request opened its own. The long-poll keeps this one
+    warm (something is always in flight), and each upload thread keeps its
+    own. Instances are not thread-safe; use one per thread.
+    """
+
+    def __init__(self, base_url: str, token: str, worker: str) -> None:
+        parts = urllib.parse.urlsplit(base_url)
+        self._https = parts.scheme != "http"
+        self._host = parts.hostname or ""
+        self._port = parts.port
+        self._prefix = parts.path.rstrip("/")
+        self._token = token
+        self._worker = worker
+        self._conn: Optional[http.client.HTTPConnection] = None
+        self.connects = 0
+        self.last_connect_seconds = 0.0
+
+    def _connect(self, timeout: float) -> http.client.HTTPConnection:
+        started = time.monotonic()
+        if self._https:
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                self._host, self._port, timeout=timeout,
+            )
+        else:
+            conn = http.client.HTTPConnection(self._host, self._port, timeout=timeout)
+        conn.connect()
+        self.connects += 1
+        self.last_connect_seconds = time.monotonic() - started
+        self._conn = conn
+        return conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
+
+    def request(self, method: str, path: str, *, body: bytes = b"",
+                headers: Optional[dict] = None, timeout: float = POLL_READ_TIMEOUT,
+                ) -> tuple[int, bytes]:
+        """Send one request on the kept connection; on a broken connection,
+        reconnect once and retry. Raises OSError when the bot is unreachable."""
+        all_headers = {
+            "X-Watcher-Token": self._token,
+            "X-Watcher-Worker": self._worker,
+            "Connection": "keep-alive",
+            **(headers or {}),
+        }
+        last_error: Optional[Exception] = None
+        for attempt in (1, 2):
+            conn = self._conn
+            try:
+                if conn is None:
+                    conn = self._connect(timeout)
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                conn.request(method, self._prefix + path,
+                             body=body if method == "POST" else None, headers=all_headers)
+                response = conn.getresponse()
+                data = response.read()
+                if response.getheader("Connection", "").lower() == "close":
+                    self.close()
+                return response.status, data
+            except (http.client.HTTPException, OSError) as exc:
+                last_error = exc
+                self.close()
+                if attempt == 2:
+                    raise
+        raise OSError(f"request failed: {last_error!r}")  # pragma: no cover
+
+
+_thread_links = threading.local()
+
+
+def _link_for_thread(url: str, token: str, worker: str) -> BotLink:
+    link = getattr(_thread_links, "link", None)
+    if link is None:
+        link = BotLink(url, token, worker)
+        _thread_links.link = link
+    return link
 
 
 def deliver(url: str, token: str, worker: str, job_id: str, username: str,
@@ -301,10 +391,11 @@ def deliver(url: str, token: str, worker: str, job_id: str, username: str,
     bot can log what it was."""
     payload = extract_payload(body) if ig_status == 200 else None
     data = payload if payload is not None else body[:NO_PAYLOAD_BODY_LIMIT]
+    link = _link_for_thread(url, token, worker)
     started = time.monotonic()
     try:
-        code, _ = _bot_request(
-            "POST", f"{url}/home-fetch/jobs/{job_id}", token, worker,
+        code, _ = link.request(
+            "POST", f"/home-fetch/jobs/{job_id}",
             body=gzip.compress(data, compresslevel=6),
             headers={
                 "Content-Type": "text/html; charset=utf-8",
@@ -315,13 +406,18 @@ def deliver(url: str, token: str, worker: str, job_id: str, username: str,
             },
             timeout=UPLOAD_TIMEOUT,
         )
-    except (urllib.error.URLError, socket.timeout, OSError) as exc:
+    except (http.client.HTTPException, OSError) as exc:
         _log(f"@{username}: could not deliver to the bot ({exc})")
         return
+    connect_note = (
+        f", new connection {link.last_connect_seconds:.1f}s" if link.last_connect_seconds else ""
+    )
+    link.last_connect_seconds = 0.0
     _log(
         f"@{username}: Instagram HTTP {ig_status} in {fetch_seconds:.1f}s, "
         f"payload={'yes' if payload is not None else 'no'}, "
         f"delivered {len(data) / 1024:.0f} KB in {time.monotonic() - started:.1f}s"
+        f"{connect_note}"
         + ("" if code == 200 else f" (bot answered HTTP {code})")
     )
 
@@ -333,20 +429,24 @@ def run(url: str, token: str, worker: str) -> int:
         state = "charging" if charging else "not charging" if charging is not None else "unknown"
         _log(f"battery {percent}% ({state}) - reported to the bot with every poll")
     uploads = ThreadPoolExecutor(max_workers=UPLOAD_THREADS, thread_name_prefix="upload")
+    link = BotLink(url, token, worker)
     backoff = 5.0
     while True:
         poll_started = time.monotonic()
         try:
-            status, raw = _bot_request(
+            status, raw = link.request(
                 "GET",
-                f"{url}/home-fetch/jobs?wait={POLL_WAIT_SECONDS}&batch={POLL_BATCH}",
-                token, worker, headers=_device_headers(),
+                f"/home-fetch/jobs?wait={POLL_WAIT_SECONDS}&batch={POLL_BATCH}",
+                headers=_device_headers(),
             )
-        except (urllib.error.URLError, socket.timeout, OSError) as exc:
+        except (http.client.HTTPException, OSError) as exc:
             _log(f"bot unreachable ({exc}) - retrying in {backoff:.0f}s")
             time.sleep(backoff)
             backoff = min(60.0, backoff * 2)
             continue
+        if link.last_connect_seconds:
+            _log(f"connected to the bot in {link.last_connect_seconds:.1f}s (kept open from here on)")
+            link.last_connect_seconds = 0.0
         if status == 401:
             _log("the bot rejected the token - check HOME_FETCH_TOKEN on both sides; retrying in 60s")
             time.sleep(60)

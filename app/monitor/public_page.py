@@ -204,6 +204,15 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
     if isinstance(pk, (str, int)) and str(pk).isdigit():
         parsed["instagram_id"] = str(pk)
 
+    # Story status. `latest_reel_media` is the newest active story's timestamp
+    # and 0 when there is none — verified 2026-09-05 against the reel query on
+    # the same accounts (@natgeo 1788624868 ↔ has_public_story True, @nasa 0 ↔
+    # False). A logged-out viewer sees null for private accounts, so it only
+    # exists for public ones; and it knows a story, not a live broadcast.
+    latest_reel = user.get("latest_reel_media")
+    if isinstance(latest_reel, int) and not isinstance(latest_reel, bool):
+        parsed["has_public_story"] = latest_reel > 0
+
     links = user.get("bio_links")
     if isinstance(links, list) and links:
         first = links[0]

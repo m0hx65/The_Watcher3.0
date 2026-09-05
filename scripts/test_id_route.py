@@ -575,6 +575,17 @@ async def test_a_sweep_hands_the_phone_the_whole_list_up_front() -> None:
         expect("the first refusal hands over the whole list",
                sorted(fake.prefetched) == sorted(late), repr(fake.prefetched))
         expect("the verdict was written during the sweep", await _door_closed_in_db())
+        # The summary names the phone and its battery.
+        fake.delivered = 3
+        result, texts, ig = await _sweep_with(
+            lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+            lambda i: _answered(i, f"batt{int(i) - 1000}"),
+            [f"batt{i}" for i in range(2)], door_known_closed=True,
+        )
+        summary = texts[-1]
+        expect("the summary has a home fetcher line with the battery",
+               "🏠 Home fetcher (xiaomi)" in summary and "battery 92% (not charging)" in summary,
+               summary)
 
         # A page the phone already delivered is used by the real client without
         # asking again — even if the phone has since dropped off.
@@ -594,6 +605,65 @@ async def test_a_sweep_hands_the_phone_the_whole_list_up_front() -> None:
     finally:
         home_fetch.broker, settings.home_fetch_token = old_broker, old_token
         await _set_door(False)
+
+
+async def test_the_page_answers_the_story_question_when_the_reel_route_is_refused() -> None:
+    """The three public accounts came back 'story status unavailable' because
+    the Worker's reel route was refused for them — while the very page the
+    phone had just delivered says, in latest_reel_media, whether a story is
+    up. Verified against the reel query: 0 = none, a timestamp = a story."""
+    from app.monitor.public_page import parse_public_profile
+
+    with_story = PAGE.replace('"is_private":false,', '"is_private":false,"latest_reel_media":1788624868,')
+    without = PAGE.replace('"is_private":false,', '"is_private":false,"latest_reel_media":0,')
+    expect("a timestamp means a story is up",
+           (parse_public_profile(with_story, "pageuser") or {}).get("has_public_story") is True)
+    expect("0 means none",
+           (parse_public_profile(without, "pageuser") or {}).get("has_public_story") is False)
+    expect("no key means unknown, not False",
+           "has_public_story" not in (parse_public_profile(PAGE, "pageuser") or {}))
+
+    # Through the check: reel route refused, page says story → the story phase
+    # gets a status, marked as page-derived.
+    account_id = await _new_account("pagestory")
+    ig = ScriptedInstagram()
+    ig.probe = lambda i: IdProbe(user_id=i, status=401)
+    ig.profile = lambda u: ProfileFetchResult(
+        username=u, http_status=200, source="public_page", api_status=401,
+        parsed={"username": u, "followers_count": 10, "following_count": 5,
+                "is_private": False, "instagram_id": "42", "has_public_story": True},
+    )
+    service = _service(ig)
+    result = await service.check_username("pagestory")
+    reel = result.get("reel_data") or {}
+    expect("the check carries a page-derived story status",
+           reel.get("has_public_story") is True and reel.get("from_page") is True
+           and reel.get("highlights") is None, repr(result.get("reel_data")))
+
+    # And the story phase uses it without knocking on the refused reel route.
+    class QuietStories:
+        async def fetch_stories(self, username):
+            return []
+
+        async def fetch_highlight_items(self, username, highlight_id, title):
+            return []
+
+        async def fetch_profile_pic_url(self, username):
+            return None
+
+    async def must_not_be_called(user_id):
+        raise AssertionError("the reel route must not be asked again this check")
+
+    ig.fetch_reel_user = must_not_be_called  # type: ignore[assignment]
+    service.stories = QuietStories()
+    service.notifier.send_text.reset_mock()
+    await service._check_stories_and_highlights(
+        account_id, "pagestory", instagram_id="42", reel_data=reel, always_report=True,
+    )
+    texts = _sent(service)
+    expect("the status line is sent from the page's answer",
+           any("HAS STORY" in t or "just posted a story" in t for t in texts), repr(texts))
+    expect("and never 'unavailable'", not any("unavailable" in t for t in texts), repr(texts))
 
 
 async def test_a_manual_check_skips_a_door_known_to_be_shut() -> None:
@@ -718,6 +788,12 @@ class FakeBroker:
         self.asked: list[str] = []
         self.prefetched: list[str] = []
         self.cache: dict = {}
+        # What the summary line reads.
+        self.last_seen_seconds = 5.0
+        self.battery = 92
+        self.charging = False
+        self.worker = "xiaomi"
+        self.delivered = 0
 
     def describe(self) -> str:
         return "connected (worker fake)" if self.connected else "not connected (fake is off)"
@@ -900,6 +976,7 @@ async def main() -> int:
     test_retriable_looks_at_both_routes()
     await test_a_door_found_shut_last_sweep_is_knocked_once()
     await test_a_sweep_hands_the_phone_the_whole_list_up_front()
+    await test_the_page_answers_the_story_question_when_the_reel_route_is_refused()
     await test_a_manual_check_skips_a_door_known_to_be_shut()
     await test_a_shut_gate_is_counted_honestly()
 

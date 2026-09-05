@@ -814,6 +814,7 @@ class MonitorService:
             username_door_threshold=1 if known_closed else None,
         )
         throttle.sweep_usernames = [uname for _, uname in targets]
+        home_pages_before = home_fetch.broker.delivered
         if known_closed:
             # Every account will need its page: hand the phone the whole list
             # now, so its round trips overlap the sweep instead of gating
@@ -1043,6 +1044,10 @@ class MonitorService:
                     "\n🔓 Instagram's profile API is answering username "
                     "lookups again — full readings are back."
                 )
+            if settings.home_fetch_token and home_fetch.broker.last_seen_seconds is not None:
+                summary += "\n" + self._home_fetcher_line(
+                    home_fetch.broker.delivered - home_pages_before
+                )
             if throttle.pauses:
                 summary += (
                     f"\n⏸ Paused {throttle.pauses}× mid-sweep to let Instagram's "
@@ -1217,6 +1222,24 @@ class MonitorService:
         text = render_digest(rows, since=since)
         accounts = len({username for _, username in rows})
         return text, len(rows), accounts
+
+    @staticmethod
+    def _home_fetcher_line(pages: int) -> str:
+        """The phone's part in this sweep, with its battery — the owner asked
+        for the battery to be visible where the sweep reports, not only in
+        /status."""
+        broker = home_fetch.broker
+        state = "connected" if broker.connected else "not connected"
+        battery = ""
+        if broker.battery is not None:
+            charge = (
+                "" if broker.charging is None
+                else " (charging)" if broker.charging else " (not charging)"
+            )
+            battery = f" · battery {broker.battery}%{charge}"
+        name = broker.worker or "phone"
+        noun = "page" if pages == 1 else "pages"
+        return f"🏠 Home fetcher ({name}): {state}, {pages} {noun} this sweep{battery}"
 
     @staticmethod
     def _prefetch_pages(usernames: list[str]) -> None:
@@ -1881,6 +1904,23 @@ class MonitorService:
                 "is_live": bool(reel_data.get("is_live")),
                 "highlights": reel_data.get("highlights") or {},
             }
+        elif fetch.partial and "has_public_story" in parsed:
+            # The id route did not answer, but the page did — and the page
+            # says whether a story is up (latest_reel_media). It knows neither
+            # a live broadcast nor the highlight catalog, so those stay
+            # unknown; the story phase is told where this came from so it
+            # neither knocks on the refused reel route again nor touches the
+            # stored catalog.
+            reel_data_response = {
+                "has_public_story": bool(parsed["has_public_story"]),
+                "is_live": False,
+                "highlights": None,
+                "from_page": True,
+            }
+            logger.debug(
+                "Story status for @{} read from the page (the reel route did "
+                "not answer): has_story={}", username, parsed["has_public_story"],
+            )
         elif fetch.partial:
             # A partial result with no probe answer means the id route did
             # not answer either (or the account has no stored id) — the reel
@@ -2443,7 +2483,10 @@ class MonitorService:
                 # The profile check already ran the reel query and passed the
                 # result down, so this costs nothing on a healthy check. Only a
                 # failed/absent profile check reaches Instagram again here.
-                attempted_reel = False
+                # A page-derived status arrives with the reel route already
+                # refused this check: don't knock again, and leave the stored
+                # highlight catalog as it is.
+                attempted_reel = bool(reel_data and reel_data.get("from_page"))
                 if reel_data is None and instagram_id and not skip_reel_fallback:
                     attempted_reel = True
                     reel_user = await self.instagram.fetch_reel_user(str(instagram_id))

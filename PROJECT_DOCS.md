@@ -568,7 +568,16 @@ batch per poll (`?batch=8`), uploading in the background, while the sweep
 does its id probes. Each check then finds its page in the broker's cache
 (`cached_page_ok`, fresh for 15 min; manual checks ask fresh) and only waits
 when it is still on its way. Every delivery logs the pickup and delivery
-latency, so a slow link shows up as numbers, not as a slow sweep.
+latency, so a slow link shows up as numbers, not as a slow sweep. The worker
+keeps one connection per thread alive (`BotLink`) and tries IPv4 first — a
+fresh DNS + TLS setup per request cost ~30 s on the phone.
+
+The page also carries `latest_reel_media` (0 = no active story, else its
+timestamp; verified against the reel query). When the reel route refuses an
+account, `_handle_success` builds the story status from the page
+(`reel_data["from_page"]`), the story phase does not knock on the reel route
+again, and the highlight catalog is left as stored. The sweep summary ends with
+a home-fetcher line: connection, pages this sweep, battery.
 
 This host's own page request is bounded to 12 s and, after three refusals in
 a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so
