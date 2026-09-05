@@ -155,8 +155,10 @@ class ScriptedInstagram:
         self.profile_calls.append(username)
         self.profile_kwargs.append(dict(kw))
         result = self.profile(username)
-        if result.api_status is None and kw.get("api", True) and result.http_status != 200:
-            result.api_status = result.http_status  # the fake's 401 came from the API
+        if result.api_status is None and kw.get("api", True):
+            # The fake's answer came from the API itself — a 200 as much as a
+            # 401 — which is what the real client records in api_status.
+            result.api_status = result.http_status
         return result
 
     def api_asks(self) -> int:
