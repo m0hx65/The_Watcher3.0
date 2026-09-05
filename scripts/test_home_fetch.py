@@ -122,6 +122,35 @@ async def test_an_abandoned_job_is_not_handed_out() -> None:
     expect("the abandoned job is dropped, not handed out", stale is None, repr(stale))
 
 
+def test_low_battery_alerts_once_and_rearms() -> None:
+    """The phone lives on a charger. A reading that drops while NOT charging
+    means the charger fell out: one alert at the threshold, one at half of
+    it, then "charging again" — never one message per poll."""
+    broker = HomeFetchBroker()
+    broker._worker = "xiaomi"
+    note = lambda b, c: broker.note_device(battery=b, charging=c, threshold=20)  # noqa: E731
+    expect("charging at 68% says nothing", note(68, True) is None)
+    expect("25% not charging is above the line", note(25, False) is None)
+    first = note(20, False)
+    expect("20% not charging alerts", first is not None and "20%" in first and "xiaomi" in first, repr(first))
+    expect("18% does not alert again", note(18, False) is None)
+    expect("12% does not alert again", note(12, False) is None)
+    second = note(10, False)
+    expect("10% (half the threshold) alerts once more", second is not None and "10%" in second, repr(second))
+    expect("9% is silent", note(9, False) is None)
+    back = note(30, True)
+    expect("charging again is announced, once", back is not None and "charging again" in back, repr(back))
+    expect("and only because an alert had gone out", note(31, True) is None)
+    expect("a later drop alerts again", note(19, False) is not None)
+    broker._last_poll = time.monotonic()  # the reading arrives with a poll
+    expect("the battery shows in describe()", "battery 19%, not charging" in broker.describe(),
+           broker.describe())
+    expect("threshold 0 disables the alert",
+           HomeFetchBroker().note_device(battery=5, charging=False, threshold=0) is None)
+    expect("an unknown charging state below the line stays quiet (no false alarm)",
+           HomeFetchBroker().note_device(battery=5, charging=None, threshold=20) is None)
+
+
 # ---------- 2. the endpoints ------------------------------------------------
 
 def _app() -> FastAPI:
@@ -185,6 +214,31 @@ async def test_endpoints() -> None:
                                   headers={"X-Watcher-Token": "sekrit", "X-IG-Status": "200"})
             expect("a delivery nobody waits for is reported as such",
                    r.status_code == 200 and r.json() == {"ok": False}, r.text)
+
+            # The battery rides along with the poll and a low reading reaches
+            # the owner through the monitor's notifier.
+            from types import SimpleNamespace
+            from unittest.mock import AsyncMock
+            notifier = SimpleNamespace(send_text=AsyncMock(return_value=True))
+            transport.app.state.monitor = SimpleNamespace(notifier=notifier)
+            settings.home_fetch_low_battery_percent = 20
+            r = await client.get("/home-fetch/jobs?wait=0.1", headers={
+                "X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi",
+                "X-Watcher-Battery": "15", "X-Watcher-Charging": "no",
+            })
+            await asyncio.sleep(0.05)
+            expect("the poll still answers", r.status_code == 200, r.text)
+            expect("the battery is recorded", home_fetch.broker.battery == 15
+                   and home_fetch.broker.charging is False, home_fetch.broker.describe())
+            expect("and the owner is alerted once", notifier.send_text.await_count == 1
+                   and "15%" in notifier.send_text.await_args.args[0],
+                   repr(notifier.send_text.await_args_list))
+            r = await client.get("/home-fetch/jobs?wait=0.1", headers={
+                "X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi",
+                "X-Watcher-Battery": "14", "X-Watcher-Charging": "no",
+            })
+            await asyncio.sleep(0.05)
+            expect("the next poll does not alert again", notifier.send_text.await_count == 1)
     finally:
         settings.home_fetch_token = old_token
         home_fetch.broker = old_broker
@@ -195,6 +249,7 @@ async def main() -> int:
     await test_round_trip()
     await test_a_silent_worker_costs_only_the_timeout()
     await test_an_abandoned_job_is_not_handed_out()
+    test_low_battery_alerts_once_and_rearms()
     await test_endpoints()
     print()
     if FAILURES:

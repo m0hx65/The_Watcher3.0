@@ -155,16 +155,46 @@ def _check_home_token(token: Optional[str]) -> None:
         )
 
 
+async def _send_alert(request: Request, text: str) -> None:
+    monitor = getattr(request.app.state, "monitor", None)
+    if monitor is None:
+        return
+    try:
+        await monitor.notifier.send_text(text)
+    except Exception as exc:  # pragma: no cover - never fail a poll on this
+        logger.warning("Home fetcher alert not sent: {}", exc)
+
+
 @router.get("/home-fetch/jobs")
 async def home_fetch_next_job(
+    request: Request,
     wait: float = home_fetch.POLL_WAIT_MAX_SECONDS,
     x_watcher_token: Optional[str] = Header(default=None),
     x_watcher_worker: Optional[str] = Header(default=None),
+    x_watcher_battery: Optional[str] = Header(default=None),
+    x_watcher_charging: Optional[str] = Header(default=None),
 ) -> dict:
     """Long-poll for the next page to fetch. Answers {"job": null} after
     `wait` seconds (capped) when there is nothing to do; the worker asks
-    again at once. Each poll marks the worker as connected."""
+    again at once. Each poll marks the worker as connected and, when the
+    device reports its battery, may raise the low-battery alert."""
     _check_home_token(x_watcher_token)
+    battery: Optional[int] = None
+    if x_watcher_battery is not None:
+        try:
+            battery = max(0, min(100, int(x_watcher_battery)))
+        except ValueError:
+            battery = None
+    charging: Optional[bool] = None
+    if x_watcher_charging is not None:
+        charging = x_watcher_charging.strip().lower() in ("yes", "1", "true", "charging")
+    home_fetch.broker._worker = (x_watcher_worker or "unnamed")[:40]
+    alert = home_fetch.broker.note_device(
+        battery=battery, charging=charging,
+        threshold=settings.home_fetch_low_battery_percent,
+    )
+    if alert:
+        asyncio.create_task(_send_alert(request, alert))
     job = await home_fetch.broker.next_job(
         wait=wait, worker=(x_watcher_worker or "unnamed")[:40]
     )

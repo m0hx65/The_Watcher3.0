@@ -69,7 +69,11 @@ and a charger.
    Reboot once to check: Termux should come up and start polling by itself.
 
 In Telegram, `/probe 65xim` now shows a **Home fetcher — connected** line with
-the counts, and the sweep summary counts profiles read from the page.
+the counts, and the sweep summary counts profiles read from the page. The
+status line shows the phone's battery too: the worker reads it from Android
+with every poll, and if it drops to 20% while not charging (the charger fell
+out, the power went) the bot sends you one alert, another at 10%, and a
+"charging again" once it's back on power (`HOME_FETCH_LOW_BATTERY_PERCENT`).
 
 ## Setup on a Windows PC
 

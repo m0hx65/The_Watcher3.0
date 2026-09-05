@@ -58,6 +58,13 @@ class HomeFetchBroker:
         self._worker: Optional[str] = None
         self.delivered = 0
         self.timed_out = 0
+        # What the worker last said about its device. A phone on a charger
+        # reads "charging"; a reading that drops while NOT charging means the
+        # charger fell out or the power went, and the door will close when the
+        # phone dies — worth one message, not one per poll.
+        self.battery: Optional[int] = None
+        self.charging: Optional[bool] = None
+        self._battery_alerted_at: Optional[int] = None
 
     # ----------------------------------------------------------- state
 
@@ -75,16 +82,63 @@ class HomeFetchBroker:
         return time.monotonic() - self._last_poll
 
     def describe(self) -> str:
-        """One phrase for /status and /probe: who, and how long ago."""
+        """One phrase for /status and /probe: who, how long ago, and the
+        device's battery when it reports one."""
         seen = self.last_seen_seconds
         if seen is None:
             return "not connected (no worker has ever polled)"
         who = f"worker {self._worker}" if self._worker else "worker"
+        battery = ""
+        if self.battery is not None:
+            state = (
+                "" if self.charging is None
+                else ", charging" if self.charging else ", not charging"
+            )
+            battery = f", battery {self.battery}%{state}"
         if self.connected:
-            return f"connected ({who}, last poll {seen:.0f}s ago)"
+            return f"connected ({who}, last poll {seen:.0f}s ago{battery})"
         minutes = seen / 60.0
         ago = f"{seen:.0f}s" if minutes < 1 else f"{minutes:.0f} min"
-        return f"not connected ({who} last polled {ago} ago)"
+        return f"not connected ({who} last polled {ago} ago{battery})"
+
+    def note_device(
+        self,
+        *,
+        battery: Optional[int],
+        charging: Optional[bool],
+        threshold: int,
+    ) -> Optional[str]:
+        """Record the worker's battery reading; return an alert to send when
+        it crossed a line, else None.
+
+        One alert when the level is at or below `threshold` while not
+        charging, one more at half the threshold, then silence until the
+        phone is charging again (which is announced, since the owner was
+        told to worry) or has climbed well clear of the threshold.
+        `threshold` 0 disables the alerts; the reading is still shown.
+        """
+        self.battery, self.charging = battery, charging
+        if battery is None or threshold <= 0:
+            return None
+        who = f"the home fetcher ({self._worker})" if self._worker else "the home fetcher"
+        if charging or battery > threshold + 10:
+            was_alerted = self._battery_alerted_at is not None
+            self._battery_alerted_at = None
+            if was_alerted and charging:
+                return f"🔌 <b>{who}</b> is charging again ({battery}%)."
+            return None
+        if battery > threshold or charging is None:
+            return None
+        second_line = max(1, threshold // 2)
+        if self._battery_alerted_at is None or (
+            battery <= second_line and self._battery_alerted_at > second_line
+        ):
+            self._battery_alerted_at = battery
+            return (
+                f"🔋 <b>{who}</b> is at <b>{battery}%</b> and not charging — "
+                "plug it in, or the profile-page door closes when it dies."
+            )
+        return None
 
     # ------------------------------------------------------ the bot side
 

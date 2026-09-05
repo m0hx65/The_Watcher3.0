@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # back — no tunnel, no inbound port. This is the shared secret it presents;
     # set the same value on both sides. Empty = the door is off.
     home_fetch_token: Optional[str] = Field(default=None, alias="HOME_FETCH_TOKEN")
+    # The worker reports its battery with every poll; at or below this percent
+    # while not charging, the owner gets one Telegram alert (and one more at
+    # half of it). 0 disables the alert.
+    home_fetch_low_battery_percent: int = Field(
+        default=20, alias="HOME_FETCH_LOW_BATTERY_PERCENT"
+    )
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
     # worker call is already 6 upstream attempts with rotating UAs and hosts —

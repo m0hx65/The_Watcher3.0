@@ -37,13 +37,16 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 try:
     from curl_cffi import requests as curl_requests
@@ -159,6 +162,58 @@ def _fetch_with_stdlib(url: str) -> tuple[int, bytes, str]:
     return status, body, final_url
 
 
+# ------------------------------------------------------------- the device
+
+def read_battery() -> tuple[Optional[int], Optional[bool]]:
+    """Battery percent and whether it is charging, or (None, None) when the
+    device does not say. Android exposes both in sysfs, readable without root
+    on most phones; Termux:API's `termux-battery-status` is the fallback. A
+    desktop PC reports nothing, which is fine. The bot turns a low reading
+    into a Telegram alert, so a phone that fell off its charger is noticed
+    before it dies and the page door closes."""
+    base = Path("/sys/class/power_supply")
+    if base.exists():
+        for name in ("battery", "Battery", "BAT0", "BAT1"):
+            capacity = base / name / "capacity"
+            if not capacity.exists():
+                continue
+            try:
+                percent = int(capacity.read_text().strip())
+            except (OSError, ValueError):
+                continue
+            charging: Optional[bool] = None
+            status_file = base / name / "status"
+            if status_file.exists():
+                try:
+                    status = status_file.read_text().strip().lower()
+                    charging = status in ("charging", "full")
+                except OSError:
+                    pass
+            return percent, charging
+    if shutil.which("termux-battery-status"):
+        try:
+            out = subprocess.run(
+                ["termux-battery-status"], capture_output=True, text=True, timeout=10,
+            ).stdout
+            data = json.loads(out)
+            percent = int(data.get("percentage"))
+            charging = str(data.get("status", "")).upper() in ("CHARGING", "FULL")
+            return percent, charging
+        except Exception:
+            pass
+    return None, None
+
+
+def _device_headers() -> dict[str, str]:
+    percent, charging = read_battery()
+    headers: dict[str, str] = {}
+    if percent is not None:
+        headers["X-Watcher-Battery"] = str(percent)
+    if charging is not None:
+        headers["X-Watcher-Charging"] = "yes" if charging else "no"
+    return headers
+
+
 # --------------------------------------------------------------- the bot
 
 def _bot_request(method: str, url: str, token: str, worker: str, *,
@@ -178,11 +233,16 @@ def _bot_request(method: str, url: str, token: str, worker: str, *,
 
 def run(url: str, token: str, worker: str) -> int:
     _log(f"polling {url} as '{worker}'  (engine: {ENGINE})")
+    percent, charging = read_battery()
+    if percent is not None:
+        state = "charging" if charging else "not charging" if charging is not None else "unknown"
+        _log(f"battery {percent}% ({state}) - reported to the bot with every poll")
     backoff = 5.0
     while True:
         try:
             status, raw = _bot_request(
                 "GET", f"{url}/home-fetch/jobs?wait={POLL_WAIT_SECONDS}", token, worker,
+                headers=_device_headers(),
             )
         except (urllib.error.URLError, socket.timeout, OSError) as exc:
             _log(f"bot unreachable ({exc}) - retrying in {backoff:.0f}s")
