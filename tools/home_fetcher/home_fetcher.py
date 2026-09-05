@@ -171,27 +171,26 @@ def read_battery() -> tuple[Optional[int], Optional[bool]]:
     desktop PC reports nothing, which is fine. The bot turns a low reading
     into a Telegram alert, so a phone that fell off its charger is noticed
     before it dies and the page door closes."""
+    # sysfs first. On many phones (MIUI among them) SELinux refuses Termux
+    # even a stat() here — Python then raises PermissionError from exists(),
+    # so every touch is guarded and any refusal means "ask elsewhere".
     base = Path("/sys/class/power_supply")
-    if base.exists():
-        for name in ("battery", "Battery", "BAT0", "BAT1"):
-            capacity = base / name / "capacity"
-            if not capacity.exists():
-                continue
-            try:
-                percent = int(capacity.read_text().strip())
-            except (OSError, ValueError):
-                continue
-            charging: Optional[bool] = None
-            status_file = base / name / "status"
-            if status_file.exists():
-                try:
-                    status = status_file.read_text().strip().lower()
-                    charging = status in ("charging", "full")
-                except OSError:
-                    pass
-            return percent, charging
-    if shutil.which("termux-battery-status"):
+    for name in ("battery", "Battery", "BAT0", "BAT1"):
         try:
+            percent = int((base / name / "capacity").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        charging: Optional[bool] = None
+        try:
+            status = (base / name / "status").read_text().strip().lower()
+            charging = status in ("charging", "full")
+        except (OSError, ValueError):
+            pass
+        return percent, charging
+    # Termux:API (the add-on app plus `pkg install termux-api`) exposes the
+    # battery to Termux the supported way.
+    try:
+        if shutil.which("termux-battery-status"):
             out = subprocess.run(
                 ["termux-battery-status"], capture_output=True, text=True, timeout=10,
             ).stdout
@@ -199,8 +198,8 @@ def read_battery() -> tuple[Optional[int], Optional[bool]]:
             percent = int(data.get("percentage"))
             charging = str(data.get("status", "")).upper() in ("CHARGING", "FULL")
             return percent, charging
-        except Exception:
-            pass
+    except Exception:
+        pass
     return None, None
 
 
