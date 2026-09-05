@@ -78,6 +78,30 @@ def test_username_door_closes_while_the_id_route_answers() -> None:
            t.peak_consecutive_user_blocks == 3, repr(t.peak_consecutive_user_blocks))
 
 
+def test_a_page_answer_does_not_reopen_the_api_door() -> None:
+    """The username API refused, the page answered: the check succeeded, but
+    the API door is still shut and must be booked as such — otherwise every
+    account keeps spending a blocked Worker call on an API known to be
+    walled, and the door never closes."""
+    t = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=3)
+    for _ in range(3):
+        t.record(200, id_status=200, api_status=401)
+    expect("the API door closes on api_status, not on the page's 200",
+           t.username_door_closed)
+    expect("while every check counted as answered", t.answered == 3, repr(t.answered))
+    expect("and the gate is fine", not t.gate_down and not t.is_open())
+
+    t2 = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=2)
+    t2.record(200, id_status=200, api_status=None)  # API skipped: no door verdict
+    t2.record(200, id_status=200, api_status=None)
+    expect("a skipped API says nothing about the door", not t2.username_door_closed)
+
+    t3 = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=2)
+    t3.record(401)  # legacy call: the overall status stands for the API door
+    t3.record(401)
+    expect("without api_status the overall status is the door", t3.username_door_closed)
+
+
 def test_one_username_success_keeps_the_door_open() -> None:
     t = _SweepThrottle(base_stagger=0.0, max_stagger=0.0, breaker_threshold=2)
     t.record(200, id_status=200)
@@ -123,11 +147,20 @@ class ScriptedInstagram:
         )
         self.probe: Callable[[str], IdProbe] = lambda i: IdProbe(user_id=i, status=401)
         self.profile_calls: list[str] = []
+        self.profile_kwargs: list[dict] = []
         self.probe_calls: list[str] = []
 
     async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         self.profile_calls.append(username)
-        return self.profile(username)
+        self.profile_kwargs.append(dict(kw))
+        result = self.profile(username)
+        if result.api_status is None and kw.get("api", True) and result.http_status != 200:
+            result.api_status = result.http_status  # the fake's 401 came from the API
+        return result
+
+    def api_asks(self) -> int:
+        """How many fetch_profile calls were allowed to ask the username API."""
+        return sum(1 for kw in self.profile_kwargs if kw.get("api", True))
 
     async def probe_by_id(self, user_id: str) -> IdProbe:
         self.probe_calls.append(str(user_id))
@@ -349,20 +382,23 @@ async def test_both_routes_blocked_stays_quiet() -> None:
            repr(account.consecutive_failures))
 
 
-async def test_id_only_with_no_id_is_deferred_not_failed() -> None:
+async def test_no_id_still_gets_the_page_doors_when_the_api_is_skipped() -> None:
+    """An account without a stored id can't be asked by id, but the page
+    doors need no id — and the page payload carries the pk, so one page
+    answer is what gives it an id for next time."""
     account_id = await _new_account("idless", instagram_id=None)
     ig = ScriptedInstagram()
     service = _service(ig)
-    result = await service._run_check(account_id, "idless", id_only=True)
-    expect("deferred, not failed", result.get("skipped") is True and result.get("ok") is False,
+    result = await service._run_check(account_id, "idless", skip_username_api=True)
+    expect("the username side was asked once", ig.profile_calls == ["idless"],
+           repr(ig.profile_calls))
+    expect("with the API skipped", ig.profile_kwargs[-1].get("api") is False,
+           repr(ig.profile_kwargs))
+    expect("no id, so no id probe", ig.probe_calls == [], repr(ig.probe_calls))
+    expect("the failure is booked honestly as a block",
+           result.get("ok") is False and result.get("status") == 401
+           and result.get("api_status") is None and result.get("id_status") is None,
            repr(result))
-    expect("nothing was asked", ig.profile_calls == [] and ig.probe_calls == [],
-           repr((ig.profile_calls, ig.probe_calls)))
-    async with get_session() as session:
-        account = await session.get(MonitoredAccount, account_id)
-    expect("and no bookkeeping pretends a check happened",
-           account.last_checked_at is None and account.consecutive_failures == 0,
-           repr((account.last_checked_at, account.consecutive_failures)))
 
 
 # ---------- 3. the sweep --------------------------------------------------
@@ -400,10 +436,58 @@ async def test_a_shut_username_door_does_not_stop_the_sweep() -> None:
            "checked by Instagram ID only" in summary, summary)
     expect("and that the username door was shut",
            "refused every username lookup" in summary, summary)
-    expect("the username door was asked only until it closed",
-           len(ig.profile_calls) == settings.sweep_breaker_threshold,
-           f"{len(ig.profile_calls)} vs threshold {settings.sweep_breaker_threshold}")
+    expect("the username API was asked only until it closed",
+           ig.api_asks() == settings.sweep_breaker_threshold,
+           f"{ig.api_asks()} vs threshold {settings.sweep_breaker_threshold}")
+    expect("the page doors were still tried for every account",
+           len(ig.profile_calls) == 6, repr(ig.profile_kwargs))
     expect("every account was asked by id", len(ig.probe_calls) == 6, repr(ig.probe_calls))
+
+
+async def test_retry_rounds_re_ask_by_id_when_the_door_is_shut() -> None:
+    """The last three accounts of a real sweep were refused on the id route,
+    back to back, and were left as failures because the retry pass was
+    skipped along with the username door. The id route is refused per colo,
+    so a paced re-ask is exactly the cheap recovery it exists for — by id,
+    without knocking on the door already known to be shut."""
+    names = [f"retry{i}" for i in range(5)]
+    blocked_once: dict[str, int] = {}
+
+    def probe(i: str) -> IdProbe:
+        n = int(i) - 1000
+        if n == 4:  # the last account: refused on the first ask, answers on the retry
+            blocked_once[i] = blocked_once.get(i, 0) + 1
+            if blocked_once[i] == 1:
+                return IdProbe(user_id=i, status=401)
+        return _answered(i, f"retry{n}")
+
+    old_rounds = settings.sweep_retry_rounds
+    settings.sweep_retry_rounds = 1
+    service_mod._SWEEP_RETRY_COOLDOWN_SECONDS = 0.01
+    service_mod._SWEEP_RETRY_GAP_SECONDS = (0.0, 0.0)
+    try:
+        result, texts, ig = await _sweep_with(
+            lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+            probe, names,
+        )
+    finally:
+        settings.sweep_retry_rounds = old_rounds
+    summary = texts[-1]
+    expect("the blocked account recovered on retry",
+           result["failed"] == 0 and result["answered"] == 5, repr(result))
+    expect("and the summary says so", "recovered on retry" in summary, summary)
+    expect("the retry did not re-knock on the username API",
+           ig.api_asks() == settings.sweep_breaker_threshold,
+           f"{ig.api_asks()} API asks vs threshold {settings.sweep_breaker_threshold}")
+    expect("one extra id ask — the retry", len(ig.probe_calls) == 6, repr(ig.probe_calls))
+
+
+def test_retriable_looks_at_both_routes() -> None:
+    is_retriable = MonitorService._is_retriable
+    expect("an id-only block is retriable", is_retriable({"ok": False, "status": None, "id_status": 401}))
+    expect("a username block is retriable", is_retriable({"ok": False, "status": 401, "id_status": None}))
+    expect("a 404 by id is not", not is_retriable({"ok": False, "status": 404, "id_status": 404}))
+    expect("a check that asked nothing is not", not is_retriable({"ok": False, "status": None, "id_status": None}))
 
 
 async def test_a_shut_gate_is_counted_honestly() -> None:
@@ -443,7 +527,8 @@ class _MockSession:
         self.requests: list[dict] = []
 
     async def get(self, url: str, *, params: Any = None, headers: Any = None):
-        self.requests.append({"url": url, "params": dict(params or {})})
+        self.requests.append({"url": url, "params": dict(params or {}),
+                              "headers": dict(headers or {})})
         return self.handler(url, dict(params or {}))
 
     async def close(self) -> None:
@@ -458,6 +543,102 @@ REEL = {"data": {"user": {
     }},
     "edge_highlight_reels": {"edges": []},
 }}}
+
+
+PAGE = (
+    "<!DOCTYPE html><html><head></head><body>"
+    "<script type=\"application/json\" data-sjs>"
+    '{"require":[["RelayPrefetchedStreamCache","next",[],[{"__bbox":'
+    '{"result":{"data":{"xig_user_by_username":'
+    '{"pk":"42","username":"pageuser",'
+    '"profile_pic_url":"https:\\/\\/scontent.cdninstagram.com\\/v\\/t51.2885-19\\/1_2_3_n.jpg",'
+    '"is_private":false,"biography":"bio text","full_name":"Page User",'
+    '"is_verified":false,"bio_links":[],"follower_count":1234,'
+    '"following_count":567,"all_media_count":null,"id":"17841407816045006"}'
+    "}}}}]]]}</script></body></html>"
+)
+
+
+async def test_fetch_profile_can_skip_the_api() -> None:
+    """With the username API known to be walled, a sweep asks the page doors
+    directly — and books the API as not asked, not as open."""
+    old = settings.ig_proxy_url
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    try:
+        session = _MockSession(lambda url, p: _MockResponse(429, {}, text=""))
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("pageuser", auth_attempts=1, api=False)
+    finally:
+        settings.ig_proxy_url = old
+    expect("the worker was never asked by username",
+           not any("workers.dev" in r["url"] for r in session.requests), repr(session.requests))
+    expect("the page was", any("instagram.com/pageuser/" in r["url"] for r in session.requests),
+           repr(session.requests))
+    expect("the result reads as blocked", not result.success and result.http_status == 401,
+           repr(result))
+    expect("and the API as not asked", result.api_status is None, repr(result.api_status))
+
+
+async def test_home_door_answers_when_this_host_is_refused() -> None:
+    """The measured state: this host's page request is bounced with a 429,
+    the PC's is not. The home fetcher's answer is the same page, parsed the
+    same way, and marked partial like any page reading."""
+    old_proxy, old_home, old_token = settings.ig_proxy_url, settings.home_fetch_url, settings.home_fetch_token
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.home_fetch_url = "https://my-pc.tail1234.ts.net/"
+    settings.home_fetch_token = "sekrit"
+
+    def handler(url: str, params: dict) -> _MockResponse:
+        if "workers.dev" in url:
+            return _MockResponse(401, {})
+        if url.startswith("https://www.instagram.com/pageuser/"):
+            return _MockResponse(429, {}, text="")
+        if url == "https://my-pc.tail1234.ts.net/page/pageuser":
+            return _MockResponse(200, {}, text=PAGE)
+        return _MockResponse(500, {}, text="unexpected " + url)
+
+    try:
+        session = _MockSession(handler)
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("pageuser", auth_attempts=1)
+        home_calls = [r for r in session.requests if "my-pc" in r["url"]]
+        expect("the home fetcher answered", result.success and result.source == "public_page",
+               repr(result))
+        expect("with the page's numbers",
+               (result.parsed or {}).get("following_count") == 567
+               and (result.parsed or {}).get("followers_count") == 1234, repr(result.parsed))
+        expect("the API's refusal is still on record", result.api_status == 401,
+               repr(result.api_status))
+        expect("this host's own page request came first",
+               [r["url"] for r in session.requests][-2].startswith("https://www.instagram.com/pageuser/"),
+               repr([r["url"] for r in session.requests]))
+        expect("the home fetcher was asked once, with the token",
+               len(home_calls) == 1 and home_calls[0]["headers"].get("X-Watcher-Token") == "sekrit",
+               repr(home_calls))
+
+        # The PC is off: the door fails fast and the check reads as blocked.
+        def off(url: str, params: dict) -> _MockResponse:
+            if "my-pc" in url:
+                raise ConnectionError("no route to host")
+            return _MockResponse(401 if "workers.dev" in url else 429, {}, text="")
+        session = _MockSession(off)
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("pageuser", auth_attempts=1)
+        expect("an unreachable home fetcher leaves the block intact",
+               not result.success and result.http_status == 401, repr(result))
+
+        # Instagram's own 404 through the home fetcher is a real 404.
+        def gone(url: str, params: dict) -> _MockResponse:
+            if "my-pc" in url:
+                return _MockResponse(404, {}, text="<html>not found</html>")
+            return _MockResponse(401 if "workers.dev" in url else 429, {}, text="")
+        session = _MockSession(gone)
+        async with InstagramClient(max_retries=5, session=session) as client:
+            result = await client.fetch_profile("pageuser", auth_attempts=1)
+        expect("a page 404 is handed up as a 404", result.http_status == 404 and not result.success,
+               repr(result))
+    finally:
+        settings.ig_proxy_url, settings.home_fetch_url, settings.home_fetch_token = old_proxy, old_home, old_token
 
 
 async def test_probe_reports_what_instagram_said() -> None:
@@ -508,6 +689,7 @@ async def main() -> int:
     settings.dark_radar_days = 0
 
     test_username_door_closes_while_the_id_route_answers()
+    test_a_page_answer_does_not_reopen_the_api_door()
     test_one_username_success_keeps_the_door_open()
     test_gate_down_needs_both_routes_blocked()
 
@@ -517,11 +699,15 @@ async def main() -> int:
     await test_a_gone_id_is_announced_at_once()
     await test_a_username_404_with_a_blocked_id_route_is_surfaced_on_the_second_miss()
     await test_both_routes_blocked_stays_quiet()
-    await test_id_only_with_no_id_is_deferred_not_failed()
+    await test_no_id_still_gets_the_page_doors_when_the_api_is_skipped()
 
     await test_a_shut_username_door_does_not_stop_the_sweep()
+    await test_retry_rounds_re_ask_by_id_when_the_door_is_shut()
+    test_retriable_looks_at_both_routes()
     await test_a_shut_gate_is_counted_honestly()
 
+    await test_fetch_profile_can_skip_the_api()
+    await test_home_door_answers_when_this_host_is_refused()
     await test_probe_reports_what_instagram_said()
 
     await engine.dispose()

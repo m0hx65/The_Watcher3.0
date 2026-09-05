@@ -35,3 +35,6 @@ watcher-backup*.json
 htmlcov/
 .pytest_cache/
 .mypy_cache/
+
+# The home page fetcher's shared secret (tools/home_fetcher)
+tools/home_fetcher/home_fetcher.token

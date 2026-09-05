@@ -715,6 +715,9 @@ def instagram_route() -> str:
         # PROXY_URL wraps the whole session, so it applies to the hop that
         # reaches the worker — not to the worker's own egress to Instagram.
         route += " + outbound proxy"
+    if settings.home_fetch_url:
+        home = urlparse(settings.home_fetch_url).hostname or settings.home_fetch_url
+        route += f" · profile page via home fetcher ({home})"
     return route
 
 
@@ -2562,7 +2565,7 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await show("⏳ Trying the public page…")
 
-    page = await service.instagram.probe_public_page(username)
+    page = await service.instagram.probe_public_page(username, allow_home=False)
     got = page.get("parsed")
     if got:
         # A count Instagram omitted is shown as "—", never as 0: `all_media_count`
@@ -2573,7 +2576,8 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return fmt_number(value) if isinstance(value, int) else "—"
 
         lines.append(
-            f"✅ <b>Public page</b> — followers: <b>{count('followers_count')}</b>, "
+            f"✅ <b>Public page</b> (this host) — followers: "
+            f"<b>{count('followers_count')}</b>, "
             f"following: <b>{count('following_count')}</b>, "
             f"posts: <b>{count('posts_count')}</b>"
             + (" 🔒" if got.get("is_private") else "")
@@ -2582,9 +2586,32 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         lines.append(
-            f"❌ <b>Public page</b> — <code>{esc(str(page.get('error')))}</code> "
+            f"❌ <b>Public page</b> (this host) — "
+            f"<code>{esc(str(page.get('error')))}</code> "
             f"({fmt_number(page.get('bytes') or 0)} bytes)"
         )
+
+    # The same page, fetched by the home fetcher — a PC on a connection
+    # Instagram trusts (tools/home_fetcher). Measured on its own so "the
+    # page is blocked" and "the PC is off" stay distinguishable.
+    if settings.home_fetch_url:
+        await show("⏳ Asking the home fetcher…")
+        home = await service.instagram.probe_home_page(username)
+        home_got = home.get("parsed")
+        if home_got:
+            def hcount(field: str) -> str:
+                value = home_got.get(field)
+                return fmt_number(value) if isinstance(value, int) else "—"
+            lines.append(
+                f"✅ <b>Home fetcher</b> — followers: <b>{hcount('followers_count')}</b>, "
+                f"following: <b>{hcount('following_count')}</b>"
+                + (" 🔒" if home_got.get("is_private") else "")
+            )
+            got = got or home_got
+        else:
+            lines.append(
+                f"❌ <b>Home fetcher</b> — <code>{esc(str(home.get('error')))}</code>"
+            )
     await show("⏳ Checking saveinsta…")
 
     if service.stories is not None:

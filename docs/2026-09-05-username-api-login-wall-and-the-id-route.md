@@ -73,9 +73,10 @@ once per check.
   <date>") and in the sweep summary. Counts and bio are never guessed.
 - **The throttle books two doors.** `SWEEP_BREAKER_THRESHOLD` refused username
   lookups in a row with none answering close *that door* for the rest of the
-  sweep — the remaining accounts go by id only, the retry rounds are skipped
-  (they would only knock on the same door) — while `gate_down` now means the
-  id route answered nothing either. A check where either route answered is a
+  sweep — the remaining accounts go by id only, and the retry rounds re-ask
+  anything still blocked by id only (the id route is refused per colo too, so
+  a paced re-ask from another colo usually lands) — while `gate_down` now
+  means the id route answered nothing either. A check where either route answered is a
   success for pacing.
 - **A username 404 is surfaced**, worded by what the id route said: the id
   still answering under the same name is a glitch (quiet); the id gone means
@@ -106,7 +107,26 @@ refresh.
 
 Follower/following/post counts, bio, name and the privacy flag need either
 the username API (login-walled) or the public page (429 from Render's shared
-IP, intermittent even from residential). A residential proxy remains the one
-durable route to the full profile. Until then the bot says what it knows and
+IP, intermittent even from residential). Measured the same evening: the page
+is refused from Cloudflare's edge too. A `?page=<username>` route on the
+Worker sends the full Chrome navigation header set; Instagram answers with a
+redirect to `/accounts/login/?next=…&is_from_rle` and that page is a 429 with
+an empty body — for every account, `@instagram` included. The header set is
+what makes Instagram embed the payload (plain curl with those headers gets it
+from a residential IP; with only a User-Agent it gets an empty shell), but
+only once the source IP is let in, and neither datacenter egress is. The
+route stays deployed so the question is one request away.
+
+The free way around it shipped the same evening: **the owner's own PC as a
+fourth door.** The owner's curl from home — through Proton VPN, no less —
+got the page every time, so `tools/home_fetcher` runs there, fetches only
+`instagram.com/<username>/` with Chrome impersonation, and is exposed with a
+free Tailscale Funnel URL. The bot asks it after its own page request is
+refused, parses the same payload, and books the API door by what the API
+itself said (`api_status`) so a page answer never re-opens it. Proton VPN
+offers no standalone SOCKS5 proxy, and a Tailscale exit node inside the
+Render container was the other free option — rejected for needing container
+surgery and for coupling the whole bot to the PC being on. With the fetch
+service, a PC that is off costs one quick failure and an id-only sweep. Until then the bot says what it knows and
 dates what it doesn't — per the standing rule: an honest gap over a stale
 number.

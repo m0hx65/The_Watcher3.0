@@ -72,6 +72,11 @@ class ProfileFetchResult:
     # genuinely does not know reels_count, story_count or is_business. Callers
     # must not read an absent field as an empty one.
     source: str = "api"
+    # What the username API itself answered on this fetch (200/401/404/…), or
+    # None when it was not asked. Kept apart from http_status, which is the
+    # outcome AFTER the page doors — the sweep guard books the API door by
+    # this, so a page that answered never reads as the API being open.
+    api_status: Optional[int] = None
 
     @property
     def success(self) -> bool:
@@ -613,8 +618,13 @@ class InstagramClient:
         *,
         auth_attempts: Optional[int] = None,
         allow_fallback: bool = True,
+        api: bool = True,
     ) -> ProfileFetchResult:
         """Fetch a profile with intelligent retry/backoff.
+
+        `api=False` skips the username API and goes straight to the page doors
+        — a sweep sets it once that API has refused every lookup so far, so the
+        remaining accounts don't each spend a blocked Worker call on it.
 
         `auth_attempts` caps how many times a 401/403 is re-asked THROUGH THE
         WORKER, where one call is already 6 upstream attempts. Sweeps pass 1
@@ -641,7 +651,13 @@ class InstagramClient:
             fetch_params = {"username": username}
             fetch_headers = headers
 
-        for attempt in range(1, self.max_retries + 1):
+        attempts = range(1, self.max_retries + 1)
+        if not api:
+            attempts = range(0)
+            last_status = 401  # stands in for the refusal already measured
+            last_error = "username API skipped — it refused every lookup this sweep"
+
+        for attempt in attempts:
             jitter = random.uniform(0.0, 1.5)
             try:
                 response = await self._session.get(
@@ -668,6 +684,7 @@ class InstagramClient:
                                 http_status=404,
                                 raw_response=payload,
                                 error="User not found in response",
+                                api_status=404,
                             )
                         fetch_health.record_status(IG_PROFILE, 200)
                         return ProfileFetchResult(
@@ -675,6 +692,7 @@ class InstagramClient:
                             http_status=200,
                             parsed=parsed,
                             raw_response=payload,
+                            api_status=200,
                         )
 
                 if response.status_code == 404:
@@ -683,6 +701,7 @@ class InstagramClient:
                         username=username,
                         http_status=404,
                         error="User not found",
+                        api_status=404,
                     )
 
                 if response.status_code == 429:
@@ -765,9 +784,11 @@ class InstagramClient:
         # account whose payload — and app, and rendered page — said 577. The
         # tags are a stale cache with nothing marking them as stale. See
         # app/monitor/public_page.py.
+        api_status = last_status if api else None
         if allow_fallback and last_status in (401, 403):
             fallback = await self.fetch_profile_via_public_page(username)
             if fallback is not None:
+                fallback.api_status = api_status
                 return fallback
 
         # Record the terminal outcome once per fetch (retries within a single
@@ -777,6 +798,7 @@ class InstagramClient:
             username=username,
             http_status=last_status,
             error=last_error or f"failed after {self.max_retries} attempts",
+            api_status=api_status,
         )
 
     async def fetch_profile_via_public_page(
@@ -802,13 +824,26 @@ class InstagramClient:
         outcome = await self.probe_public_page(username)
         parsed = outcome.get("parsed")
         if parsed is None:
+            if outcome.get("status") == 404:
+                # The page itself says the username does not exist. That is a
+                # real answer (the login wall and the rate limit come back as
+                # 200 shells or 429s, never 404), so hand it up as one and let
+                # the check weigh it against the numeric-id route.
+                fetch_health.record_status(IG_PROFILE, 404)
+                return ProfileFetchResult(
+                    username=username,
+                    http_status=404,
+                    error="User not found (public page)",
+                    source="public_page",
+                )
             return None
 
         fetch_health.record_status(IG_PROFILE, 200)
         logger.info(
-            "@{} answered on the public page after the API blocked us — "
+            "@{} answered on the public page ({}) after the API blocked us — "
             "partial data ({} of {} fields)",
-            username, len(parsed), len(PARTIAL_FIELDS),
+            username, outcome.get("door") or "direct", len(parsed),
+            len(PARTIAL_FIELDS),
         )
         return ProfileFetchResult(
             username=username,
@@ -817,19 +852,38 @@ class InstagramClient:
             source="public_page",
         )
 
-    async def probe_public_page(self, username: str) -> dict[str, Any]:
-        """Fetch the public page once and report what came back, in detail.
+    async def probe_public_page(
+        self, username: str, *, allow_home: bool = True
+    ) -> dict[str, Any]:
+        """Fetch the public page and report what came back, in detail.
 
-        Returns {"status", "bytes", "parsed", "error"}. Every outcome is logged
-        at INFO rather than debug: this path only runs when the API is already
-        blocked, so it is rare, and it is the one measurement that says whether
-        anything can still reach Instagram from this host. Learning that from a
-        log needs the log to actually contain it.
+        Returns {"status", "bytes", "parsed", "error", "door"}. Two doors, in
+        order: this host's own request, then — when `HOME_FETCH_URL` is set and
+        `allow_home` — the home fetcher, a machine whose connection Instagram
+        trusts (see tools/home_fetcher). Every outcome is logged at INFO: this
+        path only runs when the API is already blocked, so it is rare, and it
+        is the one measurement that says whether anything can still reach
+        Instagram. Learning that from a log needs the log to contain it.
         """
+        result = await self._probe_page_direct(username)
+        if result.get("parsed") is not None or not allow_home:
+            return result
+        if not settings.home_fetch_url:
+            return result
+        home = await self.probe_home_page(username)
+        if home.get("parsed") is not None or home.get("status") == 404:
+            return home
+        # Neither door answered — report this host's own outcome, and note the
+        # home fetcher's alongside it.
+        result["home_error"] = home.get("error")
+        return result
+
+    async def _probe_page_direct(self, username: str) -> dict[str, Any]:
         username = username.strip().lstrip("@")
         url = f"https://{PROFILE_PAGE_HOST}/{username}/"
         result: dict[str, Any] = {
             "status": 0, "bytes": 0, "parsed": None, "error": None,
+            "door": "direct",
         }
         try:
             response = await self._session.get(
@@ -864,6 +918,65 @@ class InstagramClient:
             logger.info(
                 "Public page for @{} was served ({} bytes) but carried no "
                 "profile payload — login wall or markup change",
+                username, len(body),
+            )
+        return result
+
+    async def probe_home_page(self, username: str) -> dict[str, Any]:
+        """The public page, fetched by the home fetcher (tools/home_fetcher).
+
+        The service returns Instagram's own status and HTML untouched, so a
+        404 here is Instagram's 404 and a 429 is Instagram rate-limiting the
+        home connection — distinguishable from the service being unreachable
+        (status 0, the PC is off or the tunnel is down), which is expected and
+        costs the sweep nothing but this one quick failure.
+        """
+        username = username.strip().lstrip("@")
+        result: dict[str, Any] = {
+            "status": 0, "bytes": 0, "parsed": None, "error": None,
+            "door": "home",
+        }
+        base = (settings.home_fetch_url or "").rstrip("/")
+        if not base:
+            result["error"] = "HOME_FETCH_URL not set"
+            return result
+        headers = {"Accept-Language": "en-US,en;q=0.9"}
+        if settings.home_fetch_token:
+            headers["X-Watcher-Token"] = settings.home_fetch_token
+        try:
+            response = await self._session.get(
+                f"{base}/page/{username}", headers=headers
+            )
+        except Exception as exc:
+            result["error"] = f"home fetcher unreachable: {exc!r}"
+            logger.info(
+                "Home fetcher unreachable for @{} ({}) — is the PC on and the "
+                "tunnel up?", username, exc,
+            )
+            return result
+
+        body = getattr(response, "text", "") or ""
+        result["status"] = response.status_code
+        result["bytes"] = len(body)
+        if response.status_code != 200:
+            result["error"] = f"HTTP {response.status_code}"
+            logger.info(
+                "Home fetcher: Instagram answered HTTP {} for @{} ({} bytes)",
+                response.status_code, username, len(body),
+            )
+            return result
+        parsed = await asyncio.to_thread(parse_public_profile, body, username)
+        result["parsed"] = parsed
+        if parsed is None:
+            result["error"] = "no profile payload in the page"
+            logger.info(
+                "Home fetcher: page for @{} served ({} bytes) but carried no "
+                "profile payload — login wall or markup change",
+                username, len(body),
+            )
+        else:
+            logger.info(
+                "Public page for @{} answered via the home fetcher ({} bytes)",
                 username, len(body),
             )
         return result

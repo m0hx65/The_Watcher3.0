@@ -7,7 +7,7 @@ import contextlib
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from app.bot.notifications import (
     NotificationDispatcher,
@@ -79,6 +79,11 @@ _SWEEP_BREAKER_MAX_PAUSES = 2
 # A 404 is a real answer (read against the numeric-id route in _do_check and
 # surfaced by _handle_failure), not a block to retry.
 _RETRIABLE_STATUSES = (401, 403, 429, 0)
+
+# `record(api_status=...)` default: "not given" is not the same as None. None
+# means the username API was deliberately not asked; not given means the
+# caller only knows the overall status, which then stands for the API door.
+_NOT_GIVEN: object = object()
 
 # How many sweeps a private→public backlog grab may retry before giving up, so a
 # genuinely empty (or permanently unreachable) account can't retry forever.
@@ -212,21 +217,27 @@ class _SweepThrottle:
         self._skipped += 1
 
     def record(
-        self, status: Optional[int], *, id_status: Optional[int] = None
+        self,
+        status: Optional[int],
+        *,
+        id_status: Optional[int] = None,
+        api_status: Any = _NOT_GIVEN,
     ) -> None:
-        """Book one check. `status` is the username route's HTTP answer (None
-        when it was not asked); `id_status` the numeric-id route's (None when
-        the account has no stored id).
+        """Book one check. `status` is the username side's overall answer
+        (the API or, failing that, a page door — None when nothing on that
+        side was asked); `id_status` the numeric-id route's (None when the
+        account has no stored id); `api_status` what the username API ITSELF
+        said (None when it was skipped), so a page that answered after the
+        API refused still counts as the API door being shut.
 
-        A check is BLOCKED only when nothing answered: the username route
-        was refused (or not asked because that door is already closed) and
-        the id route did not answer either. A check where either route
-        answered is a success for pacing and for the gate. The gate is down
-        when Instagram answers NOTHING — not when one of its doors is shut,
-        which since 2026-09-05 is the normal state of the username door.
+        A check is BLOCKED only when nothing answered anywhere. A check where
+        any route answered is a success for pacing and for the gate. The gate
+        is down when Instagram answers NOTHING — not when one of its doors is
+        shut, which since 2026-09-05 is the normal state of the username API.
         """
-        user_blocked = status in (401, 403)
-        user_ok = status == 200
+        door = status if api_status is _NOT_GIVEN else api_status
+        user_blocked = door in (401, 403)
+        user_ok = door == 200
         # A 404 by id is an answer (the id is gone), not a block.
         id_answered = id_status in (200, 404)
 
@@ -729,12 +740,15 @@ class MonitorService:
         # a retry round is 200+ more blocked requests that deny Instagram the
         # very quiet it needs to let us back in. The next sweep is the retry.
         #
-        # Also skipped when the username door closed with nothing answering
-        # on it: a retry round would knock on that same door for every
-        # account again, and the id route already had its say.
+        # With the username door shut the rounds still run, by id only: the
+        # id route is refused per colo too (the last three accounts of a sweep
+        # were, back to back), and a paced re-ask from a different colo is the
+        # cheapest recovery there is — one Worker call each.
         recovered = (
-            0 if (throttle.gate_down or throttle.username_door_closed)
-            else await self._retry_blocked(outcomes)
+            0 if throttle.gate_down
+            else await self._retry_blocked(
+                outcomes, skip_username_api=throttle.username_door_closed
+            )
         )
 
         # One batched read of every pending backlog-grab flag, so the per-account
@@ -827,6 +841,10 @@ class MonitorService:
             1 for _, _, r in outcomes
             if r.get("ok") and r.get("partial") == "id_probe"
         )
+        page_only = sum(
+            1 for _, _, r in outcomes
+            if r.get("ok") and r.get("partial") == "public_page"
+        )
         deferred = sum(1 for _, _, r in outcomes if r.get("skipped"))
         changed = sum(1 for _, _, r in outcomes if r.get("changed"))
         failed_usernames = [
@@ -837,9 +855,9 @@ class MonitorService:
         failed = len(failed_usernames)
 
         logger.info(
-            "Sweep done: checked={}, answered={}, id_only={}, changed={}, "
-            "failed={}, deferred={}",
-            checked, answered, id_only, changed, failed, deferred,
+            "Sweep done: checked={}, answered={}, id_only={}, page_only={}, "
+            "changed={}, failed={}, deferred={}",
+            checked, answered, id_only, page_only, changed, failed, deferred,
         )
 
         # Went-dark radar: flag targets that have posted nothing for a while.
@@ -873,6 +891,12 @@ class MonitorService:
             if failed:
                 names = ", ".join(f"@{u}" for u in sorted(failed_usernames))
                 summary += f" {failed} failed: {names}"
+            if page_only:
+                summary += (
+                    f"\n📄 {page_only} read from the profile page — followers, "
+                    "following, bio and privacy are live; reel and highlight "
+                    "counts carried forward."
+                )
             if id_only:
                 summary += (
                     f"\n🪪 {id_only} checked by Instagram ID only — username, "
@@ -881,9 +905,10 @@ class MonitorService:
                 )
             if throttle.username_door_closed:
                 summary += (
-                    "\n🚪 Instagram refused every username lookup "
-                    f"({throttle.peak_consecutive_user_blocks} in a row), so "
-                    "the rest of the sweep asked by ID only."
+                    "\n🚪 Instagram's profile API refused every username "
+                    f"lookup ({throttle.peak_consecutive_user_blocks} in a "
+                    "row), so the rest of the sweep skipped it and used the "
+                    "ID route and the profile page."
                 )
             if throttle.pauses:
                 summary += (
@@ -897,12 +922,6 @@ class MonitorService:
                     f"{throttle.peak_consecutive_blocks} blocks in a row — "
                     f"{deferred} account(s) deferred to avoid making it "
                     "worse. They'll retry shortly / next sweep."
-                )
-            elif deferred:
-                summary += (
-                    f"\n⏭ {deferred} account(s) have no stored Instagram ID "
-                    "and were skipped — with username lookups refused they "
-                    "can't be checked until the ID is known."
                 )
         if backfill_ids:
             async with get_session() as session:
@@ -927,6 +946,7 @@ class MonitorService:
             "failed": failed,
             "answered": answered,
             "id_only": id_only,
+            "page_only": page_only,
             "deferred": deferred,
         }
         if id_backfill is not None:
@@ -1098,17 +1118,39 @@ class MonitorService:
                 return self._breaker_skipped_result(username)
             result = await self._run_check(
                 account_id, username, thorough=False,
-                id_only=throttle.username_door_closed,
+                skip_username_api=throttle.username_door_closed,
             )
             # Recorded inside the slot so the next account's pacing — and any
             # cooldown this block just triggered — already accounts for it.
             throttle.record(
-                result.get("status"), id_status=result.get("id_status")
+                result.get("status"),
+                id_status=result.get("id_status"),
+                api_status=result.get("api_status", _NOT_GIVEN),
             )
             return result
 
-    async def _retry_blocked(self, outcomes: list[tuple[int, str, dict]]) -> int:
+    @staticmethod
+    def _is_retriable(result: dict) -> bool:
+        """A block on EITHER route earns another paced ask — the gate blocks a
+        request, not an account. A check that asked nothing (no stored id while
+        the username door was shut) has both statuses None and is left alone."""
+        return (
+            result.get("status") in _RETRIABLE_STATUSES
+            or result.get("id_status") in _RETRIABLE_STATUSES
+        )
+
+    async def _retry_blocked(
+        self,
+        outcomes: list[tuple[int, str, dict]],
+        *,
+        skip_username_api: bool = False,
+    ) -> int:
         """Re-check rate-limit-blocked accounts in paced rounds, in place.
+
+        `skip_username_api` carries the sweep's door state into the rounds:
+        once the username API has refused every lookup, a retry asks the id
+        route and the page doors only — instead of re-knocking on the door
+        already known to be shut.
 
         Instagram's anonymous gate blocks a REQUEST, not an account: the same
         username that 401s inside a sweep answers 200 a minute later on a manual
@@ -1132,7 +1174,7 @@ class MonitorService:
             retriable = [
                 (idx, aid, uname)
                 for idx, (aid, uname, r) in enumerate(outcomes)
-                if not r.get("ok") and r.get("status") in _RETRIABLE_STATUSES
+                if not r.get("ok") and self._is_retriable(r)
             ]
             if not retriable:
                 break
@@ -1151,7 +1193,10 @@ class MonitorService:
                 if time.monotonic() >= deadline:
                     logger.info("Retry budget spent mid-round — stopping")
                     break
-                retry = await self._run_check(aid, uname, thorough=False)
+                retry = await self._run_check(
+                    aid, uname, thorough=False,
+                    skip_username_api=skip_username_api,
+                )
                 if retry.get("ok"):
                     outcomes[idx] = (aid, uname, retry)
                     recovered += 1
@@ -1170,20 +1215,21 @@ class MonitorService:
         *,
         notify_unchanged: bool = False,
         thorough: bool = True,
-        id_only: bool = False,
+        skip_username_api: bool = False,
     ) -> dict:
         """One full check. `thorough` (the default) lets a blocked fetch try
         every colo it can — right for on-demand checks, which are one account
         with someone waiting. Sweeps pass False: there, extra attempts are
         multiplied by every account into the blocked traffic that keeps
         Instagram's gate shut, and the paced retry rounds are the second
-        chance instead. `id_only` skips the username route altogether — a
-        sweep sets it once that door has refused every lookup so far."""
+        chance instead. `skip_username_api` leaves the username API alone
+        (the id route and the page doors still run) — a sweep sets it once
+        that API has refused every lookup so far."""
         async with self._semaphore:
             try:
                 return await self._do_check(
                     account_id, username, notify_unchanged,
-                    thorough=thorough, id_only=id_only,
+                    thorough=thorough, skip_username_api=skip_username_api,
                 )
             except Exception as exc:
                 logger.exception("Unhandled error checking @{}: {}", username, exc)
@@ -1196,7 +1242,7 @@ class MonitorService:
         notify_unchanged: bool,
         *,
         thorough: bool = True,
-        id_only: bool = False,
+        skip_username_api: bool = False,
     ) -> dict:
         logger.info("Checking @{}", username)
 
@@ -1209,21 +1255,6 @@ class MonitorService:
         # highlight catalog — the story phase reuses it, so nothing below
         # asks the reel question twice.
         instagram_id = await self._stored_instagram_id(account_id)
-        if id_only and not instagram_id:
-            # Nothing to ask by. Deferred like a breaker skip: no check
-            # happened, so no bookkeeping pretends one did.
-            return {
-                "ok": False,
-                "username": username,
-                "status": None,
-                "id_status": None,
-                "error": (
-                    "deferred — no Instagram ID stored and Instagram is "
-                    "refusing username lookups this sweep"
-                ),
-                "skipped": True,
-            }
-
         probe: Optional[IdProbe] = None
         if instagram_id:
             probe = await self.instagram.probe_by_id(instagram_id)
@@ -1238,36 +1269,43 @@ class MonitorService:
                     account_id, username, gone, id_probe=probe
                 )
                 result["id_status"] = probe.status
+                result["api_status"] = None
                 return result
             if probe.answered and probe.username and probe.username != username:
                 username = await self._apply_rename(
                     account_id, username, probe.username
                 )
 
-        fetch: Optional[ProfileFetchResult] = None
-        if not id_only:
-            fetch = await self.instagram.fetch_profile(
-                username,
-                auth_attempts=(
-                    settings.ig_manual_auth_attempts
-                    if thorough
-                    else settings.ig_sweep_auth_attempts
-                ),
+        # Then the username side: the profile API — unless this sweep has
+        # already found it refusing every lookup — and, when that is blocked,
+        # the page doors: this host's own request, then the home fetcher when
+        # one is configured. The page carries the counts, the bio and the
+        # privacy flag the id route does not.
+        fetch = await self.instagram.fetch_profile(
+            username,
+            auth_attempts=(
+                settings.ig_manual_auth_attempts
+                if thorough
+                else settings.ig_sweep_auth_attempts
+            ),
+            api=not skip_username_api,
+        )
+        id_status = probe.status if probe is not None else None
+        if fetch.success:
+            result = await self._handle_success(
+                account_id, username, fetch, notify_unchanged,
+                reel_data=probe.reel_data if probe is not None else None,
             )
-            if fetch.success:
-                result = await self._handle_success(
-                    account_id, username, fetch, notify_unchanged,
-                    reel_data=probe.reel_data if probe is not None else None,
-                )
-                result["id_status"] = probe.status if probe is not None else None
-                return result
+            result["id_status"] = id_status
+            result["api_status"] = fetch.api_status
+            return result
 
         if probe is not None and probe.answered:
-            # The username door is shut (or was not asked) but the id route
-            # answered: a LIVE, PARTIAL reading. It knows the username and the
-            # avatar; it does not know the counts, the bio or the flags, and
-            # those carry forward from the last full reading rather than
-            # being invented — see _handle_success.
+            # Every username-side door is shut but the id route answered: a
+            # LIVE, PARTIAL reading. It knows the username and the avatar; it
+            # does not know the counts, the bio or the flags, and those carry
+            # forward from the last full reading rather than being invented —
+            # see _handle_success.
             partial = ProfileFetchResult(
                 username=username,
                 http_status=200,
@@ -1278,38 +1316,27 @@ class MonitorService:
                 },
                 source="id_probe",
             )
-            if fetch is not None:
-                logger.info(
-                    "@{} answered by numeric id after the username route "
-                    "returned {} — partial reading (username, picture, story "
-                    "status)", username, fetch.http_status,
-                )
+            logger.info(
+                "@{} answered by numeric id after the username side returned "
+                "{} — partial reading (username, picture, story status)",
+                username, fetch.http_status,
+            )
             result = await self._handle_success(
                 account_id, username, partial, notify_unchanged,
                 reel_data=probe.reel_data,
             )
-            # The username route's answer, for the sweep guard: None when it
-            # was not asked. The check itself is ok.
-            result["status"] = fetch.http_status if fetch is not None else None
-            result["id_status"] = probe.status
+            # The username side's answer, for the sweep guard. The check
+            # itself is ok.
+            result["status"] = fetch.http_status
+            result["id_status"] = id_status
+            result["api_status"] = fetch.api_status
             return result
 
-        username_status = fetch.http_status if fetch is not None else None
-        if fetch is None:
-            # The username route was not asked and the id route did not
-            # answer either. The bookkeeping records the id route's answer;
-            # the sweep guard is told the username route was not asked, so
-            # an id-only block is never counted as a refused username lookup.
-            fetch = ProfileFetchResult(
-                username=username,
-                http_status=probe.status if probe is not None else 0,
-                error="blocked on the numeric-id route",
-            )
         result = await self._handle_failure(
             account_id, username, fetch, id_probe=probe
         )
-        result["status"] = username_status
-        result["id_status"] = probe.status if probe is not None else None
+        result["id_status"] = id_status
+        result["api_status"] = fetch.api_status
         return result
 
     async def _stored_instagram_id(self, account_id: int) -> Optional[str]:

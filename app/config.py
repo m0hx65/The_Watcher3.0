@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     # When unset, requests go out unauthenticated.
     ig_session_cookie: Optional[str] = Field(default=None, alias="IG_SESSION_COOKIE")
     ig_proxy_url: Optional[str] = Field(default=None, alias="IG_PROXY_URL")
+    # A page-fetch service on a machine whose connection Instagram trusts —
+    # your PC (see tools/home_fetcher). Asked for the public profile page only,
+    # and only after this host's own page request was refused. Leave empty to
+    # disable. The token is the shared secret the service prints at startup.
+    home_fetch_url: Optional[str] = Field(default=None, alias="HOME_FETCH_URL")
+    home_fetch_token: Optional[str] = Field(default=None, alias="HOME_FETCH_TOKEN")
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
     # worker call is already 6 upstream attempts with rotating UAs and hosts —

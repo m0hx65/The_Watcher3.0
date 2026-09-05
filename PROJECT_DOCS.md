@@ -102,8 +102,10 @@ User (Telegram)
         A changed username is persisted + announced here (_apply_rename);
         a 404 by id means the account is gone, not renamed
     b.  InstagramClient.fetch_profile(username)  →  200 JSON from Instagram.
-        Skipped for the rest of the sweep once that door has refused
-        SWEEP_BREAKER_THRESHOLD lookups in a row with none answering
+        The API is skipped for the rest of the sweep once it has refused
+        SWEEP_BREAKER_THRESHOLD lookups in a row with none answering; the
+        page doors still run — this host's own request, then the home
+        fetcher (HOME_FETCH_URL, a PC on a trusted connection)
     c.  If (b) is blocked but (a) answered: an id-only PARTIAL reading —
         username + picture live, everything else carried forward, labelled
     d.  MediaHasher.hash_url()  →  download + perceptual hash
@@ -393,9 +395,9 @@ sweep itself is paced by `_SweepThrottle`:
   (`web_profile_info`) and the numeric-id route (graphql reel query) are
   counted on their own. `SWEEP_BREAKER_THRESHOLD` refused username lookups
   in a row with none answering closes THAT door for the rest of the sweep —
-  the remaining accounts are checked by id only and the retry rounds are
-  skipped — while the gate counts as shut only when the id route answered
-  nothing either. A check where either route answered is a success for
+  the remaining accounts are checked by id only, and the retry rounds re-ask
+  anything still blocked by id only — while the gate counts as shut only when
+  the id route answered nothing either. A check where either route answered is a success for
   pacing.
 - **Retry rounds** (`SWEEP_RETRY_ROUNDS`, cooldown doubling 30s → 60s → 120s,
   bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a
@@ -533,7 +535,23 @@ this design:
 - A Worker hop also **loses the Chrome TLS fingerprint**: the runtime's own
   handshake carries a header claiming to be Chrome. That mismatch is a stronger
   signal than either fact alone, and it is why the public-page fallback is
-  fetched directly instead.
+  fetched directly instead. (Measured 2026-09-05 with a `?page=` route: the
+  edge is bounced to the login page and answered 429 regardless — the IP,
+  not the fingerprint, is what decides. The route stays for re-tests.)
+
+### 6.8 Home page fetcher
+
+`tools/home_fetcher/home_fetcher.py` — a stdlib + curl_cffi HTTP service you
+run on your own PC, whose connection Instagram trusts. One job: fetch
+`instagram.com/<username>/` with Chrome impersonation and return Instagram's
+status and HTML untouched (`GET /page/<username>`, header `X-Watcher-Token`).
+Exposed for free with a stable HTTPS URL via `tailscale funnel --bg 8787`;
+the bot reads `HOME_FETCH_URL` / `HOME_FETCH_TOKEN` and
+`InstagramClient.probe_home_page` parses the same Relay payload the direct
+page door does, so the reading is a normal `source="public_page"` partial.
+Order on the username side: the API (unless skipped for the sweep), this
+host's page request, the home fetcher. An unreachable fetcher (PC off) is a
+fast, quiet failure — the sweep stays id-only. About 700 KB per page.
 
 The durable fix within a login-free design is a residential/mobile proxy
 (`IG_PROXY_URL` unset, `PROXY_URL` set), which gets a consumer-ASN IP *and*
