@@ -818,6 +818,7 @@ class MonitorService:
         # the moment the API answers, and costs ten seconds a sweep instead of
         # a threshold's worth of blocked Worker calls.
         known_closed = await self.username_api_known_closed()
+        home_serving = bool(settings.home_fetch_token and home_fetch.broker.connected)
         if known_closed:
             logger.info(
                 "Username API door: known shut since {} — one knock this sweep",
@@ -828,8 +829,15 @@ class MonitorService:
                 "Username API door: believed open — up to {} knocks before it "
                 "closes", settings.sweep_breaker_threshold,
             )
+        # With the API door shut and the phone serving, the bot makes no direct
+        # Instagram calls on the hot path — the id probe reads the phone's
+        # cache and the page comes from the phone — so there is nothing to pace
+        # against. The gap between checks drops to almost nothing and the sweep
+        # runs as fast as the phone can deliver, instead of adding 2 s of dead
+        # air per account.
+        base_stagger = 0.2 if (known_closed and home_serving) else _SWEEP_STAGGER_SECONDS
         throttle = _SweepThrottle(
-            base_stagger=_SWEEP_STAGGER_SECONDS,
+            base_stagger=base_stagger,
             max_stagger=settings.sweep_stagger_max_seconds,
             breaker_threshold=settings.sweep_breaker_threshold,
             concurrency=settings.sweep_concurrency,
@@ -1076,10 +1084,6 @@ class MonitorService:
                     "\n🔓 Instagram's profile API is answering username "
                     "lookups again — full readings are back."
                 )
-            if settings.home_fetch_token and home_fetch.broker.last_seen_seconds is not None:
-                summary += "\n" + self._home_fetcher_line(
-                    home_fetch.broker.delivered - home_pages_before
-                )
             if throttle.pauses:
                 summary += (
                     f"\n⏸ Paused {throttle.pauses}× mid-sweep to let Instagram's "
@@ -1109,6 +1113,13 @@ class MonitorService:
                     f"{'s' if still_missing != 1 else ''} still missing an ID"
                 )
         await self.notifier.send_text(summary)
+
+        # The home fetcher's part in this sweep goes out as its own message,
+        # not tucked onto the summary — the owner asked to see it on its own.
+        if settings.home_fetch_token and home_fetch.broker.last_seen_seconds is not None:
+            await self.notifier.send_text(
+                self._home_fetcher_line(home_fetch.broker.delivered - home_pages_before)
+            )
 
         result = {
             "checked": checked,

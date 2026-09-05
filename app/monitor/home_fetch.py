@@ -101,7 +101,12 @@ class PageResult:
 class HomeFetchBroker:
     def __init__(self) -> None:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._queue: Optional[asyncio.Queue[PageJob]] = None
+        # A priority queue of (priority, seq, job): pages (priority 0) are
+        # handed out before reels (1), so a sweep's counts arrive first and
+        # the story/highlight reels fill in after. seq keeps it FIFO within a
+        # priority and keeps the tuples orderable without comparing jobs.
+        self._queue: "Optional[asyncio.PriorityQueue]" = None
+        self._seq = 0
         # job id -> job, for everything queued or handed out and not yet
         # answered; (kind, key) -> that job, so one question is one job.
         self._jobs: dict[str, PageJob] = {}
@@ -283,7 +288,7 @@ class HomeFetchBroker:
         queue = self._get_queue()
         jobs: list[PageJob] = []
         limit = max(1, min(max_jobs, BATCH_MAX))
-        passed_over: list[PageJob] = []
+        passed_over: list[tuple] = []
         seen: set[str] = set()
         try:
             while len(jobs) < limit:
@@ -291,28 +296,29 @@ class HomeFetchBroker:
                 if jobs:
                     # Already have one: take the rest without waiting.
                     try:
-                        job = queue.get_nowait()
+                        item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
                 else:
                     if remaining <= 0:
                         break
                     try:
-                        job = await asyncio.wait_for(queue.get(), remaining)
+                        item = await asyncio.wait_for(queue.get(), remaining)
                     except asyncio.TimeoutError:
                         break
+                job = item[-1]
                 if job.id in seen:
-                    passed_over.append(job)  # cycled through everything left
+                    passed_over.append(item)  # cycled through everything left
                     break
                 seen.add(job.id)
                 if job.kind not in self._worker_kinds:
-                    passed_over.append(job)
+                    passed_over.append(item)
                     continue
                 if self._take(job):
                     jobs.append(job)
         finally:
-            for job in passed_over:
-                queue.put_nowait(job)
+            for item in passed_over:
+                queue.put_nowait(item)
         self._last_poll = time.monotonic()
         return jobs
 
@@ -411,7 +417,9 @@ class HomeFetchBroker:
                       prefetch=prefetch)
         self._jobs[job.id] = job
         self._by_key[(kind, key)] = job
-        queue.put_nowait(job)
+        self._seq += 1
+        priority = 0 if kind == KIND_PAGE else 1
+        queue.put_nowait((priority, self._seq, job))
         return job
 
     def _take(self, job: PageJob) -> bool:
@@ -432,7 +440,7 @@ class HomeFetchBroker:
         # jobs belong to the old loop's checks and are already lost with it.
         loop = asyncio.get_running_loop()
         if self._queue is None or self._loop is not loop:
-            self._queue = asyncio.Queue()
+            self._queue = asyncio.PriorityQueue()
             self._loop = loop
             self._jobs.clear()
             self._by_key.clear()

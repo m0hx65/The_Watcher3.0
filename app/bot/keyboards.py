@@ -487,6 +487,7 @@ def status_actions() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("🔄 Sweep Now", callback_data="menu:sweep:ids"),
+                InlineKeyboardButton("🔋 Battery", callback_data="menu:battery"),
             ],
             [
                 InlineKeyboardButton("🌑 Dark radar", callback_data="menu:darkradar"),

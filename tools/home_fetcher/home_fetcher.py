@@ -51,6 +51,7 @@ import gzip
 import http.client
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -503,17 +504,51 @@ def deliver(url: str, token: str, worker: str, job_id: str, username: str,
     )
 
 
+def _fetch_loop(url: str, token: str, worker: str,
+                jobs_q: "queue.Queue", uploads: ThreadPoolExecutor) -> None:
+    """Fetch handed-out jobs, one at a time, paced. This is the ONLY place
+    that sleeps for the 2 s gap or the soft-block pause — so the poll loop,
+    on another thread, never stops polling (the bug that made the phone go
+    'not connected' mid-sweep and collapsed the whole sweep to id-only)."""
+    while True:
+        username, job_id, kind, user_id = jobs_q.get()
+        started = time.monotonic()
+        try:
+            if kind == "reel":
+                ig_status, body, final_url = fetch_reel(user_id, username)
+            else:
+                ig_status, body, final_url = fetch_profile_page(username)
+        except Exception as exc:  # network failure on our side
+            _log(f"@{username}: Instagram request failed - {exc!r}")
+            ig_status, body, final_url = 0, b"", ""
+        uploads.submit(
+            deliver, url, token, worker, job_id, username,
+            ig_status, body, final_url, time.monotonic() - started, kind,
+        )
+
+
 def run(url: str, token: str, worker: str) -> int:
     _log(f"polling {url} as '{worker}'  (engine: {ENGINE})")
     percent, charging = read_battery()
     if percent is not None:
         state = "charging" if charging else "not charging" if charging is not None else "unknown"
         _log(f"battery {percent}% ({state}) - reported to the bot with every poll")
+
+    # Two threads behind the poll loop: one fetches (paced), a small pool
+    # uploads. The poll loop below only polls and enqueues — it never fetches,
+    # never paces, never waits out a soft block — so it keeps the connection
+    # warm and the bot always sees the phone as connected, however slow the
+    # fetching gets.
+    jobs_q: "queue.Queue" = queue.Queue()
     uploads = ThreadPoolExecutor(max_workers=UPLOAD_THREADS, thread_name_prefix="upload")
+    threading.Thread(
+        target=_fetch_loop, args=(url, token, worker, jobs_q, uploads),
+        name="fetch", daemon=True,
+    ).start()
+
     link = BotLink(url, token, worker)
     backoff = 5.0
     while True:
-        poll_started = time.monotonic()
         try:
             status, raw = link.request(
                 "GET",
@@ -552,7 +587,6 @@ def run(url: str, token: str, worker: str) -> int:
         if not jobs:
             continue  # nothing to do this round — poll again at once
 
-        _log(f"{len(jobs)} job(s) received after a {time.monotonic() - poll_started:.1f}s poll")
         for job in jobs:
             username = str(job.get("username", "")).lstrip("@")
             job_id = str(job.get("id", ""))
@@ -564,19 +598,9 @@ def run(url: str, token: str, worker: str) -> int:
             if kind == "reel" and not user_id.isdigit():
                 _log(f"ignoring a reel job without a numeric id: {job!r}")
                 continue
-            started = time.monotonic()
-            try:
-                if kind == "reel":
-                    ig_status, body, final_url = fetch_reel(user_id, username)
-                else:
-                    ig_status, body, final_url = fetch_profile_page(username)
-            except Exception as exc:  # network failure on our side
-                _log(f"@{username}: Instagram request failed - {exc!r}")
-                ig_status, body, final_url = 0, b"", ""
-            uploads.submit(
-                deliver, url, token, worker, job_id, username,
-                ig_status, body, final_url, time.monotonic() - started, kind,
-            )
+            jobs_q.put((username, job_id, kind, user_id))
+        depth = jobs_q.qsize()
+        _log(f"{len(jobs)} job(s) taken" + (f" ({depth} waiting to fetch)" if depth > 1 else ""))
 
 
 def main() -> int:

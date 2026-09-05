@@ -3114,6 +3114,32 @@ async def _handle_menu(
         )
         return
 
+    if action == "battery":
+        # The phone reports its battery with every poll, so this is always the
+        # latest reading — the button shows it as a popup and refreshes the
+        # status text (which carries the same reading on its home-fetcher line).
+        from app.monitor import home_fetch
+        broker = home_fetch.broker
+        if not settings.home_fetch_token:
+            popup = "The home fetcher is off (HOME_FETCH_TOKEN not set)."
+        elif broker.battery is None:
+            popup = f"No battery reading yet — home fetcher {broker.describe()}."
+        else:
+            charge = (
+                "charging" if broker.charging
+                else "not charging" if broker.charging is False else "unknown"
+            )
+            seen = broker.last_seen_seconds
+            ago = "just now" if seen is None or seen < 5 else f"{seen:.0f}s ago"
+            conn = "connected" if broker.connected else "NOT connected"
+            popup = f"🔋 {broker.battery}% ({charge})\n{conn}, last poll {ago}"
+        await _safe_answer(query, popup, show_alert=True)
+        text = await _render_status_message(context)
+        await _safe_edit_text(
+            query, text, reply_markup=keyboards.status_actions()
+        )
+        return
+
     if action == "interval":
         await _safe_answer(query)
         sched = _scheduler(context)

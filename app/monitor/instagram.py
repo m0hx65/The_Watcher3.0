@@ -493,6 +493,15 @@ class InstagramClient:
                 status, parsed = self._parse_home_reel(home)
                 if parsed is not None or status == 404:
                     return await self._fill_probe(probe, status, parsed, via="home")
+        if cached_ok and phone:
+            # A sweep with the phone up: the reel was prefetched (served from
+            # the cache just above) or is still on its way. Either way DON'T
+            # spend ~9 s on the refused Worker or block on a live phone
+            # request — the profile page carries this account's story status,
+            # and a rename is caught next sweep once its reel lands. This is
+            # what keeps a sweep's per-account cost near zero.
+            probe.via = "cache-miss"
+            return probe
 
         worker_refusing = time.monotonic() < self._worker_reel_blocked_until
         order = ["home", "worker"] if (phone and worker_refusing) else ["worker", "home"]
