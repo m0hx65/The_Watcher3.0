@@ -561,6 +561,13 @@ request, the home fetcher. A worker that has not polled for 90 s is "not
 connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
 page from Instagram, ~150 KB compressed to the bot.
 
+This host's own page request is bounded to 12 s and, after three refusals in
+a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so
+the home fetcher is asked at once (`/probe` still forces a measurement).
+Every check logs one timing line — `@user took 4.1s (id 1.0s, username side
+2.9s, direct 0.3s, home 2.4s, diff+store 0.2s)` — so a slow sweep names the
+slow door.
+
 The durable fix within a login-free design is a residential/mobile proxy
 (`IG_PROXY_URL` unset, `PROXY_URL` set), which gets a consumer-ASN IP *and*
 keeps the real Chrome fingerprint. The Worker remains the free default.

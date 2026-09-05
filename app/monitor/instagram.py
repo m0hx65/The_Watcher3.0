@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
 from curl_cffi.requests import AsyncSession
@@ -78,6 +78,10 @@ class ProfileFetchResult:
     # outcome AFTER the page doors — the sweep guard books the API door by
     # this, so a page that answered never reads as the API being open.
     api_status: Optional[int] = None
+    # Seconds spent per door on this fetch ("api", "direct", "home", "page"),
+    # for the one-line timing the check logs — the sweep was slow for a long
+    # time before anyone could say WHICH door was slow.
+    timings: dict[str, float] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -295,6 +299,12 @@ class InstagramClient:
         # story status, highlight catalog) — serve repeats from memory instead
         # of burning Instagram requests, which is the main 401 trigger.
         self._reel_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # This host's own page door. Instagram refuses datacenter IPs on it
+        # with a 429 — sometimes instantly, sometimes only after holding the
+        # connection open — so after a few refusals in a row the door is
+        # skipped for a while and the home fetcher (if any) takes over at once.
+        self._direct_page_failures = 0
+        self._direct_page_blocked_until = 0.0
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -403,6 +413,13 @@ class InstagramClient:
         except Exception as exc:
             logger.debug("Mobile user-info failed for user_id={}: {}", user_id, exc)
         return None
+
+    # This host's page door: refusals in a row before it is skipped, for how
+    # long, and the most one attempt may take (redirect to the login page
+    # included) before it counts as a refusal.
+    _DIRECT_PAGE_BREAKER_FAILURES = 3
+    _DIRECT_PAGE_COOLDOWN = 1800.0
+    _DIRECT_PAGE_TIMEOUT = 12.0
 
     # How long to skip the reel query after a hard block (401/403) before probing
     # again. Keeps card opens and sweeps fast where the graphql endpoint is
@@ -652,6 +669,7 @@ class InstagramClient:
             fetch_params = {"username": username}
             fetch_headers = headers
 
+        started = time.monotonic()
         attempts = range(1, self.max_retries + 1)
         if not api:
             attempts = range(0)
@@ -694,6 +712,7 @@ class InstagramClient:
                             parsed=parsed,
                             raw_response=payload,
                             api_status=200,
+                            timings={"api": time.monotonic() - started},
                         )
 
                 if response.status_code == 404:
@@ -786,10 +805,14 @@ class InstagramClient:
         # tags are a stale cache with nothing marking them as stale. See
         # app/monitor/public_page.py.
         api_status = last_status if api else None
+        timings: dict[str, float] = {"api": time.monotonic() - started}
         if allow_fallback and last_status in (401, 403):
+            page_started = time.monotonic()
             fallback = await self.fetch_profile_via_public_page(username)
+            timings["page"] = time.monotonic() - page_started
             if fallback is not None:
                 fallback.api_status = api_status
+                fallback.timings = {**fallback.timings, **timings}
                 return fallback
 
         # Record the terminal outcome once per fetch (retries within a single
@@ -800,6 +823,7 @@ class InstagramClient:
             http_status=last_status,
             error=last_error or f"failed after {self.max_retries} attempts",
             api_status=api_status,
+            timings=timings,
         )
 
     async def fetch_profile_via_public_page(
@@ -836,6 +860,7 @@ class InstagramClient:
                     http_status=404,
                     error="User not found (public page)",
                     source="public_page",
+                    timings=dict(outcome.get("timings") or {}),
                 )
             return None
 
@@ -851,10 +876,15 @@ class InstagramClient:
             http_status=200,
             parsed=parsed,
             source="public_page",
+            timings=dict(outcome.get("timings") or {}),
         )
 
     async def probe_public_page(
-        self, username: str, *, allow_home: bool = True
+        self,
+        username: str,
+        *,
+        allow_home: bool = True,
+        force_direct: bool = False,
     ) -> dict[str, Any]:
         """Fetch the public page and report what came back, in detail.
 
@@ -866,18 +896,61 @@ class InstagramClient:
         is the one measurement that says whether anything can still reach
         Instagram. Learning that from a log needs the log to contain it.
         """
-        result = await self._probe_page_direct(username)
+        timings: dict[str, float] = {}
+        if not force_direct and time.monotonic() < self._direct_page_blocked_until:
+            # Refused a few times in a row lately: don't spend up to
+            # _DIRECT_PAGE_TIMEOUT seconds per account re-learning it. One
+            # try after the cooldown re-tests the door. (/probe forces it.)
+            result: dict[str, Any] = {
+                "status": 0, "bytes": 0, "parsed": None, "door": "direct",
+                "error": "skipped — this host's page requests were refused "
+                         "repeatedly; retried after a cooldown",
+                "timings": timings,
+            }
+        else:
+            clock = time.monotonic()
+            result = await self._probe_page_direct(username)
+            timings["direct"] = time.monotonic() - clock
+            result["timings"] = timings
+            self._note_direct_page(result)
         if result.get("parsed") is not None or not allow_home:
             return result
         if not settings.home_fetch_token:
             return result
+        clock = time.monotonic()
         home = await self.probe_home_page(username)
+        timings["home"] = time.monotonic() - clock
+        home["timings"] = timings
         if home.get("parsed") is not None or home.get("status") == 404:
             return home
         # Neither door answered — report this host's own outcome, and note the
         # home fetcher's alongside it.
         result["home_error"] = home.get("error")
         return result
+
+    def _note_direct_page(self, outcome: dict[str, Any]) -> None:
+        """Book this host's page door: an answer with the payload resets the
+        streak; a 404 is an answer about the username, not about this host;
+        anything else (429, login redirect, empty shell, timeout) is a refusal,
+        and enough of them in a row close the door for a cooldown."""
+        if outcome.get("parsed") is not None:
+            self._direct_page_failures = 0
+            self._direct_page_blocked_until = 0.0
+            return
+        if outcome.get("status") == 404:
+            return
+        self._direct_page_failures += 1
+        if self._direct_page_failures >= self._DIRECT_PAGE_BREAKER_FAILURES:
+            self._direct_page_blocked_until = (
+                time.monotonic() + self._DIRECT_PAGE_COOLDOWN
+            )
+            logger.info(
+                "This host's page requests were refused {} times in a row "
+                "(last: {}) — skipping that door for {:.0f} min; the home "
+                "fetcher, if any, is asked straight away",
+                self._direct_page_failures, outcome.get("error"),
+                self._DIRECT_PAGE_COOLDOWN / 60,
+            )
 
     async def _probe_page_direct(self, username: str) -> dict[str, Any]:
         username = username.strip().lstrip("@")
@@ -887,9 +960,23 @@ class InstagramClient:
             "door": "direct",
         }
         try:
-            response = await self._session.get(
-                url, headers={"Accept-Language": "en-US,en;q=0.9"}
+            # Bounded hard: a refused datacenter IP is sometimes answered with
+            # a 429 at once and sometimes left hanging; the session's default
+            # 20 s read timeout, times the redirect to the login page, is how a
+            # fallback door came to cost 40 s per account.
+            response = await asyncio.wait_for(
+                self._session.get(
+                    url, headers={"Accept-Language": "en-US,en;q=0.9"}
+                ),
+                timeout=self._DIRECT_PAGE_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            result["error"] = f"timed out after {self._DIRECT_PAGE_TIMEOUT:.0f}s"
+            logger.info(
+                "Public page for @{} did not answer this host within {:.0f}s",
+                username, self._DIRECT_PAGE_TIMEOUT,
+            )
+            return result
         except Exception as exc:
             result["error"] = repr(exc)
             logger.warning("Public page fetch failed for @{}: {}", username, exc)

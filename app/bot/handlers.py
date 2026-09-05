@@ -2589,7 +2589,10 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await show("⏳ Trying the public page…")
 
-    page = await service.instagram.probe_public_page(username, allow_home=False)
+    # A probe measures the door even while the client is skipping it.
+    page = await service.instagram.probe_public_page(
+        username, allow_home=False, force_direct=True
+    )
     got = page.get("parsed")
     if got:
         # A count Instagram omitted is shown as "—", never as 0: `all_media_count`

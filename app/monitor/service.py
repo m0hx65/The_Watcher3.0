@@ -1336,13 +1336,28 @@ class MonitorService:
         that API has refused every lookup so far."""
         async with self._semaphore:
             try:
-                return await self._do_check(
+                started = time.monotonic()
+                result = await self._do_check(
                     account_id, username, notify_unchanged,
                     thorough=thorough, skip_username_api=skip_username_api,
                 )
+                self._log_check_timing(username, result, time.monotonic() - started)
+                return result
             except Exception as exc:
                 logger.exception("Unhandled error checking @{}: {}", username, exc)
                 return {"ok": False, "username": username, "error": repr(exc)}
+
+    @staticmethod
+    def _log_check_timing(username: str, result: dict, total: float) -> None:
+        """One line per check saying where its seconds went — by door."""
+        timings = result.get("timings")
+        if not timings:
+            return
+        parts = ", ".join(
+            f"{name} {seconds:.1f}s" for name, seconds in timings.items()
+            if seconds >= 0.05
+        )
+        logger.info("@{} took {:.1f}s ({})", username, total, parts or "no waits")
 
     async def _do_check(
         self,
@@ -1354,6 +1369,7 @@ class MonitorService:
         skip_username_api: bool = False,
     ) -> dict:
         logger.info("Checking @{}", username)
+        timings: dict[str, float] = {}
 
         # Ask by NUMERIC ID first. The id is the key that survives a rename,
         # and since 2026-09-05 it is also the route Instagram still answers
@@ -1366,7 +1382,9 @@ class MonitorService:
         instagram_id = await self._stored_instagram_id(account_id)
         probe: Optional[IdProbe] = None
         if instagram_id:
+            clock = time.monotonic()
             probe = await self.instagram.probe_by_id(instagram_id)
+            timings["id"] = time.monotonic() - clock
             if probe.gone:
                 # The id itself no longer resolves: deactivated, deleted or
                 # banned. Not a rename — a rename keeps the id.
@@ -1379,6 +1397,7 @@ class MonitorService:
                 )
                 result["id_status"] = probe.status
                 result["api_status"] = None
+                result["timings"] = timings
                 return result
             if probe.answered and probe.username and probe.username != username:
                 username = await self._apply_rename(
@@ -1390,6 +1409,7 @@ class MonitorService:
         # the page doors: this host's own request, then the home fetcher when
         # one is configured. The page carries the counts, the bio and the
         # privacy flag the id route does not.
+        clock = time.monotonic()
         fetch = await self.instagram.fetch_profile(
             username,
             auth_attempts=(
@@ -1399,14 +1419,19 @@ class MonitorService:
             ),
             api=not skip_username_api,
         )
+        timings["username side"] = time.monotonic() - clock
+        timings.update(fetch.timings)
         id_status = probe.status if probe is not None else None
         if fetch.success:
+            clock = time.monotonic()
             result = await self._handle_success(
                 account_id, username, fetch, notify_unchanged,
                 reel_data=probe.reel_data if probe is not None else None,
             )
+            timings["diff+store"] = time.monotonic() - clock
             result["id_status"] = id_status
             result["api_status"] = fetch.api_status
+            result["timings"] = timings
             return result
 
         if probe is not None and probe.answered:
@@ -1430,15 +1455,18 @@ class MonitorService:
                 "{} — partial reading (username, picture, story status)",
                 username, fetch.http_status,
             )
+            clock = time.monotonic()
             result = await self._handle_success(
                 account_id, username, partial, notify_unchanged,
                 reel_data=probe.reel_data,
             )
+            timings["diff+store"] = time.monotonic() - clock
             # The username side's answer, for the sweep guard. The check
             # itself is ok.
             result["status"] = fetch.http_status
             result["id_status"] = id_status
             result["api_status"] = fetch.api_status
+            result["timings"] = timings
             return result
 
         result = await self._handle_failure(
@@ -1446,6 +1474,7 @@ class MonitorService:
         )
         result["id_status"] = id_status
         result["api_status"] = fetch.api_status
+        result["timings"] = timings
         return result
 
     async def _stored_instagram_id(self, account_id: int) -> Optional[str]:

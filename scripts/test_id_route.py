@@ -730,6 +730,46 @@ async def test_home_door_answers_when_this_host_is_refused() -> None:
         home_fetch.broker = old_broker
 
 
+async def test_this_hosts_page_door_is_skipped_after_repeated_refusals() -> None:
+    """Refused three times in a row, this host's own page request is not made
+    again for a while — the home fetcher is asked straight away. /probe can
+    still force a measurement. Refusals are counted per client, so one
+    client is used throughout."""
+    old_proxy, old_token = settings.ig_proxy_url, settings.home_fetch_token
+    old_broker = home_fetch.broker
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.home_fetch_token = "sekrit"
+    home_fetch.broker = FakeBroker({
+        "pageuser": home_fetch.PageResult(200, PAGE, "https://www.instagram.com/pageuser/"),
+    })
+
+    def handler(url: str, params: dict) -> _MockResponse:
+        if "workers.dev" in url:
+            return _MockResponse(401, {})
+        return _MockResponse(429, {}, text="")
+
+    session = _MockSession(handler)
+    direct = lambda: sum(1 for r in session.requests if "instagram.com/pageuser/" in r["url"])  # noqa: E731
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            for n in range(1, 4):
+                result = await client.fetch_profile("pageuser", auth_attempts=1, api=False)
+                expect(f"call {n} still succeeds via the home fetcher", result.success, repr(result))
+            expect("the first three calls each tried this host's door", direct() == 3, repr(direct()))
+            result = await client.fetch_profile("pageuser", auth_attempts=1, api=False)
+            expect("the fourth call skips this host's door", direct() == 3, repr(direct()))
+            expect("and still gets the page from home", result.success and result.source == "public_page",
+                   repr(result))
+            expect("timings name the doors that ran", "home" in result.timings and "direct" not in result.timings,
+                   repr(result.timings))
+            probe = await client.probe_public_page("pageuser", allow_home=False, force_direct=True)
+            expect("/probe can force the door", direct() == 4 and probe.get("door") == "direct",
+                   repr((direct(), probe.get("door"), probe.get("error"))))
+    finally:
+        settings.ig_proxy_url, settings.home_fetch_token = old_proxy, old_token
+        home_fetch.broker = old_broker
+
+
 async def test_probe_reports_what_instagram_said() -> None:
     old = settings.ig_proxy_url
     settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
@@ -799,6 +839,7 @@ async def main() -> int:
 
     await test_fetch_profile_can_skip_the_api()
     await test_home_door_answers_when_this_host_is_refused()
+    await test_this_hosts_page_door_is_skipped_after_repeated_refusals()
     await test_probe_reports_what_instagram_said()
 
     await engine.dispose()
