@@ -41,7 +41,7 @@ from app.database.models import (  # noqa: E402
     StoredHighlight,
 )
 from app.database.session import dispose_engine, engine, get_session  # noqa: E402
-from app.monitor.instagram import ProfileFetchResult  # noqa: E402
+from app.monitor.instagram import IdProbe, ProfileFetchResult  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402
 from app.monitor.stories import StoryItem  # noqa: E402
 
@@ -100,6 +100,20 @@ class FakeInstagram:
 
     async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         return make_fetch_result()
+
+    async def probe_by_id(self, user_id: str):
+        # The numeric-id probe answers with the same reel data — one reel
+        # question per check, whichever phase asks it.
+        parsed = await self.fetch_reel_user(user_id)
+        return IdProbe(
+            user_id=str(user_id), status=200, username=parsed["username"],
+            profile_pic_url=None,
+            reel_data={
+                "has_public_story": parsed["has_public_story"],
+                "is_live": parsed["is_live"],
+                "highlights": parsed["highlights"],
+            },
+        )
 
     async def fetch_reel_user(self, user_id: str):
         self.reel_calls += 1

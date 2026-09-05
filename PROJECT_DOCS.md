@@ -97,14 +97,23 @@ User (Telegram)
     through _SweepThrottle (one at a time by default; the gap widens, and then
     the sweep pauses outright, as 401/403 blocks pile up)
 3.  Per account:
-    a.  InstagramClient.fetch_profile()  →  200 JSON from Instagram
-    b.  InstagramClient.fetch_hd_pic_url()  →  mobile API for full-res picture
-    c.  MediaHasher.hash_url()  →  download + perceptual hash
-    d.  detect_changes(previous_snapshot, new_snapshot)
-    e.  If changed: INSERT AccountSnapshot, log NotificationLog
-    f.  NotificationDispatcher sends text diff + picture document
+    a.  InstagramClient.probe_by_id(stored id)  →  current username, avatar,
+        story/live status, highlight catalog (graphql reel query, BY ID).
+        A changed username is persisted + announced here (_apply_rename);
+        a 404 by id means the account is gone, not renamed
+    b.  InstagramClient.fetch_profile(username)  →  200 JSON from Instagram.
+        Skipped for the rest of the sweep once that door has refused
+        SWEEP_BREAKER_THRESHOLD lookups in a row with none answering
+    c.  If (b) is blocked but (a) answered: an id-only PARTIAL reading —
+        username + picture live, everything else carried forward, labelled
+    d.  MediaHasher.hash_url()  →  download + perceptual hash
+    e.  detect_changes(previous_snapshot, new_snapshot)
+    f.  If changed: INSERT AccountSnapshot, log NotificationLog
+    g.  NotificationDispatcher sends text diff + picture document
 4.  _retry_blocked() re-checks anything the gate blocked, in paced rounds —
-    a 401 blocks a request, not an account, so most recover here
+    a 401 blocks a request, not an account, so most recover here. Skipped
+    when the gate is down or the username door closed (nothing to retry
+    through)
 5.  StoriesClient checks stories/highlights; the story/live status is announced
     only when it changed and the media didn't already announce it
 6.  Sweep-complete summary notification sent
@@ -267,7 +276,7 @@ x-ig-app-id: 936619743392459
   `random.uniform(1.0, 3.0)` jitter — a datacenter IP gets these
   intermittently and a re-ask often lands
 - 401/403 **through the Worker**: budgeted by the caller, because one Worker
-  call is already 8 upstream attempts. A sweep passes
+  call is already 6 upstream attempts. A sweep passes
   `IG_SWEEP_AUTH_ATTEMPTS` (1); on-demand callers get
   `IG_MANUAL_AUTH_ATTEMPTS` (3). The re-ask is worth something because a
   repeat call may leave from a different Cloudflare colo, and Instagram's
@@ -275,7 +284,11 @@ x-ig-app-id: 936619743392459
   every account, and that traffic is what keeps the gate shut
 - 429: exponential backoff, capped at 60s
 - 5xx: exponential backoff, capped at 30s
-- 404: return immediately, no retry (rename recovery handles it)
+- 404: return immediately, no retry. A username 404 is read against the
+  id route, which ran first: the id still answering under the same name
+  is a glitch (quiet); the id gone means deactivated/deleted (announced at
+  once); the id route blocked means a rename can't be confirmed (announced
+  on the second consecutive miss and every 5th after)
 
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
@@ -376,6 +389,14 @@ sweep itself is paced by `_SweepThrottle`:
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
   request is blocked traffic that keeps it shut.
+- **Two doors, booked separately** (2026-09-05). The username route
+  (`web_profile_info`) and the numeric-id route (graphql reel query) are
+  counted on their own. `SWEEP_BREAKER_THRESHOLD` refused username lookups
+  in a row with none answering closes THAT door for the rest of the sweep —
+  the remaining accounts are checked by id only and the retry rounds are
+  skipped — while the gate counts as shut only when the id route answered
+  nothing either. A check where either route answered is a success for
+  pacing.
 - **Retry rounds** (`SWEEP_RETRY_ROUNDS`, cooldown doubling 30s → 60s → 120s,
   bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a
   time. A block lands on a *request*, not an account, so a paced retry often
@@ -479,10 +500,14 @@ Cloudflare Worker proxy is used for EVERY Instagram API call:
 - URL: `https://ig-proxy.m-asaad2005-ma.workers.dev`
 - `?username=<x>` → web_profile_info (profile fields)
 - `?user_id=<id>` → graphql reel query (story/live status, highlight catalog,
-  username-by-id — powers `/add <numeric id>` and the ✨ Highlights button)
-- `?hd_user_id=<id>` → mobile API user info (HD profile picture; only useful
-  with a logged-in session, which the anonymous setup doesn't use)
-- Rotates across 6 user agents, retries 8 times; a 200 with a non-JSON body
+  username-by-id, avatar URL — powers `/add <numeric id>`, the ✨ Highlights
+  button and, since 2026-09-05, the FIRST question of every check
+  (`probe_by_id`): the route Instagram still answers anonymously while
+  `?username=` gets a 401 login wall)
+- `?hd_user_id=<id>` → mobile API user info (anonymously: pk, username and a
+  150px avatar — the probe's fallback when the reel payload lacks one; the
+  HD picture needs a logged-in session, which the anonymous setup doesn't use)
+- Rotates across 6 user agents, retries 6 times; a 200 with a non-JSON body
   (login-wall HTML) counts as blocked and is retried
 - Free tier: 100,000 requests/day
 
@@ -501,7 +526,7 @@ this design:
   reputation attached to them is everyone's aggregate traffic, not yours. This
   is why blocks flip per colo and differ per account, and why the same username
   can 401 one minute and answer the next.
-- The 8 upstream attempts inside one call all leave from the **same colo with
+- The 6 upstream attempts inside one call all leave from the **same colo with
   the same TLS fingerprint** — they vary the User-Agent and host, which are not
   what the gate keys on. Separate calls have a chance at a different colo,
   which is why the manual path re-asks and the sweep does not.
@@ -641,7 +666,7 @@ All settings are read from environment variables (or a `.env` file locally).
 |---|---|---|
 | `IG_SESSION_COOKIE` | — | Full cookie string from a logged-in browser session (enables HD profile pictures). Optional — login-free is the default and recommended mode |
 | `IG_PROXY_URL` | — | Cloudflare Worker proxy URL for datacenter IP bypass |
-| `IG_SWEEP_AUTH_ATTEMPTS` | `1` | Worker re-asks per blocked check during a sweep (each call is already 8 upstream attempts) |
+| `IG_SWEEP_AUTH_ATTEMPTS` | `1` | Worker re-asks per blocked check during a sweep (each call is already 6 upstream attempts) |
 | `IG_MANUAL_AUTH_ATTEMPTS` | `3` | Worker re-asks for an on-demand check — a repeat call may land on a different colo |
 
 ### Scheduler
@@ -814,7 +839,7 @@ Worker behavior:
 - Accepts `?username=<x>`
 - Forwards to `https://www.instagram.com/api/v1/users/web_profile_info/?username=<x>`
 - Rotates 6 user agents on each retry attempt
-- Retries 8 times
+- Retries 6 times
 
 **Config:** Set `IG_PROXY_URL=https://ig-proxy.m-asaad2005-ma.workers.dev` in Render
 environment variables.

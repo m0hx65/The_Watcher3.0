@@ -257,6 +257,36 @@ async def get_latest_snapshot_by_source(
     return None
 
 
+async def get_latest_snapshot_excluding_source(
+    session: AsyncSession,
+    account_id: int,
+    *,
+    exclude: str,
+    scan_limit: int = 50,
+) -> Optional[AccountSnapshot]:
+    """Newest successful snapshot NOT produced by `exclude`.
+
+    An id-only reading (source "id_probe") knows the username and the avatar
+    and carries every other field forward. When the newest row is one of
+    those, the card needs the reading that actually SAW the counts and the
+    bio — this — so it can date them instead of presenting them as current.
+    """
+    stmt = (
+        select(AccountSnapshot)
+        .where(
+            AccountSnapshot.account_id == account_id,
+            AccountSnapshot.http_status == 200,
+        )
+        .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
+        .limit(scan_limit)
+    )
+    result = await session.execute(stmt)
+    for snapshot in result.scalars():
+        if snapshot_source(snapshot) != exclude:
+            return snapshot
+    return None
+
+
 async def get_previous_snapshot(
     session: AsyncSession, account_id: int, before_id: int
 ) -> Optional[AccountSnapshot]:

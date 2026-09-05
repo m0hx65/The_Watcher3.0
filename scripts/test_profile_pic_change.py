@@ -61,7 +61,7 @@ from app.monitor.change_detector import (  # noqa: E402
     _pic_changed,
     detect_changes,
 )
-from app.monitor.instagram import ProfileFetchResult  # noqa: E402
+from app.monitor.instagram import IdProbe, ProfileFetchResult  # noqa: E402
 from app.monitor.media_hasher import (  # noqa: E402
     HashedMedia,
     PHASH_PREFIX,
@@ -397,6 +397,11 @@ class FakeInstagram:
 
     async def fetch_hd_pic_url(self, user_id: str):
         raise AssertionError("must not be called without a session cookie")
+
+    async def probe_by_id(self, user_id):
+        # The client's numeric-id probe; this fake has no reel data, so the
+        # id route reads as blocked and the check proceeds by username.
+        return IdProbe(user_id=str(user_id), status=401)
 
 
 class SeqHasher:

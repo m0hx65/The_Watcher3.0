@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     ig_proxy_url: Optional[str] = Field(default=None, alias="IG_PROXY_URL")
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
-    # worker call is already 8 upstream attempts with rotating UAs and hosts —
+    # worker call is already 6 upstream attempts with rotating UAs and hosts —
     # but it may also leave from a different Cloudflare colo, and Instagram's
     # datacenter gate answers differently per colo, so a re-ask is a real second
     # chance rather than a repeat of the same question.

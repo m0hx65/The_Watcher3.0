@@ -14,7 +14,7 @@ from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 
 from app.config import settings
 from app.monitor.change_detector import ChangeSet
-from app.monitor.instagram import ProfileFetchResult
+from app.monitor.instagram import IdProbe, ProfileFetchResult
 from app.utils.formatting import esc, fmt_delta, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
 
@@ -517,6 +517,65 @@ def render_failure_message(username: str, fetch: ProfileFetchResult) -> str:
         f"HTTP status: <code>{fetch.http_status}</code>\n"
         f"Error: <code>{esc(fetch.error or 'unknown')}</code>"
     )
+
+
+def render_rename_message(old: str, new: str, *, collided: bool = False) -> str:
+    """A username change found through the numeric id (or a fetched profile).
+
+    Sent by the one place that persists a rename, so a rename is one message
+    no matter how many sources go on to notice it."""
+    lines = [
+        f"🔁 <b>@{esc(old)}</b> changed username → <b>@{esc(new)}</b>",
+        "<i>Found through the stored Instagram ID — same account, followed "
+        "under its new name from now on.</i>",
+    ]
+    if collided:
+        lines.append(
+            f"<i>@{esc(new)} is already monitored as a separate entry, so this "
+            "one keeps its old name in the list.</i>"
+        )
+    return "\n".join(lines)
+
+
+def render_not_found_message(
+    username: str, failure_count: int, id_probe: Optional[IdProbe]
+) -> str:
+    """Instagram says the username does not exist. What that means depends on
+    what the numeric-id route said about the same account."""
+    times = "once" if failure_count == 1 else f"{failure_count} checks in a row"
+    if id_probe is not None and id_probe.gone:
+        # The id route is asked first and answered 404 for the id itself —
+        # the username route may not even have been asked.
+        return (
+            f"🪦 <b>@{esc(username)}</b> — the stored Instagram ID no longer "
+            f"resolves ({times}).\n"
+            "<i>Instagram answers 404 for the ID itself, so the account looks "
+            "deactivated or deleted, not renamed — a rename keeps the ID.</i>"
+        )
+    lines = [
+        f"❓ <b>@{esc(username)}</b> — Instagram says this username doesn't "
+        f"exist ({times})."
+    ]
+    if id_probe is None:
+        lines.append(
+            "<i>No Instagram ID is stored for this account, so a rename can't "
+            "be checked — it may have been renamed, deactivated or deleted.</i>"
+        )
+    elif (
+        id_probe.answered
+        and id_probe.username
+        and id_probe.username.lower() == username.lower()
+    ):
+        lines.append(
+            "<i>The Instagram ID still resolves to this same username, so this "
+            "is likely a temporary glitch on Instagram's side.</i>"
+        )
+    else:
+        lines.append(
+            "<i>The Instagram ID lookup was blocked, so a rename couldn't be "
+            "confirmed this time — it is re-tried on every check.</i>"
+        )
+    return "\n".join(lines)
 
 
 def _split_text(text: str, *, limit: int) -> list[str]:

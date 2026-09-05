@@ -49,7 +49,7 @@ from app.config import settings  # noqa: E402
 from app.database import crud  # noqa: E402
 from app.database.models import Base, MonitoredAccount  # noqa: E402
 from app.database.session import engine, get_session  # noqa: E402
-from app.monitor.instagram import ProfileFetchResult  # noqa: E402
+from app.monitor.instagram import IdProbe, ProfileFetchResult  # noqa: E402
 from app.monitor.media_hasher import HashedMedia, PHASH_PREFIX  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402
 
@@ -130,6 +130,11 @@ class FakeInstagram:
 
     async def fetch_hd_pic_url(self, user_id):
         return None
+
+    async def probe_by_id(self, user_id):
+        # The client's numeric-id probe; this fake has no reel data, so the
+        # id route reads as blocked and the check proceeds by username.
+        return IdProbe(user_id=str(user_id), status=401)
 
 
 class CountingStories:

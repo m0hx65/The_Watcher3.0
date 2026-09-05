@@ -82,6 +82,44 @@ class ProfileFetchResult:
         return self.source != "api"
 
 
+@dataclass
+class IdProbe:
+    """What Instagram's NUMERIC-ID route said about one account.
+
+    The id is the key that survives a rename, and — measured 2026-09-05 — the
+    route Instagram still answers anonymously: web_profile_info (by username)
+    returns a 401 login wall from every network tried, residential ones
+    included, while the graphql reel query by id keeps answering through the
+    Worker. So this is the sweep's first question per account.
+
+    `status` is the HTTP answer: 200 = answered (username, avatar URL and
+    reel data filled in), 404 = the id no longer resolves (the account was
+    deactivated or deleted — a rename keeps the id), 401/403 = blocked,
+    0 = no HTTP answer at all. It knows nothing about counts, bio or the
+    privacy flag; callers must not invent those.
+    """
+
+    user_id: str
+    status: int = 0
+    username: Optional[str] = None
+    profile_pic_url: Optional[str] = None
+    # {"has_public_story", "is_live", "highlights"} — the shape the story
+    # phase consumes, so one probe serves the whole check.
+    reel_data: Optional[dict[str, Any]] = None
+
+    @property
+    def answered(self) -> bool:
+        return self.status == 200 and self.username is not None
+
+    @property
+    def gone(self) -> bool:
+        return self.status == 404
+
+    @property
+    def blocked(self) -> bool:
+        return self.status in (401, 403)
+
+
 def _build_headers() -> dict[str, str]:
     # Chrome impersonation already injects accept, accept-language, sec-ch-ua*,
     # sec-fetch-*, and a Chrome user-agent. Only the IG-specific app id and the
@@ -155,15 +193,22 @@ def _parse_reel_query_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
 
     instagram_id = extract_instagram_id(payload)
     username: Optional[str] = None
+    # The reel's user/owner node carries the avatar too — the 150px variant of
+    # the same upload the profile API serves at 320px. Same asset id, so the
+    # pic-change check recognises it as the same picture.
+    profile_pic_url: Optional[str] = None
     reel = user.get("reel")
     if isinstance(reel, dict):
         for key in ("user", "owner"):
             node = reel.get(key)
-            if isinstance(node, dict):
-                candidate = node.get("username")
-                if isinstance(candidate, str) and candidate.strip():
-                    username = candidate.strip().lstrip("@").lower()
-                    break
+            if not isinstance(node, dict):
+                continue
+            candidate = node.get("username")
+            if username is None and isinstance(candidate, str) and candidate.strip():
+                username = candidate.strip().lstrip("@").lower()
+            pic = node.get("profile_pic_url")
+            if profile_pic_url is None and isinstance(pic, str) and pic:
+                profile_pic_url = pic
     if username is None:
         raw = user.get("username")
         if isinstance(raw, str) and raw.strip():
@@ -174,6 +219,7 @@ def _parse_reel_query_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     return {
         "instagram_id": instagram_id,
         "username": username,
+        "profile_pic_url": profile_pic_url,
         "highlights": parse_highlight_catalog(payload),
         "has_public_story": bool(user.get("has_public_story")),
         "is_live": bool(user.get("is_live")),
@@ -291,27 +337,44 @@ class InstagramClient:
         """
         if not user_id:
             return None
-
         # The proxy can't attach the session cookie (it would leak it to the
         # worker and Instagram ties cookies to IPs anyway), so when a cookie is
-        # configured the direct request below is the only one that can yield
+        # configured the direct request is the only one that can yield
         # hd_profile_pic_url_info — skip the proxy hop entirely.
-        if settings.ig_proxy_url and not settings.ig_session_cookie:
+        user = await self._mobile_user_info(
+            str(user_id), allow_proxy=not settings.ig_session_cookie
+        )
+        if user is None:
+            return None
+        return self._parse_hd_pic_payload({"user": user}, user_id)
+
+    async def _mobile_user_info(
+        self, user_id: str, *, allow_proxy: bool = True
+    ) -> Optional[dict[str, Any]]:
+        """The mobile API's `users/<id>/info/` user object, or None.
+
+        Anonymously it is a small object — pk, username, profile_pic_url — but
+        that is enough for a username-by-id or an avatar when the reel query
+        did not carry one. The Worker route is tried first when allowed, then
+        the direct request.
+        """
+        if allow_proxy and settings.ig_proxy_url:
             try:
                 response = await self._session.get(
                     settings.ig_proxy_url, params={"hd_user_id": str(user_id)}
                 )
                 if response.status_code == 200:
-                    return self._parse_hd_pic_payload(response.json(), user_id)
+                    user = response.json().get("user")
+                    return user if isinstance(user, dict) else None
                 logger.debug(
-                    "Proxy HD pic fetch HTTP {} for user_id={}",
+                    "Proxy mobile user-info HTTP {} for user_id={}",
                     response.status_code, user_id,
                 )
                 # 400 = worker without this route yet; anything else = blocked
                 # upstream. Either way, try the direct mobile API below.
             except Exception as exc:
                 logger.debug(
-                    "Proxy HD pic fetch failed for user_id={}: {}", user_id, exc
+                    "Proxy mobile user-info failed for user_id={}: {}", user_id, exc
                 )
 
         url = f"https://{MOBILE_HOST}/api/v1/users/{user_id}/info/"
@@ -325,13 +388,14 @@ class InstagramClient:
         try:
             response = await self._session.get(url, headers=headers)
             if response.status_code == 200:
-                return self._parse_hd_pic_payload(response.json(), user_id)
+                user = response.json().get("user")
+                return user if isinstance(user, dict) else None
             logger.debug(
-                "Mobile API returned HTTP {} or no hd info for user_id={}",
+                "Mobile API returned HTTP {} for user_id={}",
                 response.status_code, user_id,
             )
         except Exception as exc:
-            logger.debug("fetch_hd_pic_url failed for user_id={}: {}", user_id, exc)
+            logger.debug("Mobile user-info failed for user_id={}: {}", user_id, exc)
         return None
 
     # How long to skip the reel query after a hard block (401/403) before probing
@@ -346,43 +410,108 @@ class InstagramClient:
     async def fetch_reel_user(self, user_id: str) -> Optional[dict[str, Any]]:
         """Fetch reel/highlight metadata for a user id (graphql query_id=9957820854288654).
 
-        Returns {"instagram_id", "username", "highlights", "has_public_story",
-        "is_live"} or None. Served from a short-TTL cache when fresh; otherwise
-        via the Cloudflare Worker proxy when configured (datacenter IPs are
-        401-blocked on /graphql/query), falling back to the direct request.
+        Returns {"instagram_id", "username", "profile_pic_url", "highlights",
+        "has_public_story", "is_live"} or None. Served from a short-TTL cache
+        when fresh; otherwise via the Cloudflare Worker proxy when configured
+        (datacenter IPs are 401-blocked on /graphql/query), falling back to the
+        direct request. Callers that need to tell a block from a 404 use
+        `probe_by_id`, which exposes the status.
         """
         if not user_id:
             return None
         user_id = str(user_id)
+        cached = self._cached_reel(user_id)
+        if cached is not None:
+            return cached
+        _status, parsed = await self._reel_lookup(user_id)
+        return parsed
 
+    async def probe_by_id(self, user_id: str) -> IdProbe:
+        """Ask Instagram about a NUMERIC id and report exactly what it said.
+
+        The sweep's first question per account: the current username (so a
+        renamed target is found, not lost), the avatar URL, story/live status
+        and the highlight catalog — and, unlike `fetch_reel_user`, the HTTP
+        status, so a 404 (the id no longer resolves) is not confused with a
+        401 (blocked). One live request at most; a fresh cached reel answer
+        is reused.
+        """
+        probe = IdProbe(user_id=str(user_id or ""))
+        if not probe.user_id:
+            return probe
+        cached = self._cached_reel(probe.user_id)
+        if cached is not None:
+            status, parsed = 200, cached
+        else:
+            status, parsed = await self._reel_lookup(probe.user_id)
+        probe.status = status
+        if parsed is None:
+            return probe
+        probe.username = parsed.get("username") or None
+        probe.profile_pic_url = parsed.get("profile_pic_url") or None
+        probe.reel_data = {
+            "has_public_story": bool(parsed.get("has_public_story")),
+            "is_live": bool(parsed.get("is_live")),
+            "highlights": parsed.get("highlights") or {},
+        }
+        if not probe.profile_pic_url or not probe.username:
+            # The reel payload normally carries both; when it does not, the
+            # mobile user-info route (same numeric key) usually does.
+            info = await self._mobile_user_info(probe.user_id)
+            if info:
+                probe.profile_pic_url = (
+                    probe.profile_pic_url or info.get("profile_pic_url") or None
+                )
+                raw_name = info.get("username")
+                if not probe.username and isinstance(raw_name, str) and raw_name.strip():
+                    probe.username = raw_name.strip().lstrip("@").lower()
+        return probe
+
+    def _cached_reel(self, user_id: str) -> Optional[dict[str, Any]]:
         cached = self._reel_cache.get(user_id)
         if cached and time.monotonic() < cached[0]:
             return cached[1]
+        return None
 
-        parsed: Optional[dict[str, Any]] = None
-        proxied_authoritative = False
+    async def _reel_lookup(
+        self, user_id: str
+    ) -> tuple[int, Optional[dict[str, Any]]]:
+        """One live reel query: the Worker first (when configured), the direct
+        request only when the Worker did not get an answer from Instagram.
+
+        Returns (status, parsed). `status` is what Instagram said — 200 with
+        data, 404 when the id does not resolve, 401/403 when blocked, 0 when
+        nothing produced an HTTP answer (or a 200 carried nothing usable). A
+        200 is cached for _REEL_CACHE_TTL; nothing else is.
+        """
+        status, parsed = 0, None
         if settings.ig_proxy_url:
-            proxied_authoritative, parsed = await self._fetch_reel_user_proxy(user_id)
-        if parsed is None and not proxied_authoritative:
-            parsed = await self._fetch_reel_user_direct(user_id)
-
+            status, parsed = await self._fetch_reel_user_proxy(user_id)
+        if status not in (200, 404):
+            direct_status, parsed = await self._fetch_reel_user_direct(user_id)
+            # Keep the more informative status: a real answer from the direct
+            # path wins; otherwise a block seen on either path beats a 0.
+            if direct_status or not status:
+                status = direct_status
+        if status == 200 and parsed is None:
+            status = 0  # answered, but with nothing we can use
         if parsed is not None:
             if len(self._reel_cache) > 512:  # bound memory across many targets
                 self._reel_cache.clear()
             self._reel_cache[user_id] = (
                 time.monotonic() + self._REEL_CACHE_TTL, parsed
             )
-        return parsed
+        return status, parsed
 
     async def _fetch_reel_user_proxy(
         self, user_id: str
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
-        """Reel query via the Cloudflare Worker. Returns (authoritative, parsed).
+    ) -> tuple[int, Optional[dict[str, Any]]]:
+        """Reel query via the Cloudflare Worker. Returns (status, parsed).
 
-        authoritative=True means the proxy answered for Instagram (200/404) and
-        the direct fallback should be skipped; False means the proxy itself was
-        unavailable/blocked (400 from an old worker build, 401 after upstream
-        retries, network error) and a direct attempt is still worth making.
+        200/404 are Instagram's own answers and the direct fallback is skipped;
+        anything else (400 from an old worker build, 401 after upstream
+        retries, network error → 0) means the proxy could not get an answer
+        and a direct attempt is still worth making.
         """
         try:
             response = await self._session.get(
@@ -390,33 +519,36 @@ class InstagramClient:
             )
         except Exception as exc:
             logger.debug("Proxy reel query failed for id={}: {}", user_id, exc)
-            return False, None
+            return 0, None
         if response.status_code == 200:
             try:
                 payload = response.json()
             except Exception:
                 logger.debug("Proxy reel query id={} returned non-JSON 200", user_id)
-                return False, None
+                return 0, None
             fetch_health.record_status(IG_REEL, 200)
-            return True, _parse_reel_query_user(payload)
+            return 200, _parse_reel_query_user(payload)
         if response.status_code == 404:
             fetch_health.record_status(IG_REEL, 404)
-            return True, None  # Instagram says the id doesn't exist
+            return 404, None  # Instagram says the id doesn't exist
         logger.debug(
             "Proxy reel query id={} HTTP {}", user_id, response.status_code
         )
-        return False, None
+        return int(response.status_code or 0), None
 
-    async def _fetch_reel_user_direct(self, user_id: str) -> Optional[dict[str, Any]]:
-        """Direct reel query against instagram.com.
+    async def _fetch_reel_user_direct(
+        self, user_id: str
+    ) -> tuple[int, Optional[dict[str, Any]]]:
+        """Direct reel query against instagram.com. Returns (status, parsed).
 
         Fast-fails: a hard 401/403 (typical on datacenter IPs) trips a short-lived
         circuit breaker so we don't burn seconds retrying a blocked endpoint on
         every call — callers fall back to saveinsta / stored data. Transient
-        429/5xx still get one quick retry.
+        429/5xx still get one quick retry. While the breaker is tripped the
+        status is 0: nothing was asked.
         """
         if time.monotonic() < self._reel_blocked_until:
-            return None  # endpoint recently hard-blocked — skip, use fallback
+            return 0, None  # endpoint recently hard-blocked — skip, use fallback
         headers = _build_headers()
         params = {
             "query_id": PROFILE_REEL_QUERY_ID,
@@ -441,9 +573,9 @@ class InstagramClient:
                         payload = response.json()
                     except Exception:
                         logger.debug("Reel query id={} returned non-JSON 200", user_id)
-                        return None
+                        return 0, None
                     fetch_health.record_status(IG_REEL, 200)
-                    return _parse_reel_query_user(payload)
+                    return 200, _parse_reel_query_user(payload)
                 if response.status_code in (401, 403):
                     # Hard block (IP/auth) — don't retry, trip the breaker.
                     self._reel_blocked_until = time.monotonic() + self._REEL_BLOCK_TTL
@@ -452,21 +584,21 @@ class InstagramClient:
                         "Reel query id={} HTTP {} — blocking endpoint for {:.0f}s",
                         user_id, response.status_code, self._REEL_BLOCK_TTL,
                     )
-                    return None
+                    return int(response.status_code), None
                 # 429/5xx — transient, one quick retry.
                 if (response.status_code == 429 or 500 <= response.status_code < 600) and attempt < 2:
                     await asyncio.sleep(random.uniform(0.3, 0.7))
                     continue
                 fetch_health.record_status(IG_REEL, response.status_code)
                 logger.debug("Reel query id={} HTTP {} — giving up", user_id, response.status_code)
-                return None
+                return int(response.status_code or 0), None
             except Exception as exc:
                 if attempt < 2:
                     await asyncio.sleep(random.uniform(0.3, 0.7))
                     continue
                 logger.debug("Reel query id={} failed: {}", user_id, exc)
-                return None
-        return None
+                return 0, None
+        return 0, None
 
     async def fetch_username_by_id(self, user_id: str) -> Optional[str]:
         """Resolve the current username for a stable Instagram numeric user ID."""
@@ -485,7 +617,7 @@ class InstagramClient:
         """Fetch a profile with intelligent retry/backoff.
 
         `auth_attempts` caps how many times a 401/403 is re-asked THROUGH THE
-        WORKER, where one call is already 8 upstream attempts. Sweeps pass 1
+        WORKER, where one call is already 6 upstream attempts. Sweeps pass 1
         (see IG_SWEEP_AUTH_ATTEMPTS — 14 accounts multiply every extra attempt
         into the blocked traffic that keeps the gate shut); on-demand checks
         leave it None and get IG_MANUAL_AUTH_ATTEMPTS, because one account with

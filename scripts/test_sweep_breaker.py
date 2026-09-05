@@ -302,7 +302,7 @@ async def test_retry_rounds_recover_blocked_accounts() -> None:
     expect("the recovered account is marked ok in place",
            outcomes[1][2].get("ok") is True, repr(outcomes[1][2]))
     expect("a real block stays failed", outcomes[2][2].get("ok") is False)
-    expect("a 404 is never retried (rename recovery handles it)",
+    expect("a 404 is never retried (a real answer, read against the id route)",
            "gone" not in attempts, repr(attempts))
     expect("a healthy account is never re-checked", "good" not in attempts)
     expect("retries stop once an account recovers", attempts["flaky"] == 2,

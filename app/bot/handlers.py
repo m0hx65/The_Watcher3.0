@@ -541,6 +541,11 @@ async def _render_account_card(
         snapshot = await crud.get_latest_snapshot(
             session, account.id, successful_only=True
         )
+        # The newest reading that actually SAW the counts — for dating them
+        # when the newest row is an id-only one that carried them forward.
+        last_full = await crud.get_latest_snapshot_excluding_source(
+            session, account.id, exclude="id_probe"
+        )
         media = await crud.latest_media_hash(session, account.id)
         highlight_catalog = await crud.get_highlight_catalog(session, account.id)
         untracked_highlights = await crud.get_untracked_highlight_ids(
@@ -593,6 +598,19 @@ async def _render_account_card(
             lines.append(
                 "<i>Read from the public page (the API was blocked) — it "
                 "carries no post count, reels or highlights.</i>"
+            )
+        elif snapshot_source == "id_probe":
+            # An id-only reading knows the username and the picture; the
+            # numbers and the bio above are carried forward from the last
+            # reading that saw them — date them, so they can't read as now.
+            when = (
+                f" on {fmt_timestamp(last_full.created_at)}"
+                if last_full is not None else ""
+            )
+            lines.append(
+                "<i>Checked by Instagram ID only — Instagram is refusing "
+                "username lookups. Name, followers, bio and counts are from "
+                f"the last full reading{when}.</i>"
             )
         flags: list[str] = []
         if snapshot.is_private:
@@ -2507,6 +2525,41 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ <b>API</b> (web_profile_info) — <code>"
             f"{esc(str(api.error or api.http_status))}</code>"
         )
+    await show("⏳ Asking by numeric ID…")
+
+    # The numeric-id route — the one that kept answering when the username
+    # routes went dark (2026-09-05). Needs the stored id; for an unmonitored
+    # username there is nothing to ask by.
+    async with get_session() as session:
+        monitored = await crud.get_account(session, username)
+        stored_id = monitored.instagram_id if monitored else None
+    probe = None
+    if stored_id:
+        probe = await service.instagram.probe_by_id(str(stored_id))
+        if probe.answered:
+            reel = probe.reel_data or {}
+            line = (
+                f"✅ <b>ID route</b> (graphql by id <code>{esc(str(stored_id))}</code>)"
+                f" — resolves to <b>@{esc(probe.username or '?')}</b>, "
+                f"story: {'yes' if reel.get('has_public_story') else 'no'}, "
+                f"highlights: {len(reel.get('highlights') or {})}"
+            )
+            if probe.username and probe.username != username.lower():
+                line += " — <b>renamed</b>; the next check follows the new name"
+            lines.append(line)
+        elif probe.gone:
+            lines.append(
+                "❌ <b>ID route</b> — Instagram says this ID no longer exists "
+                "(account deactivated or deleted)"
+            )
+        else:
+            lines.append(
+                f"❌ <b>ID route</b> — <code>HTTP {probe.status or 'no answer'}</code>"
+            )
+    else:
+        lines.append(
+            "➖ <b>ID route</b> — skipped: no Instagram ID stored for this account"
+        )
     await show("⏳ Trying the public page…")
 
     page = await service.instagram.probe_public_page(username)
@@ -2553,6 +2606,12 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(
             "<i>The API is blocked, but the page answers — profile stats keep "
             "arriving, minus the reel/highlight counts.</i>"
+        )
+    elif probe is not None and probe.answered:
+        lines.append(
+            "<i>The username routes are blocked, but the ID route answers — "
+            "username, picture and story status stay live; followers, bio "
+            "and counts don't.</i>"
         )
     elif service.stories is not None and any("✅ <b>saveinsta" in ln for ln in lines):
         lines.append(

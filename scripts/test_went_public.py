@@ -47,7 +47,7 @@ from app.database import crud  # noqa: E402
 from app.database.models import Base, MonitoredAccount  # noqa: E402
 from app.database.session import engine, get_session  # noqa: E402
 from app.monitor.change_detector import Change, ChangeSet  # noqa: E402
-from app.monitor.instagram import ProfileFetchResult  # noqa: E402
+from app.monitor.instagram import IdProbe, ProfileFetchResult  # noqa: E402
 from app.monitor.service import (  # noqa: E402
     _PUBLIC_GRAB_MAX_ATTEMPTS,
     MonitorService,
@@ -450,7 +450,13 @@ async def test_concurrent_grab_guard() -> None:
 
     service.grab_public_backlog = slow_grab  # type: ignore[method-assign]
     first = asyncio.create_task(service._handle_public_backlog(20, "u", None, went_public=True))
-    await asyncio.sleep(0.1)  # let it reach the (blocked) grab
+    # Let it reach the (blocked) grab. Polled rather than a fixed sleep:
+    # on a loaded machine (the runner executes suites back to back) 0.1s
+    # is not always enough for the task to get past its first DB read.
+    for _ in range(300):
+        if 20 in service._public_grabs_in_flight:
+            break
+        await asyncio.sleep(0.01)
     expect("first grab is in flight", 20 in service._public_grabs_in_flight)
     second = await service._handle_public_backlog(20, "u", None, went_public=True)
     expect("overlapping call claims the account without a second grab", second is True)
@@ -496,6 +502,11 @@ class ScriptedInstagram:
 
     async def fetch_reel_user(self, user_id):
         return None
+
+    async def probe_by_id(self, user_id):
+        # The client's numeric-id probe; this fake has no reel data, so the
+        # id route reads as blocked and the check proceeds by username.
+        return IdProbe(user_id=str(user_id), status=401)
 
 
 async def test_check_username_triggers_grab_on_flip() -> None:
