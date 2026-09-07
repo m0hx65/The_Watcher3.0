@@ -161,6 +161,21 @@ class Settings(BaseSettings):
     # to false to keep the old baseline-only behavior.
     auto_grab_on_public: bool = Field(default=True, alias="AUTO_GRAB_ON_PUBLIC")
 
+    # How often to LIST a public account's grid when the post count is not
+    # readable, so a new post is still found. The count is normally the cheap
+    # trigger — it rises, and only then is the grid listed — but the profile
+    # page never carries one (`all_media_count` is null on every capture), so
+    # while the username API is shut nothing ever rose and new posts stopped
+    # being delivered entirely, silently, from 2026-09-05.
+    #
+    # The listing itself is the detector when no count exists: one saveinsta
+    # round trip per PUBLIC account per interval, deduplicated against
+    # seen_stories exactly as the count-triggered path is. The default is one
+    # sweep, which restores the original responsiveness; raise it to trade
+    # promptness for third-party traffic if many accounts are public. 0
+    # disables the fallback (posts are then only found when a count rises).
+    post_scan_interval: int = Field(default=1800, alias="POST_SCAN_INTERVAL")
+
     # Highlight re-scan cadence (seconds). Listing every highlight reel's media
     # on every sweep is close to pure bandwidth: a reel's contents only change
     # when its owner adds a story to it, and that story was already detected and

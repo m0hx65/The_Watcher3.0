@@ -408,14 +408,35 @@ class WatcherScheduler:
             logger.info("Sweep skipped — another sweep is already in progress")
             return
         self._sweep_in_flight = True
-        # Write timestamp immediately so rapid restarts don't pile up duplicate sweeps.
-        async with get_session() as session:
-            await crud.set_setting(
-                session, SETTING_LAST_SWEEP_AT,
-                datetime.now(timezone.utc).isoformat(),
-            )
         timeout = max(60, settings.sweep_timeout_seconds)
         try:
+            # Write the timestamp first so rapid restarts don't pile up
+            # duplicate sweeps — but INSIDE the try, and non-fatally.
+            #
+            # This sat above the try. It is a database write, the database is
+            # a managed free tier that suspends when idle, and the start of a
+            # sweep is exactly when the connection is coldest — so one refused
+            # connection raised past the `finally` and left _sweep_in_flight
+            # True for the life of the process. Every later sweep then
+            # answered "another sweep is already in progress" while /status
+            # went on reporting a running scheduler and a next run time: a
+            # silently dead bot that only a redeploy could revive.
+            #
+            # Failing to record WHEN a sweep ran is also no reason not to run
+            # it. The timestamp only de-duplicates sweeps across a restart; if
+            # the database is genuinely down the sweep will fail on its own,
+            # loudly, a few lines below.
+            try:
+                async with get_session() as session:
+                    await crud.set_setting(
+                        session, SETTING_LAST_SWEEP_AT,
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not record the sweep timestamp ({}) — sweeping "
+                    "anyway; a restart may re-run this sweep", exc,
+                )
             # Hard cap: if check_all() never returns (hung HTTP connection, etc.)
             # _sweep_in_flight would stay True and block every subsequent scheduled
             # run indefinitely. The cap has to leave room for the sweep's own

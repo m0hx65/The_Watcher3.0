@@ -2413,7 +2413,10 @@ class MonitorService:
         # there; afterwards a rise in the post/reel count delivers the new media.
         if self.stories is not None and not effective_private:
             await self._handle_new_posts(
-                account_id, username, changeset, first_seen=last_known is None
+                account_id, username, changeset, first_seen=last_known is None,
+                # Could this reading read a count at all? A full API answer
+                # always can; a page reading never can.
+                counts_seen=not fetch.partial or "posts_count" in parsed,
             )
 
         return {
@@ -3300,6 +3303,26 @@ class MonitorService:
                 seen_pks.add(item.pk)
         return sent
 
+    @staticmethod
+    def _post_scan_key(account_id: int) -> str:
+        """Last time this account's grid was LISTED, for the no-count
+        fallback below. Only written when a listing actually came back."""
+        return f"post_scan:{account_id}"
+
+    async def _due_post_scan(self, account_id: int) -> bool:
+        """Is a grid listing due for an account whose post count cannot be
+        read? POST_SCAN_INTERVAL 0 disables the fallback entirely."""
+        interval = max(0, settings.post_scan_interval)
+        if interval == 0:
+            return False
+        async with get_session() as session:
+            raw = await crud.get_setting(session, self._post_scan_key(account_id))
+        try:
+            last = float(raw) if raw else None
+        except ValueError:
+            last = None
+        return last is None or (time.time() - last) >= interval
+
     async def _handle_new_posts(
         self,
         account_id: int,
@@ -3307,12 +3330,22 @@ class MonitorService:
         changeset: ChangeSet,
         *,
         first_seen: bool,
+        counts_seen: bool = True,
     ) -> None:
-        """Download and send new feed posts/reels when the post/reel count rises.
+        """Download and send new feed posts/reels.
 
-        On the first observation we baseline the current grid (mark seen, don't
-        send) so we don't dump a backlog; afterwards each increase delivers the
-        new media. Login-free via saveinsta; degrades to nothing on failure.
+        Normally the COUNT is the trigger: it rises, and only then is the grid
+        listed. On the first observation we baseline the current grid (mark
+        seen, don't send) so we don't dump a backlog. Login-free via
+        saveinsta; degrades to nothing on failure.
+
+        `counts_seen` says whether this reading could read a count at all. The
+        profile page never carries one — `all_media_count` is null on every
+        capture — so while the username API is shut nothing ever rose and new
+        posts stopped being delivered at all, silently, from 2026-09-05. When
+        no count is readable the LISTING is the detector instead, run at most
+        once per POST_SCAN_INTERVAL per account and deduplicated against
+        seen_stories exactly as the count-triggered path is.
         """
         if self.stories is None:
             return
@@ -3325,7 +3358,15 @@ class MonitorService:
                 and reels_change.old is not None and reels_change.new > reels_change.old)
         )
         if not first_seen and not increased:
-            return
+            if counts_seen:
+                return
+            # No count to rise — the grid listing is the only detector left.
+            if not await self._due_post_scan(account_id):
+                return
+            logger.debug(
+                "@{}: listing the grid — no post count is readable from this "
+                "source, so a rise cannot be what triggers it", username,
+            )
 
         try:
             posts = await self.stories.fetch_posts(username)
@@ -3333,7 +3374,16 @@ class MonitorService:
             logger.warning("Post fetch failed for @{}: {}", username, exc)
             return
         if not posts:
+            # Nothing came back: the source failed, or the account has an
+            # empty grid. Either way this was not a reading, so the clock is
+            # not stamped and the next sweep tries again.
             return
+        # A listing that came back IS the scan — stamped even when nothing in
+        # it is new, because "nothing new" is the answer, not a failure.
+        async with get_session() as session:
+            await crud.set_setting(
+                session, self._post_scan_key(account_id), str(time.time())
+            )
 
         if first_seen:
             async with get_session() as session:

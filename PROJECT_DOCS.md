@@ -615,6 +615,17 @@ account, `_handle_success` builds the story status from the page
 (`reel_data["from_page"]`), the story phase does not knock on the reel route
 again, and the highlight catalog is left as stored.
 
+New posts are found by the post COUNT rising — and the profile page carries
+no count (`all_media_count` is null on every capture), so from the day the
+username API was walled nothing rose, no grid was listed and no post was
+delivered, with no error anywhere to say so. When a reading cannot read a
+count (`counts_seen=False`), the grid listing becomes the detector instead:
+one saveinsta round trip per public account per `POST_SCAN_INTERVAL`,
+deduplicated against `seen_stories` exactly as the count-triggered path is. A
+listing that comes back stamps the clock even when nothing in it is new (that
+is the answer); an empty one does not, so a failed source is retried next
+sweep.
+
 The highlight catalog is the one thing with no fallback: the page has never
 carried it, so while the profile API is shut it lives or dies on the reel
 query. The story phase's rule against re-asking that route is right for the
