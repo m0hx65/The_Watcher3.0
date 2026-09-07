@@ -426,6 +426,10 @@ class InstagramClient:
     # long, and the most one attempt may take (redirect to the login page
     # included) before it counts as a refusal.
     _DIRECT_PAGE_BREAKER_FAILURES = 3
+    # Refusals in a row before a sweep decides the phone should take over the
+    # pages. Below the breaker (the door is still tried), above one (a single
+    # login-walled page is not a shut door).
+    _DIRECT_PAGE_HANDOVER_FAILURES = 2
     _DIRECT_PAGE_COOLDOWN = 1800.0
     _DIRECT_PAGE_TIMEOUT = 12.0
     # The Worker's reel route: refusals in a row before the phone is asked
@@ -1116,15 +1120,23 @@ class InstagramClient:
         was asked — the moment the home fetcher stops being insurance and
         starts being the route.
 
-        Deliberately the FIRST refusal, not the breaker's third: handing the
-        phone a sweep's worth of pages one account too early costs a few
-        fetches nobody reads, while doing it two accounts too late costs
-        those accounts the full direct timeout plus a live wait on the phone
-        each. False at boot, so a host Instagram is currently serving (which
-        it does again, measured 2026-09-07) asks for nothing from home.
+        Two refusals in a row, not one. A single page can come back as a
+        login wall while the door itself is perfectly healthy — measured
+        2026-09-07, one account out of seventeen, with the other sixteen
+        answering in half a second each. On the first-refusal rule that one
+        page handed the phone the fifteen accounts still to check; it fetched
+        all fifteen, delivered them 80 seconds after the sweep had already
+        finished reading every one of them from here, and spent fifteen
+        Instagram requests from the home line to do it. One odd page is not a
+        shut door.
+
+        Still well short of the breaker's third strike, because being late
+        costs those accounts the full direct timeout plus a live wait on the
+        phone each. False at boot, so a host Instagram is currently serving
+        asks for nothing from home.
         """
         return (
-            self._direct_page_failures > 0
+            self._direct_page_failures >= self._DIRECT_PAGE_HANDOVER_FAILURES
             or time.monotonic() < self._direct_page_blocked_until
         )
 

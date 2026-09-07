@@ -457,6 +457,7 @@ async def _sweep_with(profile, probe, usernames: list[str], *,
     ig.probe = probe
     service = _service(ig)
     result = await service.check_all()
+    ig.service = service  # so a test can read service.last_sweep
     return result, _sent(service), ig
 
 
@@ -474,10 +475,15 @@ async def test_a_shut_username_door_does_not_stop_the_sweep() -> None:
     expect("nothing failed, nothing deferred", result["failed"] == 0 and result["deferred"] == 0,
            repr(result))
     expect("the sweep did NOT stop", "Sweep stopped" not in summary, summary)
-    expect("the summary says the checks were id-only",
-           "checked by Instagram ID only" in summary, summary)
-    expect("and that the username door was shut",
-           "refused every username lookup" in summary, summary)
+    # Which door served the readings is a standing condition, not an event:
+    # it is recorded for /status rather than repeated in the notification.
+    expect("the sweep message is one line, not four",
+           "\n" not in summary, summary)
+    last = ig.service.last_sweep
+    expect("but /status can say the checks were id-only",
+           last["id_only"] == 6, repr(last))
+    expect("and that the username door was shut", last["door_closed"],
+           repr(last))
     # USERNAME_API_KNOCKS, not SWEEP_BREAKER_THRESHOLD: closing one door and
     # abandoning the sweep are different calls and take different evidence.
     expect("the username API was asked only until it closed",
@@ -547,8 +553,9 @@ async def test_a_door_found_shut_last_sweep_is_knocked_once() -> None:
     summary = texts[-1]
     expect("exactly one knock on the username API", ig.api_asks() == 1, repr(ig.profile_kwargs))
     expect("every account still got its pages and id", result["answered"] == 4, repr(result))
-    expect("the summary says the door is still shut, checked once",
-           "still refusing" in summary and "checked once" in summary, summary)
+    expect("the door verdict is recorded, not re-announced",
+           ig.service.last_sweep["door_closed"]
+           and "still refusing" not in summary, summary)
     expect("the verdict is refreshed in the DB", await _door_closed_in_db())
 
     # The knock answers: the door reopens for everyone. (Fresh accounts —

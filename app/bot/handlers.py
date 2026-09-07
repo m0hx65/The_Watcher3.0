@@ -761,6 +761,54 @@ async def _door_line(context: ContextTypes.DEFAULT_TYPE) -> str:
     )
 
 
+def _last_sweep_lines(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Which doors served the last sweep's readings.
+
+    This used to be sent as three extra lines after every sweep-complete
+    message — the same sentences every half hour, describing a standing
+    condition rather than an event. It is the sort of thing you want on hand,
+    not pushed at you, so it lives here.
+    """
+    monitor = context.application.bot_data.get("monitor")
+    last = getattr(monitor, "last_sweep", None) if monitor else None
+    if not last:
+        return ""
+    checked = last.get("checked") or 0
+    page_only = last.get("page_only") or 0
+    id_only = last.get("id_only") or 0
+    full = max(0, (last.get("answered") or 0) - page_only - id_only)
+    parts: list[str] = []
+    if full:
+        parts.append(f"<b>{full}</b> full")
+    if page_only:
+        parts.append(f"<b>{page_only}</b> from the profile page")
+    if id_only:
+        parts.append(f"<b>{id_only}</b> by Instagram ID only")
+    if last.get("failed"):
+        parts.append(f"<b>{last['failed']}</b> failed")
+    if last.get("deferred"):
+        parts.append(f"<b>{last['deferred']}</b> deferred")
+    if not parts:
+        return ""
+    line = f"\n📄 Last sweep: <b>{checked}</b> checked — " + ", ".join(parts)
+    if last.get("recovered"):
+        line += f" (<b>{last['recovered']}</b> recovered on retry)"
+    # What a partial reading does and does not know, said once rather than
+    # implied — the counts are live, the things the page cannot see are
+    # carried forward rather than invented.
+    if page_only:
+        line += (
+            "\n   ↳ page readings: followers, following, bio and privacy are "
+            "live; reel and highlight counts carried forward"
+        )
+    if id_only:
+        line += (
+            "\n   ↳ ID readings: username, picture and story status are live; "
+            "followers, bio and counts were not read and not guessed"
+        )
+    return line
+
+
 async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     async with get_session() as session:
         stats = await crud.stats_summary(session)
@@ -833,6 +881,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"(±{settings.jitter_seconds}s jitter)\n"
         f"Last sweep: <b>{last_sweep_str}</b>\n"
         f"Next sweep: <b>{next_run_str}</b>"
+        f"{_last_sweep_lines(context)}"
         f"{digest_line}"
         f"{dark_line}"
         f"{stakeout_line}\n"

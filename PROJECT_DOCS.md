@@ -585,8 +585,10 @@ page from Instagram, a few KB (the extracted payload) back to the bot.
 
 The phone is INSURANCE, not the default route. It is handed a sweep's pages
 only once this host's own page door has stopped answering
-(`InstagramClient.direct_page_door_failing` — the first refusal, not the
-breaker's third) — at sweep start when that is already true, else the moment a
+(`InstagramClient.direct_page_door_failing` — two refusals in a row, below
+the breaker's third but above one, because a single login-walled page is not
+a shut door: on a one-refusal rule one odd account handed the phone fifteen
+pages it delivered 80 s after the sweep had already read them all from here) — at sweep start when that is already true, else the moment a
 check finds both username-side doors shut, and then only for the accounts
 still to check. While Instagram serves this host's page requests, which it
 does again (measured 2026-09-07: 17 of 17, half a second each), the phone
@@ -612,6 +614,20 @@ timestamp; verified against the reel query). When the reel route refuses an
 account, `_handle_success` builds the story status from the page
 (`reel_data["from_page"]`), the story phase does not knock on the reel route
 again, and the highlight catalog is left as stored.
+
+Reel jobs stop going to the phone after `REEL_REFUSALS_BEFORE_PAUSE`
+refusals in a row (Instagram 429s that query from the home line). The refusal
+is not free: the worker reads it as "wait a few minutes" and stops fetching
+ANYTHING for a minute, so a reel nobody can have costs the phone the page
+door it exists for — which is how a live page request came to time out at
+30 s. Pages are never held back by this.
+
+The sweep-complete message is one line. Which door served the readings — the
+page-only and id-only counts, and the verdict on the profile API — is a
+standing condition rather than an event, so it is recorded in
+`MonitorService.last_sweep` and shown in `/status` instead of being repeated
+verbatim every half hour. The API REOPENING is still announced: that is a
+change, and it means full readings are back.
 
 The phone's part in a sweep is recorded, not announced (`broker.note_sweep`):
 on a healthy run it is 0 — the phone was not needed — and a message saying so

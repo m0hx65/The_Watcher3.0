@@ -438,6 +438,9 @@ class MonitorService:
         # the memory survives a restart; see username_api_known_closed().
         self._username_api_closed_at: Optional[datetime] = None
         self._username_api_door_loaded = False
+        # The last finished sweep's shape — counts and which doors served it.
+        # Read by /status; None until a sweep has finished this process.
+        self.last_sweep: Optional[dict] = None
         # account_id -> forum topic (message_thread_id). Resolved lazily and
         # cached so each account's alerts land in its own thread.
         self._topic_cache: dict[int, int] = {}
@@ -1221,32 +1224,15 @@ class MonitorService:
             if failed:
                 names = ", ".join(f"@{u}" for u in sorted(failed_usernames))
                 summary += f" {failed} failed: {names}"
-            if page_only:
-                summary += (
-                    f"\n📄 {page_only} read from the profile page — followers, "
-                    "following, bio and privacy are live; reel and highlight "
-                    "counts carried forward."
-                )
-            if id_only:
-                summary += (
-                    f"\n🪪 {id_only} checked by Instagram ID only — username, "
-                    "picture and story status are live; followers, bio and "
-                    "counts couldn't be read this time and were not guessed."
-                )
-            if throttle.username_door_closed and known_closed:
-                summary += (
-                    "\n🚪 Instagram's profile API is still refusing username "
-                    "lookups (checked once this sweep), so the sweep used the "
-                    "ID route and the profile page."
-                )
-            elif throttle.username_door_closed:
-                summary += (
-                    "\n🚪 Instagram's profile API refused every username "
-                    f"lookup ({throttle.peak_consecutive_user_blocks} in a "
-                    "row), so the rest of the sweep skipped it and used the "
-                    "ID route and the profile page."
-                )
-            elif known_closed and throttle.username_door_answered:
+            # Which door each reading came from — the 📄 page-only and 🪪
+            # id-only lines, and the 🚪 verdict on the profile API — used to
+            # ride along here. They are the same three sentences every sweep,
+            # they describe a standing condition rather than something that
+            # just happened, and they turned one notification into four. They
+            # live in /status now (see `last_sweep`), where they are there
+            # when they are wanted. The API REOPENING is still news: it is a
+            # change, and it means full readings are back.
+            if known_closed and throttle.username_door_answered:
                 summary += (
                     "\n🔓 Instagram's profile API is answering username "
                     "lookups again — full readings are back."
@@ -1290,6 +1276,23 @@ class MonitorService:
         home_fetch.broker.note_sweep(
             home_fetch.broker.delivered - home_pages_before
         )
+
+        # Where this sweep's readings came from, for /status. Standing
+        # conditions belong on a screen you open, not in a notification that
+        # repeats them verbatim every half hour.
+        self.last_sweep = {
+            "at": datetime.now(timezone.utc),
+            "checked": checked,
+            "answered": answered,
+            "page_only": page_only,
+            "id_only": id_only,
+            "failed": failed,
+            "deferred": deferred,
+            "recovered": recovered,
+            "door_closed": throttle.username_door_closed,
+            "door_answered": throttle.username_door_answered,
+            "gate_down": throttle.gate_down,
+        }
 
         result = {
             "checked": checked,

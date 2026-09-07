@@ -62,6 +62,16 @@ KIND_PAGE = "page"
 KIND_REEL = "reel"
 KINDS = (KIND_PAGE, KIND_REEL)
 
+# Instagram refuses the reel query from this home line (429, measured
+# 2026-09-07 on two sweeps running). That refusal is not free: the worker
+# reads it as "wait a few minutes" and stops fetching ANYTHING for a minute,
+# so a reel nobody can have costs the phone the page door it exists for —
+# and that is exactly what made a live page request time out at 30 s while
+# the phone sat in a soft block. After this many refusals in a row the reel
+# jobs stop for a cooldown; pages are never held back.
+REEL_REFUSALS_BEFORE_PAUSE = 2
+REEL_PAUSE_SECONDS = 1800.0
+
 
 @dataclass
 class PageJob:
@@ -131,6 +141,9 @@ class HomeFetchBroker:
         # announced: on a healthy run this is 0 — the phone is a fallback and
         # was not needed — which is good news, not a notification.
         self.last_sweep_jobs: Optional[int] = None
+        # The reel route's standing with Instagram, from this home line.
+        self._reel_refusals = 0
+        self._reel_paused_until = 0.0
 
     # ----------------------------------------------------------- state
 
@@ -260,10 +273,17 @@ class HomeFetchBroker:
         the sweep will find that out per check, quickly, as before."""
         return self._prefetch([(KIND_PAGE, u, u) for u in usernames])
 
+    @property
+    def reel_route_paused(self) -> bool:
+        """True while Instagram is refusing the reel query from this home
+        line often enough that asking again costs more than it returns."""
+        return time.monotonic() < self._reel_paused_until
+
     def prefetch_reels(self, users: Iterable[tuple[str, str]]) -> int:
         """Queue reel queries for a whole sweep: `users` is (numeric id,
-        username) pairs. Only when the connected worker can fetch reels."""
-        if KIND_REEL not in self._worker_kinds:
+        username) pairs. Only when the connected worker can fetch reels, and
+        only while Instagram is still answering them from here."""
+        if KIND_REEL not in self._worker_kinds or self.reel_route_paused:
             return 0
         return self._prefetch([(KIND_REEL, str(uid), name) for uid, name in users])
 
@@ -282,7 +302,7 @@ class HomeFetchBroker:
     ) -> Optional[PageResult]:
         """The reel query for `user_id`, from the phone — see request_page.
         None at once when the connected worker cannot fetch reels."""
-        if KIND_REEL not in self._worker_kinds:
+        if KIND_REEL not in self._worker_kinds or self.reel_route_paused:
             return None
         return await self._request(
             (KIND_REEL, str(user_id)), username or str(user_id), timeout, fresh
@@ -361,6 +381,8 @@ class HomeFetchBroker:
             self._by_key.pop(key, None)
         self._results[key] = result
         self.delivered += 1
+        if job.kind == KIND_REEL:
+            self._note_reel_answer(int(result.status or 0))
         now = time.monotonic()
         pickup = (job.handed - job.created) if job.handed else 0.0
         deliver_seconds = (now - job.handed) if job.handed else (now - job.created)
@@ -377,6 +399,27 @@ class HomeFetchBroker:
         return True
 
     # ---------------------------------------------------------- internal
+
+    def _note_reel_answer(self, status: int) -> None:
+        """Book what Instagram told the phone about a reel. A 200 clears the
+        record; refusals in a row stop the reel jobs for a while, because
+        each one also stops the phone fetching pages for a minute."""
+        if status == 200:
+            self._reel_refusals = 0
+            self._reel_paused_until = 0.0
+            return
+        self._reel_refusals += 1
+        if (
+            self._reel_refusals >= REEL_REFUSALS_BEFORE_PAUSE
+            and not self.reel_route_paused
+        ):
+            self._reel_paused_until = time.monotonic() + REEL_PAUSE_SECONDS
+            logger.info(
+                "Instagram refused the home fetcher's reel query {} times in "
+                "a row (last HTTP {}) — no more reel jobs for {:.0f} min, so "
+                "the phone stays free for pages",
+                self._reel_refusals, status, REEL_PAUSE_SECONDS / 60,
+            )
 
     def _cached(self, key: tuple[str, str]) -> Optional[PageResult]:
         result = self._results.get(key)

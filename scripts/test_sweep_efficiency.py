@@ -607,6 +607,74 @@ async def test_the_phone_stands_by_while_this_host_can_fetch_pages() -> None:
         await _set_door(False)
 
 
+async def test_one_odd_page_does_not_hand_the_phone_the_sweep() -> None:
+    """Measured 2026-09-07: one account's page came back a login wall while
+    the other sixteen answered in half a second each. On a first-refusal rule
+    that one page handed the phone the fifteen accounts still to check — it
+    fetched all fifteen and delivered them 80 seconds AFTER the sweep had
+    already read every one of them from here. One odd page is not a shut
+    door, so the handover takes two refusals in a row."""
+    client = InstagramClient(max_retries=1, session=_MockSession(
+        lambda url, p: _MockResponse(401, {})
+    ))
+    expect("a healthy door asks nothing of the phone",
+           not client.direct_page_door_failing)
+    client._note_direct_page({"status": 200, "parsed": None,
+                              "error": "no profile payload in the page"})
+    expect("one login-walled page is still not a shut door",
+           not client.direct_page_door_failing)
+    client._note_direct_page({"status": 200, "parsed": None,
+                              "error": "no profile payload in the page"})
+    expect("two in a row is", client.direct_page_door_failing)
+    client._note_direct_page({"status": 200, "parsed": {"username": "u"}})
+    expect("and an answer clears it again", not client.direct_page_door_failing)
+
+    # A 404 is an answer about the username, not about this host's door.
+    client._note_direct_page({"status": 404, "parsed": None})
+    client._note_direct_page({"status": 404, "parsed": None})
+    expect("a 404 never counts against the door",
+           not client.direct_page_door_failing)
+    await client.close()
+
+
+async def test_a_refused_reel_stops_costing_the_phone_its_page_door() -> None:
+    """Instagram refuses the reel query from the home line (429). The worker
+    reads that as "wait a few minutes" and stops fetching ANYTHING for a
+    minute — so a reel nobody can have costs the phone the page door it
+    exists for, which is how a live page request timed out at 30 s."""
+    broker = home_fetch.HomeFetchBroker()
+    await broker.next_job(wait=0.01, worker="xiaomi", kinds=["page", "reel"])
+    expect("reels are asked for while the route answers",
+           broker.prefetch_reels([("42", "a")]) == 1)
+    job = (await broker.next_job(wait=0.2, worker="xiaomi",
+                                 kinds=["page", "reel"]))[0]
+    broker.deliver(job.id, home_fetch.PageResult(429, ""))
+    expect("one refusal is tolerated", not broker.reel_route_paused)
+
+    expect("a second reel still goes out",
+           broker.prefetch_reels([("43", "b")]) == 1)
+    job = (await broker.next_job(wait=0.2, worker="xiaomi",
+                                 kinds=["page", "reel"]))[0]
+    broker.deliver(job.id, home_fetch.PageResult(429, ""))
+    expect("two refusals in a row pause the reel route",
+           broker.reel_route_paused)
+    expect("so no more reel jobs are queued",
+           broker.prefetch_reels([("44", "c")]) == 0)
+    expect("nor asked for live",
+           await broker.request_reel("44", "c", timeout=0.1) is None)
+    expect("but PAGES are never held back — that is the whole point",
+           broker.prefetch(["c"]) == 1)
+
+    # An answer clears it, so the route recovers on its own.
+    broker._reel_paused_until = 0.0
+    broker.prefetch_reels([("45", "d")])
+    job = next(j for j in await broker.next_job(
+        wait=0.2, worker="xiaomi", kinds=["page", "reel"], max_jobs=8,
+    ) if j.kind == "reel")
+    broker.deliver(job.id, home_fetch.PageResult(200, '{"data":{}}'))
+    expect("a 200 clears the record", broker._reel_refusals == 0)
+
+
 async def test_a_private_account_never_buys_a_reel_query() -> None:
     """A private account has no story, no live broadcast and no visible
     highlights, so the story phase skips it — and its scan stamp never
@@ -806,6 +874,8 @@ async def main() -> int:
     await test_the_story_phase_reads_the_reel_the_phone_delivered()
     await test_the_shut_door_verdict_survives_a_restart()
     await test_the_phone_stands_by_while_this_host_can_fetch_pages()
+    await test_one_odd_page_does_not_hand_the_phone_the_sweep()
+    await test_a_refused_reel_stops_costing_the_phone_its_page_door()
     await test_a_private_account_never_buys_a_reel_query()
     await test_privacy_is_read_from_the_newest_successful_reading()
     await test_a_previous_sweeps_reel_is_not_read_as_this_ones()
