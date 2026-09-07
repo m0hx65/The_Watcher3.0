@@ -3476,7 +3476,15 @@ class MonitorService:
         if not posts:
             # Nothing came back: the source failed, or the account has an
             # empty grid. Either way this was not a reading, so the clock is
-            # not stamped and the next sweep tries again.
+            # not stamped and the next sweep tries again — said out loud,
+            # because a listing that answers nothing EVERY time is otherwise
+            # indistinguishable from one that answers "nothing new", and a
+            # silently dead detector is the thing this fallback exists to
+            # end, not to reproduce.
+            logger.info(
+                "@{}: the grid listing came back empty — nothing to compare "
+                "against, so the next check asks again", username,
+            )
             return
         # A listing that came back IS the scan — stamped even when nothing in
         # it is new, because "nothing new" is the answer, not a failure.
@@ -3497,6 +3505,13 @@ class MonitorService:
         async with get_session() as session:
             seen_pks = await crud.get_seen_story_pks(session, account_id)
         new_posts = [p for p in posts if p.pk and p.pk not in seen_pks]
+        # One line whichever way it went. "Nothing new" is a real answer and
+        # the common one, so it has to be visible: without it the only proof
+        # that posts are still being watched was a post actually arriving.
+        logger.info(
+            "@{}: grid listed — {} post(s), {} the chat has not seen",
+            username, len(posts), len(new_posts),
+        )
         if not new_posts:
             return
         new_posts = new_posts[:5]  # cap so a big jump never floods the chat

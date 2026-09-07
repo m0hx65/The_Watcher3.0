@@ -275,6 +275,46 @@ async def test_a_failed_listing_is_retried_not_recorded() -> None:
     expect("so nothing is recorded for it", stamp is None, repr(stamp))
 
 
+async def test_the_fallback_says_what_it_did() -> None:
+    """A detector nobody can see working is the thing this whole fallback
+    exists to replace. "Nothing new" is the common answer and the one that
+    has to be visible, or the only proof posts are still watched is a post
+    actually arriving — and a source that returns nothing every sweep looks
+    exactly the same."""
+    from loguru import logger as _logger
+
+    lines: list[str] = []
+    sink = _logger.add(lambda m: lines.append(str(m)), level="INFO")
+    try:
+        # A grid that lists, with nothing new on it.
+        account_id = await _new_account("talkative")
+        grid = _Grid([_post("t1")])
+        service = _service(grid)
+        async with get_session() as session:
+            await crud.mark_story_items_seen(session, account_id, [_post("t1")])
+        lines.clear()
+        await service._handle_new_posts(
+            account_id, "talkative", ChangeSet(username="talkative"),
+            first_seen=False, counts_seen=False,
+        )
+        expect("a listing with nothing new still reports",
+               any("grid listed" in ln and "talkative" in ln for ln in lines),
+               repr(lines))
+
+        # A source that answers nothing at all — the case that retries forever.
+        quiet_id = await _new_account("mute")
+        empty = _service(_Grid([]))
+        lines.clear()
+        await empty._handle_new_posts(
+            quiet_id, "mute", ChangeSet(username="mute"),
+            first_seen=False, counts_seen=False,
+        )
+        expect("and an empty answer is distinguishable from it",
+               any("came back empty" in ln for ln in lines), repr(lines))
+    finally:
+        _logger.remove(sink)
+
+
 async def test_the_fallback_can_be_turned_off() -> None:
     account_id = await _new_account("optout")
     grid = _Grid([_post("r1")])
@@ -321,6 +361,7 @@ async def main() -> int:
     await test_a_page_reading_still_finds_new_posts()
     await test_the_fallback_listing_is_paced_not_every_sweep()
     await test_a_failed_listing_is_retried_not_recorded()
+    await test_the_fallback_says_what_it_did()
     await test_the_fallback_can_be_turned_off()
     await test_a_rising_count_still_wins_immediately()
 
