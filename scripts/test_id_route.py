@@ -183,6 +183,12 @@ class ScriptedInstagram:
     async def fetch_reel_user(self, user_id: str):
         return None
 
+    def reel_in_hand(self, user_id: str):
+        """Reel data already delivered by the phone — the tests that care set
+        `self.in_hand`; the rest have nothing in hand, as on a live sweep
+        whose reels have not landed yet."""
+        return getattr(self, "in_hand", None)
+
     async def fetch_hd_pic_url(self, user_id: str):
         raise AssertionError("must not be called without a session cookie")
 

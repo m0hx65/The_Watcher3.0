@@ -382,7 +382,12 @@ sweep itself is paced by `_SweepThrottle`:
   request rhythm as a manual recheck). The gap is stamped when a check
   *finishes*, so it is a real gap between requests rather than between
   launches: a burst of launches all waiting on a semaphore was the old
-  behavior, and it hit Instagram as one wave.
+  behavior, and it hit Instagram as one wave. A lane also *claims* its
+  departure time on the way in, not just reads it — otherwise every lane
+  waiting on the same `_next_slot` woke to the same instant and left
+  together, which is the burst the whole class exists to prevent. With one
+  lane nothing changes: the check outlasts its own claim, so the finish
+  stamp is the one that lands.
 - **Adaptive pacing** — the gap widens by one step per consecutive 401/403 up
   to `SWEEP_STAGGER_MAX_SECONDS`, and relaxes on success.
 - **A guard that distinguishes a throttle from an outage.** At
@@ -556,9 +561,15 @@ can run neither a port forward nor a Tailscale Funnel. `app/monitor/home_fetch.p
 is the in-memory broker that matches jobs to waiting checks;
 `InstagramClient.probe_home_page` parses the same Relay payload the direct page
 door does, so the reading is a normal `source="public_page"` partial. Order on
-the username side: the API (unless skipped for the sweep), this host's page
-request, the home fetcher. A worker that has not polled for 90 s is "not
-connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
+the username side: the API (unless skipped for the sweep), then the page — and
+which page door goes first depends on what is already paid for. A page the
+phone has ALREADY delivered (`cached_page_ok`, i.e. a sweep that prefetched
+it) is taken straight away; otherwise this host asks first and the home
+fetcher is the fallback. That ordering matters twice over: this host's door
+costs up to 12 s per account and answers 429, and each of those refusals is
+one more strike against an IP already out of favour. A manual check still
+asks this host first, which is what keeps the door under test rather than
+written off. A worker that has not polled for 90 s is "not connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
 page from Instagram, a few KB (the extracted payload) back to the bot.
 
 The sweep never waits on the phone by design. It hands the broker its whole
@@ -580,12 +591,27 @@ again, and the highlight catalog is left as stored. The sweep summary ends with
 a home-fetcher line: connection, pages this sweep, battery.
 
 Reel queries go through the phone too (job kind `reel`, keyed by numeric id;
-a worker declares what it fetches in `X-Watcher-Kinds`). `check_all` prefetches
-every account's reel query at sweep start; `probe_by_id(cached_ok=True)` reads
-the phone's answer from the broker's cache first, then the Worker, and after
-three Worker refusals in a row asks the phone live first for 10 minutes. A
-sweep's guard counts a page-served check as answered (`status == 200`), not
+a worker declares what it fetches in `X-Watcher-Kinds`). `probe_by_id(cached_ok=True)`
+reads the phone's answer from the broker's cache first, then the Worker, and
+after three Worker refusals in a row asks the phone live first for 10 minutes.
+A sweep's guard counts a page-served check as answered (`status == 200`), not
 by the API door alone — the bug that paused sweeps and widened the gap.
+
+Which accounts get a reel query depends on what a reel still answers. While
+the username API is shut and the phone is serving pages, the page already
+answers the story question, so a reel adds only the live flag and the
+highlight catalog — and the catalog is re-listed at most once per
+`HIGHLIGHT_SCAN_INTERVAL`. So `check_all` prefetches reels for the accounts
+whose catalog is actually due (one batched read of the `highlight_scan:`
+stamps decides), not for every account: asking for all of them was a second
+Instagram request per account per sweep, on the same home line the page door
+depends on, for an answer nothing read. What the phone does deliver is read
+by the story phase (`InstagramClient.reel_in_hand`) — free, already fetched,
+no request and no wait — to fill the live flag and the catalog a page-derived
+status cannot know. That read is bounded to 5 minutes (`_REEL_IN_HAND_MAX_AGE`,
+well under the broker's own 15-minute result TTL) so the previous sweep's
+answer is never announced as this one's. Any older and it is treated as
+nothing in hand, and the page's own answer stands.
 
 This host's own page request is bounded to 12 s and, after three refusals in
 a row (429, login redirect, empty shell, timeout), skipped for 30 minutes so

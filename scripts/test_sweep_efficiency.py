@@ -1,0 +1,568 @@
+"""What a sweep is allowed to spend (2026-09-07).
+
+Every Instagram request a sweep makes is either useful or it is the reason
+the next one gets refused. These are the four places the sweep was spending
+requests and seconds it did not need to:
+
+- a page the phone had ALREADY delivered was used only after this host's own
+  page request had been refused first — up to _DIRECT_PAGE_TIMEOUT seconds
+  per account, and one more refused request from an IP already out of favour;
+- a reel query went out for EVERY account every sweep, on the same home line
+  the page door depends on, while the page answered the story question and
+  nothing ever read the reel's answer;
+- what the phone did deliver was then thrown away, so the live flag and the
+  highlight catalog went missing for the whole page-served era;
+- each check re-read the account's numeric id from the database, which the
+  sweep had already read to build its own list.
+
+And one guard: with more than one lane, the pacing gap must space the
+launches. Reading the next slot without claiming it let every waiting lane
+wake to the same instant — a burst, which is the shape that trips the gate.
+
+Runs fully offline.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Optional
+from unittest.mock import AsyncMock
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
+os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
+DB_FILE = ROOT / "test_sweep_efficiency.db"
+if DB_FILE.exists():
+    DB_FILE.unlink()
+os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}")
+
+from app.config import settings  # noqa: E402
+from app.database import crud  # noqa: E402
+from app.database.models import Base, MonitoredAccount  # noqa: E402
+from app.database.session import engine, get_session  # noqa: E402
+from app.monitor import home_fetch  # noqa: E402
+from app.monitor.instagram import (  # noqa: E402
+    IdProbe, InstagramClient, ProfileFetchResult,
+)
+from app.monitor.service import MonitorService, _SweepThrottle  # noqa: E402
+
+FAILURES: list[str] = []
+
+
+def expect(name: str, condition: bool, detail: str = "") -> None:
+    status = "ok" if condition else "FAIL"
+    line = f"{status}: {name}"
+    if detail and not condition:
+        line += f" -- {detail}"
+    print(line)
+    if not condition:
+        FAILURES.append(name)
+
+
+# The page as Instagram serves it, payload and all — the same shape the home
+# fetcher extracts and posts back.
+PAGE = (
+    "<!DOCTYPE html><html><head></head><body>"
+    "<script type=\"application/json\" data-sjs>"
+    '{"require":[["RelayPrefetchedStreamCache","next",[],[{"__bbox":'
+    '{"result":{"data":{"xig_user_by_username":'
+    '{"pk":"42","username":"pageuser",'
+    '"profile_pic_url":"https:\\/\\/scontent.cdninstagram.com\\/v\\/t51.2885-19\\/1_2_3_n.jpg",'
+    '"is_private":false,"biography":"bio text","full_name":"Page User",'
+    '"is_verified":false,"bio_links":[],"follower_count":1234,'
+    '"following_count":567,"latest_reel_media":0,"all_media_count":null,'
+    '"id":"17841407816045006"}'
+    "}}}}]]]}</script></body></html>"
+)
+
+
+class _MockResponse:
+    def __init__(self, status_code: int, body: Any = None, text: str = "") -> None:
+        self.status_code = status_code
+        self._body = body if body is not None else {}
+        self.text = text
+
+    def json(self) -> Any:
+        return self._body
+
+
+class _MockSession:
+    def __init__(self, handler) -> None:
+        self.handler = handler
+        self.requests: list[dict] = []
+
+    async def get(self, url: str, *, params: Any = None, headers: Any = None):
+        self.requests.append({"url": url, "params": dict(params or {})})
+        return self.handler(url, dict(params or {}))
+
+    async def close(self) -> None:
+        pass
+
+    def page_asks(self) -> list[str]:
+        """The requests that went to instagram.com/<username>/ — this host's
+        own page door, the one a datacenter IP is refused on."""
+        return [
+            r["url"] for r in self.requests
+            if r["url"].startswith("https://www.instagram.com/")
+            and "/graphql/" not in r["url"] and "/api/" not in r["url"]
+        ]
+
+
+class FakeBroker:
+    """The home fetcher's broker: pages and reels the phone has delivered,
+    plus a record of everything the sweep asked it for."""
+
+    def __init__(self, *, connected: bool = True) -> None:
+        self.connected = connected
+        self.cache: dict[str, home_fetch.PageResult] = {}
+        self.reel_cache: dict[str, home_fetch.PageResult] = {}
+        self.asked: list[str] = []
+        self.prefetched: list[str] = []
+        self.prefetched_reels: list[tuple[str, str]] = []
+        self.last_seen_seconds = 5.0
+        self.battery = None
+        self.charging = None
+        self.worker = "xiaomi"
+        self.delivered = 0
+
+    def describe(self) -> str:
+        return "connected (fake)" if self.connected else "not connected (fake)"
+
+    def cached(self, username: str):
+        return self.cache.get(username)
+
+    def cached_reel(self, user_id: str):
+        return self.reel_cache.get(str(user_id))
+
+    def prefetch(self, usernames) -> int:
+        if not self.connected:
+            return 0
+        names = list(usernames)
+        self.prefetched.extend(names)
+        return len(names)
+
+    def prefetch_reels(self, users) -> int:
+        if not self.connected:
+            return 0
+        pairs = list(users)
+        self.prefetched_reels.extend(pairs)
+        return len(pairs)
+
+    async def request_page(self, username: str, *, timeout: float = 30.0,
+                           fresh: bool = False):
+        self.asked.append(username)
+        return self.cache.get(username) if not fresh else None
+
+    async def request_reel(self, user_id: str, username: str = "", *,
+                           timeout: float = 15.0, fresh: bool = False):
+        return None
+
+
+class ScriptedInstagram:
+    """A client whose two doors answer whatever a test scripts."""
+
+    def __init__(self) -> None:
+        self.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=401, error="HTTP 401", api_status=401,
+        )
+        self.probe = lambda i: IdProbe(user_id=i, status=401)
+        self.probe_calls: list[str] = []
+        self.in_hand: Optional[dict] = None
+        self.in_hand_calls: list[str] = []
+
+    async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
+        return self.profile(username)
+
+    async def probe_by_id(self, user_id: str, **kw) -> IdProbe:
+        self.probe_calls.append(str(user_id))
+        return self.probe(str(user_id))
+
+    async def fetch_reel_user(self, user_id: str):
+        raise AssertionError(
+            "the reel route must not be asked again once the page answered"
+        )
+
+    def reel_in_hand(self, user_id: str):
+        self.in_hand_calls.append(str(user_id))
+        return self.in_hand
+
+    async def fetch_hd_pic_url(self, user_id: str):
+        return None
+
+
+class QuietStories:
+    async def fetch_stories(self, username):
+        return []
+
+    async def fetch_highlight_items(self, username, highlight_id, title):
+        return []
+
+    async def fetch_profile_pic_url(self, username):
+        return None
+
+
+def _service(instagram, *, stories=None) -> MonitorService:
+    notifier = AsyncMock()
+    notifier.send_text = AsyncMock(return_value=True)
+    notifier.send_document = AsyncMock(return_value=True)
+    notifier.create_forum_topic = AsyncMock(return_value=None)
+    return MonitorService(
+        instagram=instagram,
+        hasher=AsyncMock(hash_url=AsyncMock(return_value=None)),
+        notifier=notifier, stories=stories,
+    )
+
+
+def _sent(service) -> list[str]:
+    return [c.args[0] for c in service.notifier.send_text.await_args_list]
+
+
+async def _new_account(username: str, instagram_id: Optional[str] = "42") -> int:
+    async with get_session() as session:
+        account = MonitoredAccount(
+            username=username, active=True, instagram_id=instagram_id
+        )
+        session.add(account)
+        await session.flush()
+        return account.id
+
+
+async def _pause_everything() -> None:
+    async with get_session() as session:
+        for a in await crud.list_accounts(session, only_active=True):
+            await crud.set_account_active(session, a.username, False)
+
+
+async def _set_door(closed: bool) -> None:
+    from datetime import datetime, timezone
+    async with get_session() as session:
+        if closed:
+            await crud.set_setting(
+                session, "username_api_closed_at",
+                datetime.now(timezone.utc).isoformat(),
+            )
+        else:
+            await crud.delete_setting(session, "username_api_closed_at")
+
+
+# ---------- 1. a page already in hand is not paid for twice ----------------
+
+async def test_a_prefetched_page_skips_this_hosts_refused_door() -> None:
+    """The phone delivered this page seconds ago. Asking Instagram for it
+    again from here costs up to 12 s and earns a 429 — and that refusal is
+    what keeps the door shut. Take the one already paid for."""
+    old_broker, old_token, old_proxy = (
+        home_fetch.broker, settings.home_fetch_token, settings.ig_proxy_url,
+    )
+    settings.home_fetch_token = "sekrit"
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    try:
+        broker = FakeBroker(connected=True)
+        broker.cache["pageuser"] = home_fetch.PageResult(
+            200, PAGE, "https://www.instagram.com/pageuser/"
+        )
+        home_fetch.broker = broker
+
+        # This host's page door would answer — slowly, and with a 429.
+        session = _MockSession(lambda url, p: _MockResponse(429, {}, text=""))
+        async with InstagramClient(max_retries=5, session=session) as client:
+            swept = await client.fetch_profile(
+                "pageuser", auth_attempts=1, api=False, cached_page_ok=True
+            )
+        expect("the sweep's check reads the page the phone delivered",
+               swept.success and swept.source == "public_page"
+               and (swept.parsed or {}).get("following_count") == 567, repr(swept))
+        expect("without spending a request on this host's refused door",
+               session.page_asks() == [], repr(session.page_asks()))
+        expect("and without waiting on the phone",
+               broker.asked == [], repr(broker.asked))
+
+        # A manual check wants a fresh reading, so this host asks first — which
+        # is also what keeps the door under test rather than written off.
+        session2 = _MockSession(lambda url, p: _MockResponse(429, {}, text=""))
+        async with InstagramClient(max_retries=5, session=session2) as client:
+            fresh = await client.fetch_profile(
+                "pageuser", auth_attempts=1, api=False, cached_page_ok=False
+            )
+        expect("a manual check still asks this host first",
+               len(session2.page_asks()) == 1, repr(session2.page_asks()))
+        expect("and reports the refusal rather than a stale page",
+               not fresh.success, repr(fresh))
+
+        # A delivered page that carried nothing usable is not an answer: the
+        # doors below still get their turn.
+        broker.cache["walled"] = home_fetch.PageResult(429, "", "")
+        session3 = _MockSession(lambda url, p: _MockResponse(429, {}, text=""))
+        async with InstagramClient(max_retries=5, session=session3) as client:
+            walled = await client.fetch_profile(
+                "walled", auth_attempts=1, api=False, cached_page_ok=True
+            )
+        expect("a refused page in hand falls through to the other doors",
+               len(session3.page_asks()) == 1, repr(session3.page_asks()))
+        expect("and the check reports the failure honestly", not walled.success,
+               repr(walled))
+    finally:
+        home_fetch.broker = old_broker
+        settings.home_fetch_token = old_token
+        settings.ig_proxy_url = old_proxy
+
+
+# ---------- 2. reels only where a reel is still needed ---------------------
+
+async def _sweep(usernames: list[str], *, connected: bool = True
+                 ) -> tuple[dict, FakeBroker, ScriptedInstagram, MonitorService]:
+    await _pause_everything()
+    await _set_door(True)
+    for i, u in enumerate(usernames):
+        await _new_account(u, instagram_id=str(1000 + i))
+    broker = FakeBroker(connected=connected)
+    home_fetch.broker = broker
+    ig = ScriptedInstagram()
+    ig.profile = lambda u: ProfileFetchResult(
+        username=u, http_status=200, source="public_page", api_status=401,
+        parsed={"username": u, "followers_count": 10, "following_count": 5,
+                "is_private": False, "instagram_id": "42",
+                "has_public_story": False},
+    )
+    service = _service(ig)
+    result = await service.check_all()
+    return result, broker, ig, service
+
+
+async def test_the_sweep_asks_only_for_the_reels_it_will_read() -> None:
+    """With the username API shut and the phone serving pages, the page
+    answers the story question — so a reel is worth asking for only where the
+    highlight catalog is actually due. Asking for one per account was a second
+    Instagram request per account, on the home line, that nothing read."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    try:
+        names = [f"reel{i}" for i in range(4)]
+        await _pause_everything()
+        ids = {}
+        for i, u in enumerate(names):
+            ids[u] = await _new_account(u, instagram_id=str(1000 + i))
+        # Three were scanned just now; one is overdue.
+        async with get_session() as session:
+            for u in names[:3]:
+                await crud.set_setting(
+                    session, f"highlight_scan:{ids[u]}", str(time.time())
+                )
+            await crud.set_setting(
+                session, f"highlight_scan:{ids[names[3]]}",
+                str(time.time() - settings.highlight_scan_interval - 60),
+            )
+        await _set_door(True)
+        broker = FakeBroker(connected=True)
+        home_fetch.broker = broker
+        ig = ScriptedInstagram()
+        ig.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=200, source="public_page", api_status=401,
+            parsed={"username": u, "followers_count": 10, "following_count": 5,
+                    "is_private": False, "instagram_id": "42",
+                    "has_public_story": False},
+        )
+        service = _service(ig)
+        await service.check_all()
+        asked = sorted(name for _, name in broker.prefetched_reels)
+        expect("only the account whose catalog is due gets a reel query",
+               asked == [names[3]], repr(broker.prefetched_reels))
+        expect("every account still gets its page",
+               sorted(broker.prefetched) == sorted(names), repr(broker.prefetched))
+
+        # The filter only applies while the page is answering the story
+        # question. With the username API believed open, the reel is the
+        # primary route again and every account still gets one — including
+        # the three whose catalog was scanned a moment ago.
+        await _set_door(False)
+        broker2 = FakeBroker(connected=True)
+        home_fetch.broker = broker2
+        service2 = _service(ig)
+        await service2.check_all()
+        expect("with the API door believed open, every account gets a reel",
+               sorted(n for _, n in broker2.prefetched_reels) == sorted(names),
+               repr(broker2.prefetched_reels))
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
+# ---------- 3. what the phone delivered is read, not discarded -------------
+
+async def test_the_story_phase_reads_the_reel_the_phone_delivered() -> None:
+    """The page says whether a story is up; it has never known a live
+    broadcast or the highlight catalog. The phone's reel answer does, it has
+    already been fetched, and reading it costs nothing."""
+    account_id = await _new_account("livedup", instagram_id="42")
+    ig = ScriptedInstagram()
+    ig.in_hand = {
+        "has_public_story": False,
+        "is_live": True,
+        "highlights": {"h1": "Trips", "h2": "Food"},
+    }
+    service = _service(ig, stories=QuietStories())
+    page_reel = {
+        "has_public_story": False, "is_live": False,
+        "highlights": None, "from_page": True,
+    }
+    await service._check_stories_and_highlights(
+        account_id, "livedup", instagram_id="42",
+        reel_data=dict(page_reel), always_report=True,
+    )
+    texts = _sent(service)
+    expect("the live flag comes back",
+           any("LIVE" in t for t in texts), repr(texts))
+    expect("and it never asked the refused reel route again",
+           ig.in_hand_calls == ["42"], repr(ig.in_hand_calls))
+    async with get_session() as session:
+        stored = await crud.get_highlight_catalog(session, account_id)
+    expect("the highlight catalog is stored from the same free answer",
+           stored == {"h1": "Trips", "h2": "Food"}, repr(stored))
+
+    # Nothing in hand: the page's own answer stands, and no stored catalog is
+    # overwritten with an empty one.
+    quiet = await _new_account("nothingyet", instagram_id="77")
+    ig2 = ScriptedInstagram()
+    ig2.in_hand = None
+    service2 = _service(ig2, stories=QuietStories())
+    await service2._check_stories_and_highlights(
+        quiet, "nothingyet", instagram_id="77",
+        reel_data=dict(page_reel), always_report=True,
+    )
+    texts2 = _sent(service2)
+    expect("with nothing in hand the page's answer still stands",
+           any("NO STORY" in t for t in texts2), repr(texts2))
+
+
+async def test_a_previous_sweeps_reel_is_not_read_as_this_ones() -> None:
+    """The broker keeps an answer for 15 minutes so one sweep can share it.
+    A status the bot announces as current must not come from the sweep
+    before — too old is the same as nothing in hand."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    try:
+        broker = FakeBroker(connected=True)
+        home_fetch.broker = broker
+        client = InstagramClient(max_retries=1, session=_MockSession(
+            lambda url, p: _MockResponse(401, {})
+        ))
+        live = '{"data":{"user":{"has_public_story":false,"is_live":true,' \
+               '"reel":{"id":"55","user":{"id":"55","username":"n"}},' \
+               '"edge_highlight_reels":{"edges":[]}}}}'
+        fresh = home_fetch.PageResult(200, live)
+        broker.reel_cache["55"] = fresh
+        expect("a reel from this sweep is read",
+               (client.reel_in_hand("55") or {}).get("is_live") is True,
+               repr(client.reel_in_hand("55")))
+
+        stale_client = InstagramClient(max_retries=1, session=_MockSession(
+            lambda url, p: _MockResponse(401, {})
+        ))
+        stale = home_fetch.PageResult(200, live)
+        stale.fetched_at -= InstagramClient._REEL_IN_HAND_MAX_AGE + 60
+        broker.reel_cache["56"] = stale
+        expect("a reel from the sweep before is not",
+               stale_client.reel_in_hand("56") is None,
+               repr(stale_client.reel_in_hand("56")))
+        await client.close()
+        await stale_client.close()
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+
+
+# ---------- 4. the id the sweep already read is not read again -------------
+
+async def test_a_sweep_does_not_re_read_every_accounts_id() -> None:
+    """check_all reads every account row to build its list. Reading each id
+    again inside the check cost a session checkout, a pool ping and a round
+    trip per account for something already in hand."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    try:
+        names = [f"noreread{i}" for i in range(3)]
+        result, broker, ig, service = await _sweep(names)
+
+        async def must_not_be_called(account_id):
+            raise AssertionError("the sweep re-read an id it already had")
+
+        service._stored_instagram_id = must_not_be_called  # type: ignore[assignment]
+        await _pause_everything()
+        again = [f"again{i}" for i in range(3)]
+        for i, u in enumerate(again):
+            await _new_account(u, instagram_id=str(3000 + i))
+        home_fetch.broker = FakeBroker(connected=True)
+        second = await service.check_all()
+        expect("the sweep ran without a single id re-read",
+               second["checked"] == 3, repr(second))
+        expect("and every check asked by the id the sweep already had",
+               sorted(ig.probe_calls[-3:]) == ["3000", "3001", "3002"],
+               repr(ig.probe_calls))
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
+# ---------- 5. extra lanes space out, they do not burst --------------------
+
+async def test_extra_lanes_are_spaced_not_bursted() -> None:
+    """Reading the next slot without claiming it let every waiting lane wake
+    to the same instant. Three lanes then left as one burst — which is the
+    exact shape that trips Instagram's anonymous limiter."""
+    t = _SweepThrottle(
+        base_stagger=0.15, max_stagger=0.15, breaker_threshold=0, concurrency=3
+    )
+    starts: list[float] = []
+    began = time.monotonic()
+
+    async def one() -> None:
+        async with t.slot():
+            starts.append(time.monotonic() - began)
+            await asyncio.sleep(0.25)
+
+    await asyncio.gather(*(one() for _ in range(3)))
+    starts.sort()
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    expect("no two lanes leave at the same instant",
+           all(g >= 0.12 for g in gaps), repr(gaps))
+
+    # And one lane is still paced from the END of the previous check, so a
+    # slow check does not get a second request fired on top of it.
+    t2 = _SweepThrottle(base_stagger=0.2, max_stagger=0.2, breaker_threshold=0)
+    began = time.monotonic()
+    async with t2.slot():
+        await asyncio.sleep(0.2)
+    async with t2.slot():
+        second = time.monotonic() - began
+    expect("a single lane still measures the gap from the last request",
+           second >= 0.4 - 0.05, f"{second:.3f}s")
+
+
+async def main() -> int:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    await test_a_prefetched_page_skips_this_hosts_refused_door()
+    await test_the_sweep_asks_only_for_the_reels_it_will_read()
+    await test_the_story_phase_reads_the_reel_the_phone_delivered()
+    await test_a_previous_sweeps_reel_is_not_read_as_this_ones()
+    await test_a_sweep_does_not_re_read_every_accounts_id()
+    await test_extra_lanes_are_spaced_not_bursted()
+
+    await engine.dispose()
+    print()
+    if FAILURES:
+        print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
+        return 1
+    print("All sweep-efficiency checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
