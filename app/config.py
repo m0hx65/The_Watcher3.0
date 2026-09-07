@@ -222,6 +222,12 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    # The host's health checker hits /health every few seconds, and uvicorn
+    # logs an access line for each — twelve a minute of "still alive", which
+    # is enough to bury a sweep between two of them. Passing checks are hidden
+    # by default; a FAILING one always logs, whatever this says. Set true when
+    # the question is whether the health checker is running at all.
+    log_health_checks: bool = Field(default=False, alias="LOG_HEALTH_CHECKS")
 
     # Optional proxy (single URL applied to both http and https)
     proxy_url: Optional[str] = Field(default=None, alias="PROXY_URL")

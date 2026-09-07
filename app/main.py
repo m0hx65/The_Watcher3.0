@@ -30,12 +30,13 @@ from app.monitor.instagram import InstagramClient
 from app.monitor.media_hasher import MediaHasher
 from app.monitor.service import MonitorService
 from app.monitor.stories import StoriesClient
-from app.utils.logger import logger
+from app.utils.logger import logger, quiet_health_check_logs
 from app.workers.scheduler import WatcherScheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    quiet_health_check_logs()
     logger.info("Starting The Watcher V3.0…")
     # Say the route once, at boot. A cloud host's own IP is 401-blocked, so a
     # misconfigured IG_PROXY_URL looks exactly like Instagram blocking us.
