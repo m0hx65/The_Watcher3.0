@@ -397,6 +397,25 @@ sweep itself is paced by `_SweepThrottle`:
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
   request is blocked traffic that keeps it shut.
+- **Nothing outruns the pacer.** `_SweepThrottle` only knows about its own
+  sweep, so a stakeout ticking every two minutes, a card Recheck or `/story`
+  fired unpaced requests into the middle of a paced sweep and the burst guard
+  never saw them. Every check now stamps a process-wide clock — sweep checks
+  included — and an OFF-schedule one waits out
+  `_OFF_SCHEDULE_MIN_GAP_SECONDS` (1 s, deliberately under the sweep's own
+  2 s: one account with someone waiting) before it goes. Sweep and retry-round
+  checks pass `paced=True`; they space themselves and must not be paced twice.
+- **A failed media download is retried, then retired.** Marking a story seen
+  on the first failed download lost it for good, although the next sweep — half
+  an hour later, well inside the 24 hours a story lives — would very likely
+  have got it. It now takes `_DOWNLOAD_ATTEMPTS` failures. Counted in memory,
+  so a restart is a fresh start, which is the right side to err on.
+- **Background work is held and reports itself** (`app/utils/tasks.spawn`).
+  The event loop keeps only a WEAK reference to a task, so an unreferenced one
+  can be collected mid-flight — and a whole sweep ran that way from the
+  Telegram button and `POST /sweep`, with any exception surfacing as a GC
+  warning if at all. `spawn` holds the task until it finishes and logs what it
+  raised, against a name that says where it came from.
 - **A door's baseline survives the outage that shut it.** Diffing is
   source-scoped, so the last API-sourced snapshot is what a returning API
   check measures against — and three separate things used to destroy it, all

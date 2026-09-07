@@ -68,6 +68,21 @@ _SWEEP_STAGGER_SECONDS = 2.0
 # it runs after every check, so this is the ceiling on a cost the sweep's
 # readings never wait for.
 _CATALOG_REFRESH_PER_SWEEP = 3
+# How many times one story/post item may fail to download before it is retired
+# as undownloadable. Counted in memory, so a restart is a fresh start — which
+# is the right side to err on: a story lives 24 hours and sweeps are half an
+# hour apart, so a transient source failure has room to recover, while an item
+# that is genuinely broken still stops being asked for.
+_DOWNLOAD_ATTEMPTS = 3
+# The smallest gap between an OFF-SCHEDULE check (a stakeout tick, a card
+# Recheck, /story) and whatever check ran last, sweep checks included. The
+# sweep paces itself through _SweepThrottle, but that throttle only knows
+# about its own sweep — so a stakeout ticking every two minutes fired
+# unpaced requests straight into the middle of a paced sweep, and the guard
+# that exists to prevent bursts could not see them. Deliberately shorter than
+# _SWEEP_STAGGER_SECONDS: this is one account with someone waiting on it, and
+# the job is to stop two requests landing together, not to slow the answer.
+_OFF_SCHEDULE_MIN_GAP_SECONDS = 1.0
 # First cooldown before re-checking accounts that hit a rate-limit block during
 # the sweep; it doubles each round up to the max. Instagram's anonymous throttle
 # windows are short, so a paced retry usually goes straight through.
@@ -446,6 +461,14 @@ class MonitorService:
         # The last finished sweep's shape — counts and which doors served it.
         # Read by /status; None until a sweep has finished this process.
         self.last_sweep: Optional[dict] = None
+        # (account_id, item pk) -> consecutive failed downloads. See
+        # _DOWNLOAD_ATTEMPTS.
+        self._download_failures: dict[tuple[Optional[int], str], int] = {}
+        # When the last check of ANY kind finished, and the gate that keeps an
+        # off-schedule check from landing on top of one. See
+        # _OFF_SCHEDULE_MIN_GAP_SECONDS.
+        self._last_check_at: float = 0.0
+        self._off_schedule_gate = asyncio.Lock()
         # account_id -> forum topic (message_thread_id). Resolved lazily and
         # cached so each account's alerts land in its own thread.
         self._topic_cache: dict[int, int] = {}
@@ -1540,6 +1563,7 @@ class MonitorService:
                 account_id, username, thorough=False,
                 skip_username_api=throttle.username_door_closed,
                 instagram_id=instagram_id,
+                paced=True,  # the throttle slot above IS the spacing
             )
             # Recorded inside the slot so the next account's pacing — and any
             # cooldown this block just triggered — already accounts for it.
@@ -1644,6 +1668,7 @@ class MonitorService:
                 retry = await self._run_check(
                     aid, uname, thorough=False,
                     skip_username_api=skip_username_api,
+                    paced=True,  # the round's cooldown and gaps are the spacing
                 )
                 if retry.get("ok"):
                     outcomes[idx] = (aid, uname, retry)
@@ -1665,6 +1690,7 @@ class MonitorService:
         thorough: bool = True,
         skip_username_api: bool = False,
         instagram_id: Optional[str] = None,
+        paced: bool = False,
     ) -> dict:
         """One full check. `thorough` (the default) lets a blocked fetch try
         every colo it can — right for on-demand checks, which are one account
@@ -1673,8 +1699,17 @@ class MonitorService:
         Instagram's gate shut, and the paced retry rounds are the second
         chance instead. `skip_username_api` leaves the username API alone
         (the id route and the page doors still run) — a sweep sets it once
-        that API has refused every lookup so far."""
+        that API has refused every lookup so far.
+
+        `paced` says the caller already holds a sweep slot and has spaced this
+        check itself. Everything else — stakeout ticks, card rechecks — waits
+        out `_OFF_SCHEDULE_MIN_GAP_SECONDS` first, so it slots into the same
+        rhythm instead of arriving on top of it. Every check stamps the clock
+        on the way out, sweep checks included, or the sweep's own traffic
+        would be invisible to the gate."""
         async with self._semaphore:
+            if not paced:
+                await self._await_off_schedule_slot()
             try:
                 started = time.monotonic()
                 result = await self._do_check(
@@ -1687,6 +1722,27 @@ class MonitorService:
             except Exception as exc:
                 logger.exception("Unhandled error checking @{}: {}", username, exc)
                 return {"ok": False, "username": username, "error": repr(exc)}
+            finally:
+                self._last_check_at = time.monotonic()
+
+    async def _await_off_schedule_slot(self) -> None:
+        """Hold an off-schedule check back until the gap has passed.
+
+        The lock is held across the wait on purpose: two stakeouts coming due
+        in the same second must leave one after the other, not together."""
+        gap = _OFF_SCHEDULE_MIN_GAP_SECONDS
+        if gap <= 0:
+            return
+        async with self._off_schedule_gate:
+            wait = self._last_check_at + gap - time.monotonic()
+            if wait > 0:
+                logger.debug(
+                    "Off-schedule check waiting {:.1f}s so it does not land on "
+                    "top of the last one", wait,
+                )
+                await asyncio.sleep(wait)
+            # Claim the slot, so a second waiter measures from here.
+            self._last_check_at = max(self._last_check_at, time.monotonic())
 
     @staticmethod
     def _log_check_timing(username: str, result: dict, total: float) -> None:
@@ -3249,22 +3305,47 @@ class MonitorService:
                 continue
             path = await self.stories.download(item, username)
             if path is None:
-                logger.warning(
-                    "Could not download story {} for @{}", item.pk, username
-                )
-                if account_id is not None:
-                    async with get_session() as session:
-                        await crud.mark_story_seen(
-                            session,
-                            account_id=account_id,
-                            story_pk=item.pk,
-                            source=item.source,
-                            highlight_id=item.highlight_id,
-                            highlight_title=item.highlight_title,
-                            media_type=item.media_type,
-                            taken_at=item.taken_at,
-                        )
-                seen_pks.add(item.pk)
+                # A failed download used to mark the item SEEN, which retired
+                # it for good: one saveinsta hiccup and a story was lost,
+                # although the next sweep — half an hour later, well inside
+                # the 24 hours a story lives — would very likely have got it.
+                # Marking it seen is still the right end state for an item
+                # that is simply not downloadable, or it would be retried
+                # every sweep forever; it just has to be the end of several
+                # attempts rather than the first.
+                key = (account_id, item.pk)
+                failures = self._download_failures.get(key, 0) + 1
+                # Nothing is persisted for an ad-hoc fetch of an unmonitored
+                # account, so there is no later sweep to retry on.
+                if account_id is None or failures >= _DOWNLOAD_ATTEMPTS:
+                    self._download_failures.pop(key, None)
+                    logger.warning(
+                        "Could not download story {} for @{} after {} "
+                        "attempt(s) — giving up on it",
+                        item.pk, username, failures,
+                    )
+                    if account_id is not None:
+                        async with get_session() as session:
+                            await crud.mark_story_seen(
+                                session,
+                                account_id=account_id,
+                                story_pk=item.pk,
+                                source=item.source,
+                                highlight_id=item.highlight_id,
+                                highlight_title=item.highlight_title,
+                                media_type=item.media_type,
+                                taken_at=item.taken_at,
+                            )
+                    seen_pks.add(item.pk)
+                else:
+                    if len(self._download_failures) > 512:
+                        self._download_failures.clear()  # bound the ledger
+                    self._download_failures[key] = failures
+                    logger.warning(
+                        "Could not download story {} for @{} (attempt {}/{}) "
+                        "— leaving it for the next check",
+                        item.pk, username, failures, _DOWNLOAD_ATTEMPTS,
+                    )
                 continue
 
             if item.source == "highlight":
@@ -3288,6 +3369,7 @@ class MonitorService:
 
             if ok:
                 sent += 1
+                self._download_failures.pop((account_id, item.pk), None)
                 if account_id is not None:
                     async with get_session() as session:
                         await crud.mark_story_seen(

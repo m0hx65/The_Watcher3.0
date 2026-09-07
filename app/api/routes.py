@@ -17,6 +17,7 @@ from app.monitor import home_fetch
 from app.monitor.health import fetch_health
 from app.monitor.service import MonitorService
 from app.utils.logger import logger
+from app.utils.tasks import spawn
 from app.workers.scheduler import WatcherScheduler
 
 router = APIRouter()
@@ -132,7 +133,7 @@ async def trigger_sweep(
     if scheduler.sweep_in_flight:
         return {"ok": False, "detail": "sweep already in progress"}
     logger.info("Sweep triggered via HTTP")
-    asyncio.create_task(scheduler.trigger_now())
+    spawn(scheduler.trigger_now(), name="sweep:http")
     return {"ok": True}
 
 
@@ -198,7 +199,7 @@ async def home_fetch_next_job(
         levels=settings.battery_alert_levels,
     )
     if alert:
-        asyncio.create_task(_send_alert(request, alert))
+        spawn(_send_alert(request, alert), name="home-fetch:battery-alert")
     kinds = None
     if x_watcher_kinds:
         kinds = [k.strip() for k in x_watcher_kinds.split(",") if k.strip()]

@@ -35,6 +35,7 @@ from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
+from app.utils.tasks import spawn
 from app.workers.scheduler import (
     MAX_INTERVAL,
     MIN_INTERVAL,
@@ -1198,7 +1199,7 @@ async def _do_add_bulk(
                 parse_mode=ParseMode.HTML,
             )
 
-    asyncio.create_task(_baseline())
+    spawn(_baseline(), name="bulk-add:baseline")
 
 
 async def _send_profile_photo(
@@ -1299,7 +1300,10 @@ async def _begin_stakeout(
     info = await sched.start_stakeout(account.id, username, duration=duration)
     service: MonitorService = context.application.bot_data["monitor"]
     # Immediate first check (don't wait one interval) — fire-and-forget.
-    asyncio.create_task(service.check_username(username, notify_unchanged=False))
+    spawn(
+        service.check_username(username, notify_unchanged=False),
+        name=f"stakeout:first-check:{username}",
+    )
     interval = info["interval"]
     end = info["end"]
     text = (
@@ -3302,7 +3306,7 @@ async def _handle_menu(
             return
         alert = "Sweep started — also fetching missing Instagram IDs!" if backfill_ids else "Sweep started!"
         await _safe_answer(query, alert)
-        asyncio.create_task(sched.trigger_now(backfill_ids=backfill_ids))
+        spawn(sched.trigger_now(backfill_ids=backfill_ids), name="sweep:button")
         text = await _render_status_message(context)
         running_msg = "🔄 Sweep running"
         if backfill_ids:
