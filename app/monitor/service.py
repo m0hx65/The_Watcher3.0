@@ -99,6 +99,18 @@ _PUBLIC_GRAB_MAX_ATTEMPTS = 3
 _PUBLIC_GRAB_POST_LIMIT = 100
 
 
+def _humanize_seconds(seconds: float) -> str:
+    """A duration a person can read at a glance. `0.0h` is how a 90-second
+    setting managed to look like a rounding error in a log line instead of
+    the reason every sweep was re-paying its discovery."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f}h"
+
+
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
     """An ISO timestamp from app_settings as an aware UTC datetime, or None."""
     if not raw:
@@ -623,10 +635,26 @@ class MonitorService:
                 "sweep"
             )
         age = (datetime.now(timezone.utc) - at).total_seconds()
-        return (
-            f"the stored verdict (shut at {at.isoformat()}) is {age / 3600:.1f}h "
-            f"old, past the {window / 3600:.1f}h recheck window"
+        reason = (
+            f"the stored verdict (shut at {at.isoformat()}) is "
+            f"{_humanize_seconds(age)} old, past the "
+            f"{_humanize_seconds(window)} recheck window"
         )
+        # A window shorter than the gap between sweeps can never be used: the
+        # verdict is always stale by the time the next sweep reads it, so
+        # every sweep re-pays the discovery in full. That is not a tuning
+        # choice, it is the setting cancelling itself out, and the log is
+        # where someone would look to find out why.
+        interval = max(0, settings.check_interval)
+        if interval and window < interval:
+            reason += (
+                f" — and that window is SHORTER than the sweep interval "
+                f"({_humanize_seconds(interval)}), so the verdict expires "
+                "before any sweep can ever use it and each one pays the "
+                "knocks again; raise USERNAME_API_RECHECK_SECONDS well above "
+                "the interval (43200 = 12h)"
+            )
+        return reason
 
     async def _remember_username_api_door(
         self, *, closed: bool, answered: bool

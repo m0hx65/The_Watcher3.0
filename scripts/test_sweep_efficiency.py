@@ -33,6 +33,7 @@ import asyncio
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import AsyncMock
@@ -519,6 +520,24 @@ async def test_the_shut_door_verdict_survives_a_restart() -> None:
         expect("and the log says so, by name",
                "USERNAME_API_RECHECK_SECONDS is 0" in zeroed._door_open_reason(),
                zeroed._door_open_reason())
+
+        # The real misconfiguration, measured 2026-09-07: a 90-second window
+        # against a 30-minute sweep interval. The verdict was written every
+        # sweep and expired long before the next one could read it, so every
+        # sweep re-paid five blocked Worker calls to rediscover the same shut
+        # door. Nothing looked broken — which is why the log has to say it.
+        settings.username_api_recheck_seconds = 90
+        stale = datetime.now(timezone.utc) - timedelta(minutes=30)
+        async with get_session() as session:
+            await crud.set_setting(
+                session, "username_api_closed_at", stale.isoformat()
+            )
+        short = _service(ig)
+        expect("a verdict one sweep old is already stale in a 90s window",
+               not await short.username_api_known_closed())
+        why = short._door_open_reason()
+        expect("and the log names it as the cause, not as a rounding error",
+               "SHORTER than the sweep interval" in why and "90s" in why, why)
     finally:
         settings.username_api_recheck_seconds = old_window
 
