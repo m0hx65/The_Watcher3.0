@@ -397,6 +397,19 @@ sweep itself is paced by `_SweepThrottle`:
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
   request is blocked traffic that keeps it shut.
+- **A door's baseline survives the outage that shut it.** Diffing is
+  source-scoped, so the last API-sourced snapshot is what a returning API
+  check measures against — and three separate things used to destroy it, all
+  of them only after the outage had run a while. The door marker lives in
+  `raw_response`, which the retention purge nulled wholesale: a marker-less
+  row reads as the API's, so week-old page rows began impersonating API ones
+  and a returning check would diff its counts against the page's. The purge
+  now strips the payload and KEEPS the marker. `get_latest_snapshot_by_source`
+  scanned 25 rows and returned "no baseline" once this door had not answered
+  for 25 changes; it now widens to the retained history (200/account) on a
+  miss, and only on a miss. And `purge_old_data` preserved the newest row per
+  ACCOUNT, which is only ever whichever door answered last; it now also keeps
+  the newest successful row of EACH door.
 - **A verdict on the username API, kept in `app_settings`.** A sweep that
   finds it refusing every lookup writes `username_api_closed_at`, and the next
   sweep — a redeployed process included — knocks ONCE instead of

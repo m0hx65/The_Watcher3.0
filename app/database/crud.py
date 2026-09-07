@@ -148,17 +148,19 @@ async def get_latest_snapshot(
     return result.scalar_one_or_none()
 
 
-def snapshot_source(snapshot: Optional[AccountSnapshot]) -> Optional[str]:
-    """Which door produced this snapshot: None for the authoritative API,
-    otherwise the marker written into raw_response (e.g. "public_page")."""
-    if snapshot is None:
-        return None
-    raw = snapshot.raw_response
+def _raw_source(raw: Any) -> Optional[str]:
+    """The door marker inside a raw_response value, or None for the API."""
     if isinstance(raw, dict):
         source = raw.get("source")
         if isinstance(source, str) and source != "api":
             return source
     return None
+
+
+def snapshot_source(snapshot: Optional[AccountSnapshot]) -> Optional[str]:
+    """Which door produced this snapshot: None for the authoritative API,
+    otherwise the marker written into raw_response (e.g. "public_page")."""
+    return None if snapshot is None else _raw_source(snapshot.raw_response)
 
 
 # Everything the public page produced BEFORE this instant came from the og:
@@ -262,6 +264,7 @@ async def get_latest_snapshot_by_source(
     *,
     source: Optional[str],
     scan_limit: int = 25,
+    deep_scan_limit: int = 200,
 ) -> Optional[AccountSnapshot]:
     """Newest successful snapshot recorded from the SAME source.
 
@@ -279,20 +282,47 @@ async def get_latest_snapshot_by_source(
     The marker lives in raw_response rather than a column because the schema is
     created with `create_all` and has no migration path; scanning the newest few
     rows is cheap, and snapshots are only written when something changed.
+
+    `scan_limit` is the fast path. When it finds nothing the scan WIDENS to
+    `deep_scan_limit` before giving up, because "none of the last 25 changes
+    came from this door" is precisely what a long outage looks like — and
+    returning None there hands a returning door an empty baseline, which it
+    then fills silently, swallowing everything that changed while it was
+    shut. The deep pass only runs on that miss, and `cleanup_old_snapshots`
+    keeps 200 rows per account, so it is bounded by the whole retained
+    history rather than by a guess.
+    """
+    found = await _newest_snapshot_from_source(
+        session, account_id, source, scan_limit
+    )
+    if found is not None or deep_scan_limit <= scan_limit:
+        return found
+    return await _newest_snapshot_from_source(
+        session, account_id, source, deep_scan_limit
+    )
+
+
+async def _newest_snapshot_from_source(
+    session: AsyncSession, account_id: int, source: Optional[str], limit: int
+) -> Optional[AccountSnapshot]:
+    """Newest successful snapshot from `source` within the newest `limit` rows.
+
+    Reads only the id and the marker, then loads the one row that matched —
+    so widening the window costs a few hundred bytes per row scanned rather
+    than a full snapshot each.
     """
     stmt = (
-        select(AccountSnapshot)
+        select(AccountSnapshot.id, AccountSnapshot.raw_response)
         .where(
             AccountSnapshot.account_id == account_id,
             AccountSnapshot.http_status == 200,
         )
         .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
-        .limit(scan_limit)
+        .limit(limit)
     )
-    result = await session.execute(stmt)
-    for snapshot in result.scalars():
-        if snapshot_source(snapshot) == source:
-            return snapshot
+    for row_id, raw in (await session.execute(stmt)).all():
+        if _raw_source(raw) == source:
+            return await session.get(AccountSnapshot, row_id)
     return None
 
 
@@ -845,6 +875,45 @@ async def set_account_topic(
 
 # ---------- Data retention ----------
 
+# Bulk id lists are chunked so a very old database cannot build a single
+# statement with tens of thousands of bind parameters.
+_PURGE_CHUNK = 500
+
+
+async def _newest_snapshot_id_per_source(session: AsyncSession) -> set[int]:
+    """The id of the newest SUCCESSFUL snapshot from each door, per account.
+
+    Read in Python rather than as a JSON predicate, because it has to behave
+    identically on Postgres (JSONB) and SQLite (JSON) — the same reason
+    `purge_partial_snapshots` scans. Bounded by what
+    `cleanup_old_snapshots` keeps: 200 rows per account.
+    """
+    rows = (
+        await session.execute(
+            select(
+                AccountSnapshot.id,
+                AccountSnapshot.account_id,
+                AccountSnapshot.raw_response,
+            )
+            .where(AccountSnapshot.http_status == 200)
+            .order_by(
+                AccountSnapshot.account_id,
+                desc(AccountSnapshot.created_at),
+                desc(AccountSnapshot.id),
+            )
+        )
+    ).all()
+    keep: set[int] = set()
+    seen: set[tuple[int, Optional[str]]] = set()
+    for row_id, account_id, raw in rows:
+        key = (account_id, _raw_source(raw))
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.add(row_id)
+    return keep
+
+
 async def purge_old_data(
     session: AsyncSession,
     snapshot_days: int,
@@ -873,18 +942,46 @@ async def purge_old_data(
         "notifications_deleted": 0,
     }
 
-    # --- NULL out raw_response on old-but-kept snapshots ---
+    # --- Strip raw_response on old-but-kept snapshots, KEEPING the marker ---
     if raw_response_days > 0:
         cutoff = now - timedelta(days=raw_response_days)
-        result = await session.execute(
-            update(AccountSnapshot)
-            .where(
-                AccountSnapshot.created_at < cutoff,
-                AccountSnapshot.raw_response.isnot(None),
+        # This used to null the whole column, which took the door marker with
+        # it — and `snapshot_source` reads a marker-less row as the API's. So
+        # after raw_response_days every page-sourced snapshot began
+        # impersonating an API one, and a returning API check would diff its
+        # numbers against the page's. That is exactly the phantom change the
+        # source-scoped baseline exists to prevent, arriving by the back door.
+        #
+        # The marker is two dozen bytes; the payload this step exists to
+        # reclaim was 50-200 KB. Keeping it costs nothing and is the
+        # difference between a row that knows where it came from and one that
+        # lies about it.
+        rows = (
+            await session.execute(
+                select(AccountSnapshot.id, AccountSnapshot.raw_response).where(
+                    AccountSnapshot.created_at < cutoff,
+                    AccountSnapshot.raw_response.isnot(None),
+                )
             )
-            .values(raw_response=None)
-        )
-        totals["raw_responses_nulled"] = result.rowcount
+        ).all()
+        by_marker: dict[Optional[str], List[int]] = {}
+        for row_id, raw in rows:
+            marker = _raw_source(raw)
+            reduced = {"source": marker} if marker else None
+            if raw == reduced:
+                continue  # already stripped by an earlier run
+            by_marker.setdefault(marker, []).append(row_id)
+        stripped = 0
+        for marker, ids in by_marker.items():
+            value = {"source": marker} if marker else None
+            for start in range(0, len(ids), _PURGE_CHUNK):
+                result = await session.execute(
+                    update(AccountSnapshot)
+                    .where(AccountSnapshot.id.in_(ids[start:start + _PURGE_CHUNK]))
+                    .values(raw_response=value)
+                )
+                stripped += result.rowcount
+        totals["raw_responses_nulled"] = stripped
 
     # --- Delete old snapshots, preserving the newest per account ---
     if snapshot_days > 0:
@@ -897,12 +994,21 @@ async def purge_old_data(
             .scalar_subquery()
         )
 
-        result = await session.execute(
-            delete(AccountSnapshot).where(
-                AccountSnapshot.created_at < cutoff,
-                AccountSnapshot.id.notin_(latest_ids_sq),
-            )
-        )
+        # …and the newest successful row of EACH door, per account. Diffing is
+        # source-scoped, so the last API-sourced row is the baseline a
+        # returning API check measures against. max(id) per account only ever
+        # protects whichever door answered last — so during a long outage the
+        # API's baseline aged past the cutoff and was deleted, and the check
+        # that finally got through established a new baseline in silence,
+        # taking every change made during the outage with it.
+        keep_ids = await _newest_snapshot_id_per_source(session)
+        conditions = [
+            AccountSnapshot.created_at < cutoff,
+            AccountSnapshot.id.notin_(latest_ids_sq),
+        ]
+        if keep_ids:
+            conditions.append(AccountSnapshot.id.notin_(keep_ids))
+        result = await session.execute(delete(AccountSnapshot).where(*conditions))
         totals["snapshots_deleted"] = result.rowcount
 
     # --- Delete old notification logs ---
