@@ -513,6 +513,14 @@ class HomeFetchBroker:
             self._loop = loop
             self._jobs.clear()
             self._by_key.clear()
+            # The waiters and the answers go with them. A waiter is a future
+            # belonging to the dead loop — nothing can ever resolve it, and
+            # resolving it from THIS loop would be a cross-loop call — while a
+            # kept answer is the reply to a question nobody is asking any
+            # more. Leaving either behind meant the state a "fresh" loop
+            # started from was not fresh.
+            self._waiters.clear()
+            self._results.clear()
         return self._queue
 
 

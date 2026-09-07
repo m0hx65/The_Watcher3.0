@@ -453,6 +453,16 @@ class MonitorService:
         self.notifier = notifier
         self.stories = stories
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
+        # The story phase gets its own budget rather than sharing the one
+        # above. One semaphore was standing in for two different upstreams:
+        # a CHECK talks to Instagram, while the story phase talks to
+        # saveinsta and Telegram and holds its lane for the whole of a long
+        # body — listings, downloads, sends, database work. Sharing meant a
+        # card Recheck queued behind three accounts' media work for no
+        # reason, and it never bounded Instagram traffic any better, because
+        # the story phase barely touches Instagram. Same size, so neither
+        # side fans out wider than before.
+        self._story_semaphore = asyncio.Semaphore(settings.max_concurrent_fetches)
         # When a sweep last found the username API refusing every lookup
         # (None = it was answering). Loaded from app_settings on first use so
         # the memory survives a restart; see username_api_known_closed().
@@ -1064,10 +1074,18 @@ class MonitorService:
                 "{} account(s) deferred to the retry pass / next sweep",
                 throttle.peak_consecutive_blocks, throttle.skipped,
             )
-        await self._remember_username_api_door(
-            closed=throttle.username_door_closed,
-            answered=throttle.username_door_answered,
-        )
+        # Only when the mid-sweep latch has not already written this exact
+        # verdict. It writes the moment the door closes (so a restart cannot
+        # forget it), and repeating it here wrote the same row and logged the
+        # same line a second time every sweep. A door that closed can never
+        # go on to answer — closing requires that nothing answered, and from
+        # then on the API is not asked at all — so `door_recorded` means the
+        # verdict below is the one already stored.
+        if not throttle.door_recorded:
+            await self._remember_username_api_door(
+                closed=throttle.username_door_closed,
+                answered=throttle.username_door_answered,
+            )
 
         # account_id -> (fallback username, result dict). Exceptions become
         # failure dicts (flagged "crashed") so the retry pass can rewrite any
@@ -2832,7 +2850,7 @@ class MonitorService:
         can. The caller caps how many accounts get this per sweep.
         """
         assert self.stories is not None
-        async with self._semaphore:
+        async with self._story_semaphore:
             try:
                 async with get_session() as session:
                     previous_catalog = await crud.get_highlight_catalog(
