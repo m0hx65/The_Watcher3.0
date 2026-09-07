@@ -177,33 +177,56 @@ async def test_prefetch_batches_and_caches() -> None:
            repr(joined))
 
 
-def test_low_battery_alerts_once_and_rearms() -> None:
-    """The phone lives on a charger. A reading that drops while NOT charging
-    means the charger fell out: one alert at the threshold, one at half of
-    it, then "charging again" — never one message per poll."""
+def test_battery_alerts_once_per_rung() -> None:
+    """The phone lives on a charger, and it polls every few seconds — so the
+    rule is one message per rung crossed on the way down, never one per poll.
+    The rungs are configurable (HOME_FETCH_BATTERY_ALERTS, 50/20/10/5 by
+    default); plugging it back in is announced once and re-arms them."""
+    LEVELS = [50, 20, 10, 5]
     broker = HomeFetchBroker()
     broker._worker = "xiaomi"
-    note = lambda b, c: broker.note_device(battery=b, charging=c, threshold=20)  # noqa: E731
+    note = lambda b, c: broker.note_device(battery=b, charging=c, levels=LEVELS)  # noqa: E731
     expect("charging at 68% says nothing", note(68, True) is None)
-    expect("25% not charging is above the line", note(25, False) is None)
-    first = note(20, False)
-    expect("20% not charging alerts", first is not None and "20%" in first and "xiaomi" in first, repr(first))
-    expect("18% does not alert again", note(18, False) is None)
-    expect("12% does not alert again", note(12, False) is None)
-    second = note(10, False)
-    expect("10% (half the threshold) alerts once more", second is not None and "10%" in second, repr(second))
-    expect("9% is silent", note(9, False) is None)
+    expect("51% not charging is above every rung", note(51, False) is None)
+    first = note(50, False)
+    expect("50% is the first rung",
+           first is not None and "50%" in first and "xiaomi" in first, repr(first))
+    expect("49% does not repeat it", note(49, False) is None)
+    expect("21% still does not", note(21, False) is None)
+    second = note(20, False)
+    expect("20% is the next rung", second is not None and "20%" in second, repr(second))
+    expect("19% is silent", note(19, False) is None)
+    expect("11% is silent", note(11, False) is None)
+    expect("10% speaks", "10%" in (note(10, False) or ""), "10")
+    expect("7% is silent", note(7, False) is None)
+    expect("5% speaks", "5%" in (note(5, False) or ""), "5")
+    expect("2% is silent — there is no rung below 5", note(2, False) is None)
     back = note(30, True)
-    expect("charging again is announced, once", back is not None and "charging again" in back, repr(back))
+    expect("charging again is announced, once",
+           back is not None and "charging again" in back, repr(back))
     expect("and only because an alert had gone out", note(31, True) is None)
-    expect("a later drop alerts again", note(19, False) is not None)
+    expect("a later drop alerts at the rung it reaches", "20%" in (note(20, False) or ""))
     broker._last_poll = time.monotonic()  # the reading arrives with a poll
-    expect("the battery shows in describe()", "battery 19%, not charging" in broker.describe(),
+    expect("the battery shows in describe()", "battery 20%, not charging" in broker.describe(),
            broker.describe())
-    expect("threshold 0 disables the alert",
-           HomeFetchBroker().note_device(battery=5, charging=False, threshold=0) is None)
-    expect("an unknown charging state below the line stays quiet (no false alarm)",
-           HomeFetchBroker().note_device(battery=5, charging=None, threshold=20) is None)
+
+    # A discharge that never came back to a charger but climbed clear of the
+    # whole ladder re-arms it too — the phone was moved, not plugged in.
+    climbed = HomeFetchBroker()
+    expect("first rung on the way down",
+           climbed.note_device(battery=20, charging=False, levels=LEVELS) is not None)
+    expect("clear of the ladder is quiet",
+           climbed.note_device(battery=80, charging=False, levels=LEVELS) is None)
+    expect("and the rungs are armed again",
+           climbed.note_device(battery=20, charging=False, levels=LEVELS) is not None)
+
+    expect("an empty ladder disables the alerts",
+           HomeFetchBroker().note_device(battery=5, charging=False, levels=[]) is None)
+    expect("an unknown charging state stays quiet (no false alarm on a PC)",
+           HomeFetchBroker().note_device(battery=5, charging=None, levels=LEVELS) is None)
+    expect("the ladder is parsed highest-first, clamped and de-duplicated",
+           settings.battery_alert_levels == [50, 20, 10, 5],
+           repr(settings.battery_alert_levels))
 
 
 async def test_reel_jobs_go_only_to_a_worker_that_can_fetch_them() -> None:
@@ -250,6 +273,7 @@ def _app() -> FastAPI:
 
 async def test_endpoints() -> None:
     old_token = settings.home_fetch_token
+    old_levels = settings.home_fetch_battery_alerts
     old_broker = home_fetch.broker
     home_fetch.broker = HomeFetchBroker()
     transport = httpx.ASGITransport(app=_app())
@@ -313,7 +337,7 @@ async def test_endpoints() -> None:
             from unittest.mock import AsyncMock
             notifier = SimpleNamespace(send_text=AsyncMock(return_value=True))
             transport.app.state.monitor = SimpleNamespace(notifier=notifier)
-            settings.home_fetch_low_battery_percent = 20
+            settings.home_fetch_battery_alerts = "50,20,10,5"
             r = await client.get("/home-fetch/jobs?wait=0.1", headers={
                 "X-Watcher-Token": "sekrit", "X-Watcher-Worker": "xiaomi",
                 "X-Watcher-Battery": "15", "X-Watcher-Charging": "no",
@@ -333,6 +357,7 @@ async def test_endpoints() -> None:
             expect("the next poll does not alert again", notifier.send_text.await_count == 1)
     finally:
         settings.home_fetch_token = old_token
+        settings.home_fetch_battery_alerts = old_levels
         home_fetch.broker = old_broker
 
 
@@ -343,7 +368,7 @@ async def main() -> int:
     await test_an_abandoned_job_is_not_handed_out()
     await test_prefetch_batches_and_caches()
     await test_reel_jobs_go_only_to_a_worker_that_can_fetch_them()
-    test_low_battery_alerts_once_and_rearms()
+    test_battery_alerts_once_per_rung()
     await test_endpoints()
     print()
     if FAILURES:

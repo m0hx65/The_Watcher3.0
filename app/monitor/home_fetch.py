@@ -127,6 +127,10 @@ class HomeFetchBroker:
         self.battery: Optional[int] = None
         self.charging: Optional[bool] = None
         self._battery_alerted_at: Optional[int] = None
+        # What the phone did for the last finished sweep. Kept rather than
+        # announced: on a healthy run this is 0 — the phone is a fallback and
+        # was not needed — which is good news, not a notification.
+        self.last_sweep_jobs: Optional[int] = None
 
     # ----------------------------------------------------------- state
 
@@ -178,44 +182,66 @@ class HomeFetchBroker:
         ago = f"{seen:.0f}s" if minutes < 1 else f"{minutes:.0f} min"
         return f"not connected ({who} last polled {ago} ago{battery})"
 
+    def note_sweep(self, jobs: int) -> None:
+        """How many answers the phone delivered during the sweep that just
+        finished — read by the phone button in /status."""
+        self.last_sweep_jobs = max(0, jobs)
+
     def note_device(
         self,
         *,
         battery: Optional[int],
         charging: Optional[bool],
-        threshold: int,
+        levels: Iterable[int],
     ) -> Optional[str]:
         """Record the worker's battery reading; return an alert to send when
-        it crossed a line, else None.
+        it crossed a rung, else None.
 
-        One alert when the level is at or below `threshold` while not
-        charging, one more at half the threshold, then silence until the
-        phone is charging again (which is announced, since the owner was
-        told to worry) or has climbed well clear of the threshold.
-        `threshold` 0 disables the alerts; the reading is still shown.
+        `levels` is the ladder to speak at, e.g. 50/20/10/5. Falling to or
+        below a rung while NOT charging is one message, and each rung fires
+        at most once per discharge — so a phone sitting at 19% for six hours
+        says nothing more after the 20% alert, and only reaching 10% speaks
+        again. Plugging it back in is announced once (the owner was told to
+        worry), and that also re-arms every rung above the current level, so
+        the next discharge alerts properly. An empty ladder disables the
+        alerts; the reading is still recorded for the phone button.
         """
         self.battery, self.charging = battery, charging
-        if battery is None or threshold <= 0:
+        # Ascending, so the search below finds the DEEPEST rung this reading
+        # has reached rather than the highest one it is still under — the
+        # difference between 20% speaking at 20% and 20% re-reporting 50%.
+        rungs = sorted({int(v) for v in levels})
+        if battery is None or not rungs:
             return None
         who = f"the home fetcher ({self._worker})" if self._worker else "the home fetcher"
-        if charging or battery > threshold + 10:
+
+        if charging:
             was_alerted = self._battery_alerted_at is not None
             self._battery_alerted_at = None
-            if was_alerted and charging:
-                return f"🔌 <b>{who}</b> is charging again ({battery}%)."
-            return None
-        if battery > threshold or charging is None:
-            return None
-        second_line = max(1, threshold // 2)
-        if self._battery_alerted_at is None or (
-            battery <= second_line and self._battery_alerted_at > second_line
-        ):
-            self._battery_alerted_at = battery
             return (
-                f"🔋 <b>{who}</b> is at <b>{battery}%</b> and not charging — "
-                "plug it in, or the profile-page door closes when it dies."
+                f"🔌 <b>{who}</b> is charging again ({battery}%)."
+                if was_alerted else None
             )
-        return None
+        if charging is None:
+            # The device does not say whether it is on power. Never guess it
+            # is running down — that is a false alarm every poll on a PC.
+            return None
+
+        # The lowest rung this reading has reached. Alert only when it is a
+        # rung we have not already spoken at during this discharge.
+        crossed = next((r for r in rungs if battery <= r), None)
+        if crossed is None:
+            # Comfortably above the whole ladder — a fresh discharge from
+            # here should alert again at every rung.
+            self._battery_alerted_at = None
+            return None
+        if self._battery_alerted_at is not None and crossed >= self._battery_alerted_at:
+            return None
+        self._battery_alerted_at = crossed
+        return (
+            f"🔋 <b>{who}</b> is at <b>{battery}%</b> and not charging — "
+            "plug it in, or the profile-page door closes when it dies."
+        )
 
     # ------------------------------------------------------ the bot side
 

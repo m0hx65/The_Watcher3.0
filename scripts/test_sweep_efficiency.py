@@ -58,7 +58,9 @@ from app.monitor import home_fetch  # noqa: E402
 from app.monitor.instagram import (  # noqa: E402
     IdProbe, InstagramClient, ProfileFetchResult,
 )
-from app.monitor.service import MonitorService, _SweepThrottle  # noqa: E402
+from app.monitor.service import (  # noqa: E402
+    MonitorService, _SWEEP_STAGGER_SECONDS, _SweepThrottle,
+)
 
 FAILURES: list[str] = []
 
@@ -142,6 +144,9 @@ class FakeBroker:
     def describe(self) -> str:
         return "connected (fake)" if self.connected else "not connected (fake)"
 
+    def note_sweep(self, jobs: int) -> None:
+        self.last_sweep_jobs = jobs
+
     def cached(self, username: str):
         return self.cache.get(username)
 
@@ -181,6 +186,9 @@ class ScriptedInstagram:
         )
         self.probe = lambda i: IdProbe(user_id=i, status=401)
         self.probe_calls: list[str] = []
+        # This host's page door, as the client reports it: refusing by
+        # default, which is the regime these sweeps model.
+        self.direct_page_door_failing = True
         self.in_hand: Optional[dict] = None
         self.in_hand_calls: list[str] = []
 
@@ -459,6 +467,63 @@ async def test_the_story_phase_reads_the_reel_the_phone_delivered() -> None:
            any("NO STORY" in t for t in texts2), repr(texts2))
 
 
+async def test_the_phone_stands_by_while_this_host_can_fetch_pages() -> None:
+    """Instagram started serving Render's own page requests again (measured
+    2026-09-07): 17 accounts, 17 pages, half a second each. The phone was
+    still handed all 17 as well — 17 fetches nobody read, spent against the
+    home line's own standing — and the sweep still ran at the 0.2 s pace that
+    only makes sense when the bot is making no requests of its own. Both are
+    wrong when this host is the one asking Instagram."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    try:
+        await _pause_everything()
+        names = [f"standby{i}" for i in range(2)]
+        for i, u in enumerate(names):
+            await _new_account(u, instagram_id=str(6000 + i))
+        await _set_door(True)
+        broker = FakeBroker(connected=True)
+        home_fetch.broker = broker
+        ig = ScriptedInstagram()
+        ig.direct_page_door_failing = False   # this host's page door answers
+        ig.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=200, source="public_page", api_status=401,
+            parsed={"username": u, "followers_count": 10, "following_count": 5,
+                    "is_private": False, "instagram_id": "42",
+                    "has_public_story": False},
+        )
+        service = _service(ig)
+        started = time.monotonic()
+        result = await service.check_all()
+        own_pace = time.monotonic() - started
+        expect("every account is still checked", result["checked"] == 2, repr(result))
+        expect("the phone is handed no pages at all",
+               broker.prefetched == [], repr(broker.prefetched))
+        expect("and the sweep paces its own requests, not the phone's",
+               own_pace >= _SWEEP_STAGGER_SECONDS - 0.3, f"{own_pace:.2f}s")
+
+        # The same sweep with this host's door refusing: the phone takes over
+        # and the pace goes back up, because now the bot is asking nobody.
+        await _pause_everything()
+        handed = [f"handover{i}" for i in range(2)]
+        for i, u in enumerate(handed):
+            await _new_account(u, instagram_id=str(6100 + i))
+        broker2 = FakeBroker(connected=True)
+        home_fetch.broker = broker2
+        ig.direct_page_door_failing = True
+        service2 = _service(ig)
+        started = time.monotonic()
+        await service2.check_all()
+        phone_pace = time.monotonic() - started
+        expect("with this host refused, the phone gets the whole list",
+               sorted(broker2.prefetched) == sorted(handed), repr(broker2.prefetched))
+        expect("and the sweep runs at the phone's pace instead",
+               phone_pace < own_pace, f"{phone_pace:.2f}s vs {own_pace:.2f}s")
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
 async def test_a_private_account_never_buys_a_reel_query() -> None:
     """A private account has no story, no live broadcast and no visible
     highlights, so the story phase skips it — and its scan stamp never
@@ -656,6 +721,7 @@ async def main() -> int:
     await test_a_prefetched_page_skips_this_hosts_refused_door()
     await test_the_sweep_asks_only_for_the_reels_it_will_read()
     await test_the_story_phase_reads_the_reel_the_phone_delivered()
+    await test_the_phone_stands_by_while_this_host_can_fetch_pages()
     await test_a_private_account_never_buys_a_reel_query()
     await test_privacy_is_read_from_the_newest_successful_reading()
     await test_a_previous_sweeps_reel_is_not_read_as_this_ones()

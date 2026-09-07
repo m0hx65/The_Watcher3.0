@@ -3115,24 +3115,48 @@ async def _handle_menu(
         return
 
     if action == "battery":
-        # The phone reports its battery with every poll, so this is always the
-        # latest reading — the button shows it as a popup and refreshes the
-        # status text (which carries the same reading on its home-fetcher line).
+        # Everything about the phone, on demand. This used to go out as its
+        # own message after every sweep, which on a healthy run said the
+        # phone did nothing — true, and not worth a notification. The phone
+        # reports its battery with every poll, so this is always the latest
+        # reading.
         from app.monitor import home_fetch
         broker = home_fetch.broker
         if not settings.home_fetch_token:
             popup = "The home fetcher is off (HOME_FETCH_TOKEN not set)."
-        elif broker.battery is None:
-            popup = f"No battery reading yet — home fetcher {broker.describe()}."
         else:
-            charge = (
-                "charging" if broker.charging
-                else "not charging" if broker.charging is False else "unknown"
-            )
+            name = broker.worker or "phone"
             seen = broker.last_seen_seconds
-            ago = "just now" if seen is None or seen < 5 else f"{seen:.0f}s ago"
-            conn = "connected" if broker.connected else "NOT connected"
-            popup = f"🔋 {broker.battery}% ({charge})\n{conn}, last poll {ago}"
+            if seen is None:
+                lines = [f"📱 {name}", "Never polled — the worker has not run."]
+            else:
+                ago = "just now" if seen < 5 else f"{seen:.0f}s ago"
+                conn = "connected" if broker.connected else "NOT connected"
+                lines = [f"📱 {name}", f"{conn}, last poll {ago}"]
+                if broker.battery is None:
+                    lines.append("🔋 no battery reading (this device doesn't say)")
+                else:
+                    charge = (
+                        "charging" if broker.charging
+                        else "not charging" if broker.charging is False
+                        else "power state unknown"
+                    )
+                    lines.append(f"🔋 {broker.battery}% ({charge})")
+                jobs = broker.last_sweep_jobs
+                if jobs is None:
+                    lines.append("No sweep has finished since the bot started.")
+                elif jobs == 0:
+                    lines.append(
+                        "0 answers in the last sweep — this host reached "
+                        "Instagram on its own, so the phone stood by."
+                    )
+                else:
+                    lines.append(
+                        f"{jobs} answer{'' if jobs == 1 else 's'} in the last sweep."
+                    )
+                if broker.pending:
+                    lines.append(f"{broker.pending} job(s) waiting right now.")
+            popup = "\n".join(lines)
         await _safe_answer(query, popup, show_alert=True)
         text = await _render_status_message(context)
         await _safe_edit_text(

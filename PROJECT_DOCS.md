@@ -572,11 +572,24 @@ asks this host first, which is what keeps the door under test rather than
 written off. A worker that has not polled for 90 s is "not connected": a fast, quiet answer — the sweep stays id-only. About 700 KB per
 page from Instagram, a few KB (the extracted payload) back to the bot.
 
-The sweep never waits on the phone by design. It hands the broker its whole
-list up front (`broker.prefetch`) — at sweep start when the username API is
-known shut, else at the first refusal — and the phone works through it, a
-batch per poll (`?batch=8`), uploading in the background, while the sweep
-does its id probes. Each check then finds its page in the broker's cache
+The phone is INSURANCE, not the default route. It is handed a sweep's pages
+only once this host's own page door has stopped answering
+(`InstagramClient.direct_page_door_failing` — the first refusal, not the
+breaker's third) — at sweep start when that is already true, else the moment a
+check finds both username-side doors shut, and then only for the accounts
+still to check. While Instagram serves this host's page requests, which it
+does again (measured 2026-09-07: 17 of 17, half a second each), the phone
+gets nothing: 17 fetches nobody reads are 17 requests spent against the home
+line's own good standing. The same signal sets the pace — the 0.2 s gap
+belongs to a sweep making no requests of its own; when THIS host is fetching
+the pages the gap stays at `_SWEEP_STAGGER_SECONDS`, because 17 direct
+requests in twelve seconds from a datacenter IP is the burst that earns the
+429 the phone exists to work around.
+
+When the phone IS the route, the sweep never waits on it. It hands the broker
+the list up front (`broker.prefetch`) and the phone works through it, a batch
+per poll (`?batch=8`), uploading in the background, while the sweep does its
+id probes. Each check then finds its page in the broker's cache
 (`cached_page_ok`, fresh for 15 min; manual checks ask fresh) and only waits
 when it is still on its way. Every delivery logs the pickup and delivery
 latency, so a slow link shows up as numbers, not as a slow sweep. The worker
@@ -587,8 +600,16 @@ The page also carries `latest_reel_media` (0 = no active story, else its
 timestamp; verified against the reel query). When the reel route refuses an
 account, `_handle_success` builds the story status from the page
 (`reel_data["from_page"]`), the story phase does not knock on the reel route
-again, and the highlight catalog is left as stored. The sweep summary ends with
-a home-fetcher line: connection, pages this sweep, battery.
+again, and the highlight catalog is left as stored.
+
+The phone's part in a sweep is recorded, not announced (`broker.note_sweep`):
+on a healthy run it is 0 — the phone was not needed — and a message saying so
+after every sweep is a notification for good news. It lives on the **📱 Phone**
+button in `/status`, which shows the worker, connection, last poll, battery
+and what it delivered last sweep. The one thing that still interrupts is the
+battery, and only on a rung of `HOME_FETCH_BATTERY_ALERTS` (default
+50/20/10/5), each firing at most once per discharge — plugging it in is
+announced once and re-arms them.
 
 Reel queries go through the phone too (job kind `reel`, keyed by numeric id;
 a worker declares what it fetches in `X-Watcher-Kinds`). `probe_by_id(cached_ok=True)`

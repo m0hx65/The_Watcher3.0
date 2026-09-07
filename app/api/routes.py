@@ -195,7 +195,7 @@ async def home_fetch_next_job(
     home_fetch.broker._worker = (x_watcher_worker or "unnamed")[:40]
     alert = home_fetch.broker.note_device(
         battery=battery, charging=charging,
-        threshold=settings.home_fetch_low_battery_percent,
+        levels=settings.battery_alert_levels,
     )
     if alert:
         asyncio.create_task(_send_alert(request, alert))

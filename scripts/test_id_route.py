@@ -158,6 +158,10 @@ class ScriptedInstagram:
             username=u, http_status=401, error="HTTP 401"
         )
         self.probe: Callable[[str], IdProbe] = lambda i: IdProbe(user_id=i, status=401)
+        # This host's page door, as the client reports it. The sweeps
+        # modelled here are the page-served regime, where it is refusing and
+        # the phone is the route.
+        self.direct_page_door_failing = True
         self.profile_calls: list[str] = []
         self.profile_kwargs: list[dict] = []
         self.probe_calls: list[str] = []
@@ -589,20 +593,30 @@ async def test_a_sweep_hands_the_phone_the_whole_list_up_front() -> None:
             lambda i: _answered(i, f"late{int(i) - 1000}"),
             late, door_known_closed=False,
         )
-        expect("the first refusal hands over the whole list",
-               sorted(fake.prefetched) == sorted(late), repr(fake.prefetched))
+        # The account that triggered the handover is fetching its own page
+        # already, so the phone is handed the accounts still to come — not
+        # the whole list including the ones already checked.
+        expect("the first refusal hands over the accounts still to check",
+               set(fake.prefetched) < set(late)
+               and len(fake.prefetched) == len(late) - 1, repr(fake.prefetched))
         expect("the verdict was written during the sweep", await _door_closed_in_db())
-        # The summary names the phone and its battery.
+        # The phone's part in the sweep is RECORDED, not announced: on a
+        # healthy run it did nothing, and a message saying so every sweep is
+        # a notification for good news. It lives on the phone button now.
+        fake = FakeBroker({}, connected=True)
+        home_fetch.broker = fake
         fake.delivered = 3
         result, texts, ig = await _sweep_with(
             lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
             lambda i: _answered(i, f"batt{int(i) - 1000}"),
             [f"batt{i}" for i in range(2)], door_known_closed=True,
         )
-        summary = texts[-1]
-        expect("the summary has a home fetcher line with the battery",
-               "🏠 Home fetcher (xiaomi)" in summary and "battery 92% (not charging)" in summary,
-               summary)
+        expect("no message announces the phone any more",
+               not any("Home fetcher" in t for t in texts), repr(texts[-2:]))
+        expect("the sweep is one message",
+               sum(1 for t in texts if "Sweep complete" in t) == 1, repr(texts[-2:]))
+        expect("but the phone's part is recorded for the button",
+               fake.last_sweep_jobs == 0, repr(fake.last_sweep_jobs))
 
         # A page the phone already delivered is used by the real client without
         # asking again — even if the phone has since dropped off.
@@ -818,6 +832,9 @@ class FakeBroker:
 
     def describe(self) -> str:
         return "connected (worker fake)" if self.connected else "not connected (fake is off)"
+
+    def note_sweep(self, jobs: int) -> None:
+        self.last_sweep_jobs = jobs
 
     def cached(self, username: str):
         return self.cache.get(username)

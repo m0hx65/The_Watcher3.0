@@ -166,10 +166,10 @@ class _SweepThrottle:
             breaker_threshold if username_door_threshold is None
             else username_door_threshold
         )
-        # Sweep-wide bookkeeping the per-account check needs: the whole list
-        # (so the first refusal can hand it to the home fetcher up front), and
-        # two once-per-sweep latches.
-        self.sweep_usernames: list[str] = []
+        # Sweep-wide bookkeeping the per-account check needs: the accounts
+        # still to come (so a refusal can hand the REST to the home fetcher,
+        # not the ones already checked), and two once-per-sweep latches.
+        self.pending_usernames: list[str] = []
         self.pages_prefetched = False
         self.door_recorded = False
         self._cooldown = max(0.0, cooldown)  # 0 = open immediately, never pause
@@ -257,6 +257,14 @@ class _SweepThrottle:
 
     def note_skip(self) -> None:
         self._skipped += 1
+
+    def note_started(self, username: str) -> None:
+        """This account is being checked now, so it is no longer one the
+        home fetcher could usefully be asked for up front."""
+        try:
+            self.pending_usernames.remove(username)
+        except ValueError:
+            pass
 
     def record(
         self,
@@ -848,13 +856,23 @@ class MonitorService:
                 "Username API door: believed open — up to {} knocks before it "
                 "closes", settings.sweep_breaker_threshold,
             )
-        # With the API door shut and the phone serving, the bot makes no direct
-        # Instagram calls on the hot path — the id probe reads the phone's
-        # cache and the page comes from the phone — so there is nothing to pace
-        # against. The gap between checks drops to almost nothing and the sweep
-        # runs as fast as the phone can deliver, instead of adding 2 s of dead
-        # air per account.
-        base_stagger = 0.2 if (known_closed and home_serving) else _SWEEP_STAGGER_SECONDS
+        # Is the PHONE serving this sweep's pages, or is this host?
+        #
+        # It decides the pace, and getting it wrong is how the door gets shut.
+        # When the phone serves, the bot makes no direct Instagram calls on
+        # the hot path — the id probe reads the phone's cache and the page
+        # comes from the phone — so there is nothing to pace against and the
+        # gap drops to almost nothing. When THIS HOST serves (which it does
+        # again — Instagram started answering Render's own page requests,
+        # measured 2026-09-07), that same gap would fire one real Instagram
+        # request every 0.2 s: seventeen of them in twelve seconds, from a
+        # datacenter IP, which is precisely the burst that earns the 429 the
+        # phone exists to work around. So the fast pace is tied to the phone
+        # actually being the page source, not merely to it being connected.
+        phone_serves_pages = (
+            known_closed and home_serving and self.instagram.direct_page_door_failing
+        )
+        base_stagger = 0.2 if phone_serves_pages else _SWEEP_STAGGER_SECONDS
         throttle = _SweepThrottle(
             base_stagger=base_stagger,
             max_stagger=settings.sweep_stagger_max_seconds,
@@ -863,7 +881,7 @@ class MonitorService:
             cooldown=settings.sweep_breaker_cooldown_seconds,
             username_door_threshold=1 if known_closed else None,
         )
-        throttle.sweep_usernames = [uname for _, uname in targets]
+        throttle.pending_usernames = [uname for _, uname in targets]
         home_pages_before = home_fetch.broker.delivered
         # Reel data from the phone, before the first check. The Worker's reel
         # route is refused per colo and each refusal costs ~9 s; the phone
@@ -912,13 +930,23 @@ class MonitorService:
                 len(reel_targets), len(targets), private,
             )
         self._prefetch_reels(reel_targets)
-        if known_closed:
-            # Every account will need its page: hand the phone the whole list
-            # now, so its round trips overlap the sweep instead of gating
-            # each check. (When the verdict is not yet known, the first
-            # refusal does the same — see _staggered_check.)
+        if phone_serves_pages:
+            # Every account will need its page and this host cannot get one:
+            # hand the phone the whole list now, so its round trips overlap
+            # the sweep instead of gating each check. (When this host's door
+            # is still answering, nothing is handed over — the phone is
+            # insurance, and 17 fetches it never gets asked for are 17
+            # requests spent against the home line's own good standing. If
+            # the door fails mid-sweep the first refusal hands the rest over
+            # — see _staggered_check.)
             throttle.pages_prefetched = True
-            self._prefetch_pages(throttle.sweep_usernames)
+            self._prefetch_pages(throttle.pending_usernames)
+        elif known_closed:
+            logger.info(
+                "This host's page door is answering — the home fetcher stands "
+                "by rather than fetching {} page(s) nobody would read",
+                len(targets),
+            )
         results = await asyncio.gather(
             *(
                 self._staggered_check(
@@ -1185,12 +1213,15 @@ class MonitorService:
                 )
         await self.notifier.send_text(summary)
 
-        # The home fetcher's part in this sweep goes out as its own message,
-        # not tucked onto the summary — the owner asked to see it on its own.
-        if settings.home_fetch_token and home_fetch.broker.last_seen_seconds is not None:
-            await self.notifier.send_text(
-                self._home_fetcher_line(home_fetch.broker.delivered - home_pages_before)
-            )
+        # The home fetcher's part in this sweep is RECORDED, not announced.
+        # It went out as its own message every sweep, which on a healthy run
+        # is a second notification saying the phone did nothing — the phone
+        # is a fallback, so "0 pages this sweep" is the normal, good answer
+        # and not news. It lives on the phone button in /status now, where it
+        # is there when it is wanted. A dying battery still interrupts.
+        home_fetch.broker.note_sweep(
+            home_fetch.broker.delivered - home_pages_before
+        )
 
         result = {
             "checked": checked,
@@ -1338,24 +1369,6 @@ class MonitorService:
         return text, len(rows), accounts
 
     @staticmethod
-    def _home_fetcher_line(pages: int) -> str:
-        """The phone's part in this sweep, with its battery — the owner asked
-        for the battery to be visible where the sweep reports, not only in
-        /status."""
-        broker = home_fetch.broker
-        state = "connected" if broker.connected else "not connected"
-        battery = ""
-        if broker.battery is not None:
-            charge = (
-                "" if broker.charging is None
-                else " (charging)" if broker.charging else " (not charging)"
-            )
-            battery = f" · battery {broker.battery}%{charge}"
-        name = broker.worker or "phone"
-        noun = "page" if pages == 1 else "pages"
-        return f"🏠 Home fetcher ({name}): {state}, {pages} {noun} this sweep{battery}"
-
-    @staticmethod
     def _prefetch_reels(users: list[tuple[str, str]]) -> None:
         """Ask the home fetcher for every reel query a sweep will need."""
         if not settings.home_fetch_token or not users:
@@ -1413,6 +1426,10 @@ class MonitorService:
             if throttle.is_open():  # tripped while this one waited its turn
                 throttle.note_skip()
                 return self._breaker_skipped_result(username)
+            # Off the pending list before the check runs: this account is
+            # fetching its own page now, so a handover triggered by its own
+            # refusal must not ask the phone for it a second time.
+            throttle.note_started(username)
             result = await self._run_check(
                 account_id, username, thorough=False,
                 skip_username_api=throttle.username_door_closed,
@@ -1425,15 +1442,28 @@ class MonitorService:
                 id_status=result.get("id_status"),
                 api_status=result.get("api_status", _NOT_GIVEN),
             )
-            # The first refusal of the username API is the moment to hand the
-            # home fetcher the rest of the list: every account after this one
-            # will need its page.
-            if not throttle.pages_prefetched and (
-                throttle.username_door_closed
-                or result.get("api_status") in (401, 403)
+            # The moment to hand the home fetcher the rest of the list is
+            # when BOTH username-side doors have failed for this account: the
+            # API refused, and this host's own page request did not answer.
+            # The API alone is not enough any more — while this host can
+            # still fetch pages it does so in half a second, and handing the
+            # phone the whole list then is a fetch per account that nothing
+            # reads, spent against the home line's own standing.
+            if (
+                not throttle.pages_prefetched
+                and (
+                    throttle.username_door_closed
+                    or result.get("api_status") in (401, 403)
+                )
+                and self.instagram.direct_page_door_failing
             ):
                 throttle.pages_prefetched = True
-                self._prefetch_pages(throttle.sweep_usernames)
+                logger.info(
+                    "This host's page door stopped answering — handing the "
+                    "home fetcher the {} account(s) still to check",
+                    len(throttle.pending_usernames),
+                )
+                self._prefetch_pages(throttle.pending_usernames)
             # And the verdict is written the moment it is reached, not at the
             # end of the sweep — a restart mid-sweep must not forget it.
             if throttle.username_door_closed and not throttle.door_recorded:
