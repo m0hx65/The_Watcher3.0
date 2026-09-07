@@ -60,7 +60,8 @@ from app.monitor.instagram import (  # noqa: E402
     IdProbe, InstagramClient, ProfileFetchResult,
 )
 from app.monitor.service import (  # noqa: E402
-    MonitorService, _SWEEP_STAGGER_SECONDS, _SweepThrottle,
+    MonitorService, _CATALOG_REFRESH_PER_SWEEP, _SWEEP_STAGGER_SECONDS,
+    _SweepThrottle,
 )
 
 FAILURES: list[str] = []
@@ -607,6 +608,123 @@ async def test_the_phone_stands_by_while_this_host_can_fetch_pages() -> None:
         await _set_door(False)
 
 
+async def test_a_due_highlight_catalog_is_re_read_rather_than_left_to_age() -> None:
+    """With the profile API shut, nothing free carries the highlight catalog:
+    the page has never known it, the Worker's reel route is refused per colo
+    and the phone is 429'd on it. The story phase correctly refuses to
+    re-ask the reel route for a STATUS the page already answered — and was
+    declining the CATALOG along with it, so the stored one aged silently.
+
+    A catalog is not a status. It is re-listed at most once per
+    HIGHLIGHT_SCAN_INTERVAL, this runs after every check, and no other source
+    exists — so a due catalog earns one live call, and only a due one."""
+    account_id = await _new_account("aging", instagram_id="42")
+    async with get_session() as session:
+        await crud.replace_highlight_catalog(session, account_id, {"h1": "Old"})
+
+    page_reel = {
+        "has_public_story": False, "is_live": False,
+        "highlights": None, "from_page": True,
+    }
+
+    # Not due: the reel route is left alone, exactly as before.
+    quiet = ScriptedInstagram()
+    service = _service(quiet, stories=QuietStories())
+    await service._check_stories_and_highlights(
+        account_id, "aging", instagram_id="42", reel_data=dict(page_reel),
+    )
+    async with get_session() as session:
+        kept = await crud.get_highlight_catalog(session, account_id)
+    expect("a catalog that is not due is never re-asked for",
+           kept == {"h1": "Old"}, repr(kept))
+
+    # Due: one live call, and the stored catalog moves on.
+    asked: list[str] = []
+
+    class CatalogInstagram(ScriptedInstagram):
+        async def fetch_reel_user(self, user_id: str):
+            asked.append(str(user_id))
+            return {"has_public_story": False, "is_live": False,
+                    "highlights": {"h1": "Old", "h2": "New"}}
+
+    live = CatalogInstagram()
+    service2 = _service(live, stories=QuietStories())
+    await service2._check_stories_and_highlights(
+        account_id, "aging", instagram_id="42", reel_data=dict(page_reel),
+        catalog_due=True,
+    )
+    expect("a due catalog spends exactly one reel call", asked == ["42"], repr(asked))
+    async with get_session() as session:
+        fresh = await crud.get_highlight_catalog(session, account_id)
+    expect("and the stored catalog is brought up to date",
+           fresh == {"h1": "Old", "h2": "New"}, repr(fresh))
+
+    # No route answers: the stored catalog stands rather than being wiped.
+    class DeadInstagram(ScriptedInstagram):
+        async def fetch_reel_user(self, user_id: str):
+            return None
+
+    service3 = _service(DeadInstagram(), stories=QuietStories())
+    await service3._check_stories_and_highlights(
+        account_id, "aging", instagram_id="42", reel_data=dict(page_reel),
+        catalog_due=True,
+    )
+    async with get_session() as session:
+        survived = await crud.get_highlight_catalog(session, account_id)
+    expect("a failed re-read never empties what is stored",
+           survived == {"h1": "Old", "h2": "New"}, repr(survived))
+
+    # And a shut gate still suppresses it — no route is worth asking then.
+    service4 = _service(CatalogInstagram(), stories=QuietStories())
+    before = len(asked)
+    await service4._check_stories_and_highlights(
+        account_id, "aging", instagram_id="42", reel_data=dict(page_reel),
+        catalog_due=True, skip_reel_fallback=True,
+    )
+    expect("a shut gate outranks a due catalog", len(asked) == before, repr(asked))
+
+
+async def test_the_catalog_re_read_is_capped_per_sweep() -> None:
+    """A fresh install, or a long spell with no reel source, leaves EVERY
+    account due at once. Seventeen ~9 s calls would be a sweep's worth of
+    blocked traffic for something that is due once every six hours."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    try:
+        await _pause_everything()
+        names = [f"allstale{i}" for i in range(6)]
+        for i, u in enumerate(names):
+            await _new_account(u, instagram_id=str(8000 + i))
+        await _set_door(True)
+        home_fetch.broker = FakeBroker(connected=True)
+
+        asked: list[str] = []
+
+        class CountingInstagram(ScriptedInstagram):
+            async def fetch_reel_user(self, user_id: str):
+                asked.append(str(user_id))
+                return {"has_public_story": False, "is_live": False,
+                        "highlights": {"h1": "One"}}
+
+        ig = CountingInstagram()
+        ig.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=200, source="public_page", api_status=401,
+            parsed={"username": u, "followers_count": 10, "following_count": 5,
+                    "is_private": False, "instagram_id": "42",
+                    "has_public_story": False},
+        )
+        service = _service(ig, stories=QuietStories())
+        await service.check_all()
+        expect("no more than the per-sweep cap re-read their catalog",
+               len(asked) == _CATALOG_REFRESH_PER_SWEEP,
+               f"{len(asked)} calls, cap {_CATALOG_REFRESH_PER_SWEEP}")
+        expect("and the rest of the sweep still finished",
+               len(set(asked)) == len(asked), repr(asked))
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
 async def test_one_odd_page_does_not_hand_the_phone_the_sweep() -> None:
     """Measured 2026-09-07: one account's page came back a login wall while
     the other sixteen answered in half a second each. On a first-refusal rule
@@ -874,6 +992,8 @@ async def main() -> int:
     await test_the_story_phase_reads_the_reel_the_phone_delivered()
     await test_the_shut_door_verdict_survives_a_restart()
     await test_the_phone_stands_by_while_this_host_can_fetch_pages()
+    await test_a_due_highlight_catalog_is_re_read_rather_than_left_to_age()
+    await test_the_catalog_re_read_is_capped_per_sweep()
     await test_one_odd_page_does_not_hand_the_phone_the_sweep()
     await test_a_refused_reel_stops_costing_the_phone_its_page_door()
     await test_a_private_account_never_buys_a_reel_query()

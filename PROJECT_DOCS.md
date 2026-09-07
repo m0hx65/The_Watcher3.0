@@ -615,6 +615,19 @@ account, `_handle_success` builds the story status from the page
 (`reel_data["from_page"]`), the story phase does not knock on the reel route
 again, and the highlight catalog is left as stored.
 
+The highlight catalog is the one thing with no fallback: the page has never
+carried it, so while the profile API is shut it lives or dies on the reel
+query. The story phase's rule against re-asking that route is right for the
+story STATUS (the page already answered it) and wrong for the catalog (the
+page never can) — followed for both, the stored catalog aged silently. So a
+sweep picks up to `_CATALOG_REFRESH_PER_SWEEP` public accounts whose catalog
+is past `HIGHLIGHT_SCAN_INTERVAL` and lets each spend one live reel call
+(`catalog_due`). It runs after every check, so a refused ~9 s call costs the
+sweep's readings nothing; the sweep order is shuffled, so every due account
+gets its turn over a few sweeps; a failed re-read leaves the stored catalog
+exactly as it was rather than emptying it; and a shut gate suppresses it
+entirely.
+
 Reel jobs stop going to the phone after `REEL_REFUSALS_BEFORE_PAUSE`
 refusals in a row (Instagram 429s that query from the home line). The refusal
 is not free: the worker reads it as "wait a few minutes" and stops fetching

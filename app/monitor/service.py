@@ -63,6 +63,11 @@ _DOWNLOAD_UNAVAILABLE_MSG = (
 # concurrency of 1 the sweep produces the same request rhythm as a human
 # pressing Recheck — the pattern Instagram answers reliably.
 _SWEEP_STAGGER_SECONDS = 2.0
+# The most accounts one sweep may spend a live reel call on purely to refresh
+# a stale highlight catalog. Each is ~9 s when the Worker's colo refuses, and
+# it runs after every check, so this is the ceiling on a cost the sweep's
+# readings never wait for.
+_CATALOG_REFRESH_PER_SWEEP = 3
 # First cooldown before re-checking accounts that hit a rate-limit block during
 # the sweep; it doubles each round up to the max. Instagram's anonymous throttle
 # windows are short, so a paced retry usually goes straight through.
@@ -1132,6 +1137,35 @@ class MonitorService:
                      r.get("reel_data"))
                 )
 
+        # Which of them may spend a live reel call on their highlight catalog.
+        #
+        # The catalog has exactly one source — the reel query — and while the
+        # profile API is shut, nothing free carries it: the page has never
+        # known it, the Worker's reel route is refused per colo, and the phone
+        # is 429'd on it. So the story phase, which correctly refuses to
+        # re-ask the reel route for a STATUS the page already answered, was
+        # also declining to ask for a catalog nothing else can answer — and
+        # the stored one quietly aged.
+        #
+        # A catalog is not a status, though. It changes when its owner adds a
+        # highlight, it is re-listed at most once per HIGHLIGHT_SCAN_INTERVAL
+        # anyway, and this runs AFTER every check, so a refused ~9 s call
+        # costs the sweep's readings nothing. Capped per sweep so a run where
+        # every account is due (a fresh install, or a long spell with no
+        # source) cannot turn into seventeen of them; the sweep order is
+        # shuffled, so over a few sweeps every due account gets its turn.
+        catalog_refresh: set[int] = set()
+        for aid, _, ig_id, _ in story_targets:
+            if len(catalog_refresh) >= _CATALOG_REFRESH_PER_SWEEP:
+                break
+            if ig_id and self._highlight_scan_overdue(aid, highlight_stamps):
+                catalog_refresh.add(aid)
+        if catalog_refresh:
+            logger.info(
+                "Highlight catalogs due a live re-read this sweep: {} of {} "
+                "public account(s)", len(catalog_refresh), len(story_targets),
+            )
+
         if self.stories is not None and story_targets:
             # With the gate down, the per-account fallback reel query is 8 more
             # blocked upstream attempts each for an answer we already know we
@@ -1143,6 +1177,7 @@ class MonitorService:
                     self._check_stories_and_highlights(
                         aid, uname, instagram_id=ig_id, reel_data=reel,
                         skip_reel_fallback=throttle.gate_down,
+                        catalog_due=aid in catalog_refresh,
                     )
                     for aid, uname, ig_id, reel in story_targets
                 ),
@@ -2703,6 +2738,7 @@ class MonitorService:
         reel_data: Optional[dict] = None,
         always_report: bool = False,
         skip_reel_fallback: bool = False,
+        catalog_due: bool = False,
     ) -> None:
         """Stories, highlight catalog changes, and new highlight media for public accounts.
 
@@ -2728,6 +2764,13 @@ class MonitorService:
         answer when one has landed for this account — free, already fetched,
         and the only source for the live flag and the highlight catalog while
         the username API is shut. Nothing is asked for here to get it.
+
+        `catalog_due` allows ONE live reel call for the highlight catalog
+        when nothing free carried it and this account's catalog is past its
+        re-scan interval. It is the only thing that overrides the
+        don't-re-ask rule, because it is the only thing that rule gets wrong:
+        the story status the page already answered, the catalog it never
+        can. The caller caps how many accounts get this per sweep.
         """
         assert self.stories is not None
         async with self._semaphore:
@@ -2791,10 +2834,39 @@ class MonitorService:
                 # fetch when no reel query has been attempted at all (e.g. the
                 # numeric id isn't stored yet, which that path resolves).
                 catalog = (reel_data or {}).get("highlights")
-                if catalog is None and not attempted_reel and not skip_reel_fallback:
+                if catalog is None and not skip_reel_fallback and (
+                    not attempted_reel or catalog_due
+                ):
+                    # `catalog_due` overrides the don't-re-ask rule above, and
+                    # only that rule. The rule is right about the STATUS: the
+                    # page already said whether a story is up, so knocking on
+                    # the refused reel route for it buys an answer already in
+                    # hand. It is wrong about the CATALOG, which the page has
+                    # never carried and nothing else can supply — there the
+                    # answer is not known, it is simply missing, and refusing
+                    # to ask is how a stored catalog ages without anyone
+                    # noticing. The caller has already capped how many
+                    # accounts may reach this per sweep.
+                    if attempted_reel:
+                        logger.info(
+                            "@{}: re-reading the highlight catalog — the page "
+                            "answered the story question but has never known "
+                            "the reels, and this catalog is due", username,
+                        )
                     catalog = await self._fetch_highlight_catalog(
                         username, instagram_id
                     )
+                    if catalog:
+                        logger.info(
+                            "@{}: highlight catalog re-read — {} reel(s)",
+                            username, len(catalog),
+                        )
+                    elif attempted_reel:
+                        logger.info(
+                            "@{}: no route answered the reel query, so the "
+                            "stored highlight catalog stands as it was",
+                            username,
+                        )
                 if catalog is None:
                     # Reel query unavailable this check — "unknown", not "empty".
                     # The guard below keeps the stored catalog untouched.
