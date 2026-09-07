@@ -217,6 +217,45 @@ def _written_before(snapshot: AccountSnapshot, cutoff: datetime) -> bool:
     return written < cutoff
 
 
+async def latest_privacy_by_account(
+    session: AsyncSession, account_ids: Iterable[int]
+) -> dict[int, Optional[bool]]:
+    """Each account's privacy flag from its newest SUCCESSFUL snapshot, in one
+    query instead of one round trip per account.
+
+    Same row `get_latest_snapshot(successful_only=True)` would return, and the
+    same three-way answer: True (private), False (public), or None — the
+    snapshot exists but did not carry the flag, which is "unknown", not
+    "public". An account with no successful snapshot at all is simply absent
+    from the dict, which callers must also read as unknown.
+
+    Keyed on MAX(id) rather than the newest `created_at`: ids are assigned in
+    insertion order, and created_at can collide outright (SQLite stores whole
+    seconds) — which is why the per-account query breaks that tie by id too.
+    """
+    ids = [int(a) for a in account_ids]
+    if not ids:
+        return {}
+    newest = (
+        select(
+            AccountSnapshot.account_id.label("account_id"),
+            func.max(AccountSnapshot.id).label("snapshot_id"),
+        )
+        .where(
+            AccountSnapshot.http_status == 200,
+            AccountSnapshot.account_id.in_(ids),
+        )
+        .group_by(AccountSnapshot.account_id)
+        .subquery()
+    )
+    result = await session.execute(
+        select(AccountSnapshot.account_id, AccountSnapshot.is_private).join(
+            newest, AccountSnapshot.id == newest.c.snapshot_id
+        )
+    )
+    return {row.account_id: row.is_private for row in result}
+
+
 async def get_latest_snapshot_by_source(
     session: AsyncSession,
     account_id: int,

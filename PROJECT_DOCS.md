@@ -603,9 +603,18 @@ answers the story question, so a reel adds only the live flag and the
 highlight catalog — and the catalog is re-listed at most once per
 `HIGHLIGHT_SCAN_INTERVAL`. So `check_all` prefetches reels for the accounts
 whose catalog is actually due (one batched read of the `highlight_scan:`
-stamps decides), not for every account: asking for all of them was a second
-Instagram request per account per sweep, on the same home line the page door
-depends on, for an answer nothing read. What the phone does deliver is read
+stamps decides) and that are not known to be private, not for every account:
+asking for all of them was a second Instagram request per account per sweep,
+on the same home line the page door depends on, for an answer nothing read.
+A private account was the worst of it — the story phase skips it, so its scan
+stamp never advanced and it read as permanently due, buying a reel every
+sweep forever for something with no story, no live flag and no visible
+highlights in it. Privacy comes from `crud.latest_privacy_by_account`, one
+query over the newest successful snapshot per account, and only a flag
+actually SEEN counts: unknown means ask, so a new target is never silently
+skipped, and a private account going public is announced by the page (the
+backlog grab lists its highlights itself and stamps the scan key) and treated
+normally from the next sweep. What the phone does deliver is read
 by the story phase (`InstagramClient.reel_in_hand`) — free, already fetched,
 no request and no wait — to fill the live flag and the catalog a page-derived
 status cannot know. That read is bounded to 5 minutes (`_REEL_IN_HAND_MAX_AGE`,

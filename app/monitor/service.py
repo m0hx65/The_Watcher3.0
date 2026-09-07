@@ -808,10 +808,13 @@ class MonitorService:
         async with get_session() as session:
             accounts = await crud.list_accounts(session, only_active=True)
             targets = [(a.id, a.username) for a in accounts]
-            # One batched read, so the reel decision below costs no per-account
-            # query.
+            # Two batched reads, so the reel decision below — and the story
+            # phase's fallback further down — cost no per-account query.
             highlight_stamps = await crud.get_settings_by_prefix(
                 session, "highlight_scan:"
+            )
+            last_privacy = await crud.latest_privacy_by_account(
+                session, [a.id for a in accounts]
             )
 
         if not targets:
@@ -875,6 +878,17 @@ class MonitorService:
         # home line the page door depends on, for an answer nothing read.
         # Now it goes out for the accounts whose catalog is actually due, and
         # the story phase reads what comes back (`reel_in_hand`).
+        #
+        # A PRIVATE account is left out entirely. It has no story, no live
+        # broadcast and no visible highlights, so the story phase skips it and
+        # its scan stamp never advances — which made it read as permanently
+        # "due" and buy a reel query every sweep, forever, for nothing. The
+        # page still carries everything a private account's check reads: its
+        # counts, its handle (so a rename is caught) and its avatar. Only a
+        # privacy flag actually SEEN in the last successful reading counts —
+        # unknown means ask, so a new target is never silently skipped, and a
+        # private account going public is announced by the page and picked up
+        # from the next sweep.
         ids_by_name = {a.username: a.instagram_id for a in accounts}
         catalog_only = known_closed and home_serving
         reel_targets = [
@@ -883,14 +897,19 @@ class MonitorService:
             if ids_by_name.get(uname)
             and (
                 not catalog_only
-                or self._highlight_scan_overdue(aid, highlight_stamps)
+                or (
+                    last_privacy.get(aid) is not True
+                    and self._highlight_scan_overdue(aid, highlight_stamps)
+                )
             )
         ]
         if catalog_only:
+            private = sum(1 for aid, _ in targets if last_privacy.get(aid) is True)
             logger.info(
                 "Reel queries this sweep: {} of {} account(s) — the page "
-                "answers the story question for the rest",
-                len(reel_targets), len(targets),
+                "answers the story question for the rest ({} private, which "
+                "have no reel to read)",
+                len(reel_targets), len(targets), private,
             )
         self._prefetch_reels(reel_targets)
         if known_closed:
@@ -976,10 +995,19 @@ class MonitorService:
             # A successful check already knows privacy and the numeric id —
             # only fall back to the two-query DB lookup when the result
             # doesn't (failed fetches), instead of paying it for every
-            # account on every sweep.
+            # account on every sweep. And before that lookup, what the sweep
+            # already read up front: a blocked sweep fails EVERY check, which
+            # is exactly when N more round trips are least affordable.
             is_private = r.get("is_private")
             instagram_id = r.get("instagram_id")
+            if is_private is None and target_account_id in last_privacy:
+                is_private = last_privacy[target_account_id]
+            if not instagram_id:
+                instagram_id = ids_by_name.get(uname)
             if is_private is None or not instagram_id:
+                # Still unanswered: the account has no successful snapshot, or
+                # its id was only recovered from one mid-check and is not in
+                # the list this sweep started from.
                 meta = await self._load_account_story_meta(target_account_id)
                 if is_private is None:
                     is_private = meta["is_private"]

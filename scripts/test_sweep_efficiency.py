@@ -1,7 +1,7 @@
 """What a sweep is allowed to spend (2026-09-07).
 
 Every Instagram request a sweep makes is either useful or it is the reason
-the next one gets refused. These are the four places the sweep was spending
+the next one gets refused. These are the places the sweep was spending
 requests and seconds it did not need to:
 
 - a page the phone had ALREADY delivered was used only after this host's own
@@ -10,10 +10,15 @@ requests and seconds it did not need to:
 - a reel query went out for EVERY account every sweep, on the same home line
   the page door depends on, while the page answered the story question and
   nothing ever read the reel's answer;
+- a PRIVATE account bought one of those every sweep forever: the story phase
+  skips it, so its highlight-scan stamp never advanced and it read as
+  permanently due — for a reel with no story, no live flag and no visible
+  highlights in it;
 - what the phone did deliver was then thrown away, so the live flag and the
   highlight catalog went missing for the whole page-served era;
-- each check re-read the account's numeric id from the database, which the
-  sweep had already read to build its own list.
+- each check re-read the account's numeric id from the database, and a failed
+  check re-read its privacy — both of which the sweep had already read to
+  build its own list.
 
 And one guard: with more than one lane, the pacing gap must space the
 launches. Reading the next slot without claiming it let every waiting lane
@@ -45,7 +50,9 @@ os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}
 
 from app.config import settings  # noqa: E402
 from app.database import crud  # noqa: E402
-from app.database.models import Base, MonitoredAccount  # noqa: E402
+from app.database.models import (  # noqa: E402
+    AccountSnapshot, Base, MonitoredAccount,
+)
 from app.database.session import engine, get_session  # noqa: E402
 from app.monitor import home_fetch  # noqa: E402
 from app.monitor.instagram import (  # noqa: E402
@@ -232,6 +239,17 @@ async def _new_account(username: str, instagram_id: Optional[str] = "42") -> int
         session.add(account)
         await session.flush()
         return account.id
+
+
+async def _seed_snapshot(account_id: int, username: str,
+                         is_private: Optional[bool], *,
+                         http_status: int = 200) -> None:
+    """One stored reading, as a check would have written it."""
+    async with get_session() as session:
+        session.add(AccountSnapshot(
+            account_id=account_id, username=username, http_status=http_status,
+            followers_count=10, following_count=5, is_private=is_private,
+        ))
 
 
 async def _pause_everything() -> None:
@@ -441,6 +459,93 @@ async def test_the_story_phase_reads_the_reel_the_phone_delivered() -> None:
            any("NO STORY" in t for t in texts2), repr(texts2))
 
 
+async def test_a_private_account_never_buys_a_reel_query() -> None:
+    """A private account has no story, no live broadcast and no visible
+    highlights, so the story phase skips it — and its scan stamp never
+    advances, which made it read as permanently 'due' and buy a reel query
+    every sweep, forever, for an answer nothing could ever read."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    try:
+        await _pause_everything()
+        # private (no stamp), public and due, public and freshly scanned,
+        # and one nobody has ever read.
+        privacy = {"shy": True, "loud": False, "scanned": False,
+                   "brandnew": None}
+        ids = {}
+        for i, (name, private) in enumerate(privacy.items()):
+            ids[name] = await _new_account(name, instagram_id=str(4000 + i))
+            if private is not None:
+                await _seed_snapshot(ids[name], name, private)
+        async with get_session() as session:
+            await crud.set_setting(
+                session, f"highlight_scan:{ids['scanned']}", str(time.time())
+            )
+            await crud.set_setting(
+                session, f"highlight_scan:{ids['loud']}",
+                str(time.time() - settings.highlight_scan_interval - 60),
+            )
+        await _set_door(True)
+        broker = FakeBroker(connected=True)
+        home_fetch.broker = broker
+        ig = ScriptedInstagram()
+        ig.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=200, source="public_page", api_status=401,
+            parsed={"username": u, "followers_count": 10, "following_count": 5,
+                    "is_private": bool(privacy.get(u)), "instagram_id": "42"},
+        )
+        service = _service(ig)
+        await service.check_all()
+        asked = sorted(name for _, name in broker.prefetched_reels)
+        expect("the private account is left out of the reel queries",
+               "shy" not in asked, repr(asked))
+        expect("the public account whose catalog is due still gets one",
+               "loud" in asked, repr(asked))
+        expect("a freshly scanned public account does not",
+               "scanned" not in asked, repr(asked))
+        expect("and an account nobody has read yet is never silently skipped",
+               "brandnew" in asked, repr(asked))
+        expect("every account still gets its page",
+               sorted(broker.prefetched) == sorted(privacy), repr(broker.prefetched))
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
+async def test_privacy_is_read_from_the_newest_successful_reading() -> None:
+    """One query, and the same answer the per-account lookup gives: the
+    newest SUCCESSFUL snapshot, with a missing flag reported as unknown
+    rather than guessed either way."""
+    await _pause_everything()
+    flipped = await _new_account("flipped", instagram_id="5000")
+    await _seed_snapshot(flipped, "flipped", True)
+    await _seed_snapshot(flipped, "flipped", False)   # went public since
+
+    blank = await _new_account("blank", instagram_id="5001")
+    await _seed_snapshot(blank, "blank", None)        # a reading without the flag
+
+    blocked = await _new_account("blocked", instagram_id="5002")
+    await _seed_snapshot(blocked, "blocked", True)
+    await _seed_snapshot(blocked, "blocked", False, http_status=401)  # not a reading
+
+    never = await _new_account("never", instagram_id="5003")
+
+    async with get_session() as session:
+        got = await crud.latest_privacy_by_account(
+            session, [flipped, blank, blocked, never]
+        )
+    expect("the newest reading wins", got.get(flipped) is False, repr(got))
+    expect("a reading without the flag is unknown, not a guess",
+           got.get(blank) is None, repr(got))
+    expect("a blocked check is not a reading", got.get(blocked) is True, repr(got))
+    expect("an account never read is absent, which is also unknown",
+           never not in got, repr(got))
+
+    async with get_session() as session:
+        empty = await crud.latest_privacy_by_account(session, [])
+    expect("no accounts, no query", empty == {}, repr(empty))
+
+
 async def test_a_previous_sweeps_reel_is_not_read_as_this_ones() -> None:
     """The broker keeps an answer for 15 minutes so one sweep can share it.
     A status the bot announces as current must not come from the sweep
@@ -551,6 +656,8 @@ async def main() -> int:
     await test_a_prefetched_page_skips_this_hosts_refused_door()
     await test_the_sweep_asks_only_for_the_reels_it_will_read()
     await test_the_story_phase_reads_the_reel_the_phone_delivered()
+    await test_a_private_account_never_buys_a_reel_query()
+    await test_privacy_is_read_from_the_newest_successful_reading()
     await test_a_previous_sweeps_reel_is_not_read_as_this_ones()
     await test_a_sweep_does_not_re_read_every_accounts_id()
     await test_extra_lanes_are_spaced_not_bursted()
