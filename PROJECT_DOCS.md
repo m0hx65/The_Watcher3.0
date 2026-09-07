@@ -397,6 +397,17 @@ sweep itself is paced by `_SweepThrottle`:
   answered, the gate is shut: stop immediately, skip the retry rounds, and
   skip the per-account reel fallback, because no pace helps and every further
   request is blocked traffic that keeps it shut.
+- **A verdict on the username API, kept in `app_settings`.** A sweep that
+  finds it refusing every lookup writes `username_api_closed_at`, and the next
+  sweep — a redeployed process included — knocks ONCE instead of
+  `USERNAME_API_KNOCKS` times. That matters because one knock is ~9 s and six
+  blocked upstream attempts: rediscovering a shut door costs 45 s and thirty
+  refused requests at the old five-knock threshold. Closing one door now takes
+  its own (smaller) evidence rather than borrowing `SWEEP_BREAKER_THRESHOLD`,
+  which is the number for abandoning a sweep. When the verdict is NOT trusted
+  the log says which reason it is — nothing recorded, or recorded and outside
+  `USERNAME_API_RECHECK_SECONDS` (`0` there means never trusted, so a sweep
+  re-pays the discovery every run).
 - **Two doors, booked separately** (2026-09-05). The username route
   (`web_profile_info`) and the numeric-id route (graphql reel query) are
   counted on their own. `SWEEP_BREAKER_THRESHOLD` refused username lookups

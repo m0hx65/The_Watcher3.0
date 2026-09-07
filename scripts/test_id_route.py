@@ -478,9 +478,11 @@ async def test_a_shut_username_door_does_not_stop_the_sweep() -> None:
            "checked by Instagram ID only" in summary, summary)
     expect("and that the username door was shut",
            "refused every username lookup" in summary, summary)
+    # USERNAME_API_KNOCKS, not SWEEP_BREAKER_THRESHOLD: closing one door and
+    # abandoning the sweep are different calls and take different evidence.
     expect("the username API was asked only until it closed",
-           ig.api_asks() == settings.sweep_breaker_threshold,
-           f"{ig.api_asks()} vs threshold {settings.sweep_breaker_threshold}")
+           ig.api_asks() == settings.username_api_knocks,
+           f"{ig.api_asks()} vs {settings.username_api_knocks} knocks")
     expect("the page doors were still tried for every account",
            len(ig.profile_calls) == 6, repr(ig.profile_kwargs))
     expect("every account was asked by id", len(ig.probe_calls) == 6, repr(ig.probe_calls))
@@ -519,8 +521,8 @@ async def test_retry_rounds_re_ask_by_id_when_the_door_is_shut() -> None:
            result["failed"] == 0 and result["answered"] == 5, repr(result))
     expect("and the summary says so", "recovered on retry" in summary, summary)
     expect("the retry did not re-knock on the username API",
-           ig.api_asks() == settings.sweep_breaker_threshold,
-           f"{ig.api_asks()} API asks vs threshold {settings.sweep_breaker_threshold}")
+           ig.api_asks() == settings.username_api_knocks,
+           f"{ig.api_asks()} API asks vs {settings.username_api_knocks} knocks")
     expect("one extra id ask — the retry", len(ig.probe_calls) == 6, repr(ig.probe_calls))
 
 

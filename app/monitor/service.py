@@ -604,6 +604,30 @@ class MonitorService:
         age = datetime.now(timezone.utc) - closed_at
         return age < timedelta(seconds=max(0, settings.username_api_recheck_seconds))
 
+    def _door_open_reason(self) -> str:
+        """Why this sweep is about to knock on the username API instead of
+        trusting a stored verdict. Call only after `username_api_known_closed`
+        has run, so the verdict is loaded."""
+        at = self._username_api_closed_at
+        if at is None:
+            return (
+                "nothing recorded — either no sweep has found it shut yet, or "
+                "the last one got an answer out of it"
+            )
+        window = max(0, settings.username_api_recheck_seconds)
+        if window == 0:
+            return (
+                f"a verdict IS stored (shut at {at.isoformat()}) but "
+                "USERNAME_API_RECHECK_SECONDS is 0, so it is never trusted — "
+                "set it to e.g. 43200 to stop re-paying this discovery every "
+                "sweep"
+            )
+        age = (datetime.now(timezone.utc) - at).total_seconds()
+        return (
+            f"the stored verdict (shut at {at.isoformat()}) is {age / 3600:.1f}h "
+            f"old, past the {window / 3600:.1f}h recheck window"
+        )
+
     async def _remember_username_api_door(
         self, *, closed: bool, answered: bool
     ) -> None:
@@ -619,6 +643,15 @@ class MonitorService:
                     await crud.set_setting(
                         session, _USERNAME_API_DOOR_KEY, now.isoformat()
                     )
+                # Said out loud, because the whole point of the verdict is
+                # that the NEXT sweep does not pay to rediscover this. A log
+                # that shows this line and then still says "believed open"
+                # next sweep names the problem as the window, not the write.
+                logger.info(
+                    "Username API door: recorded as shut at {} — the next "
+                    "sweep knocks once instead of {}",
+                    now.isoformat(), max(1, settings.username_api_knocks),
+                )
                 return
             if answered and self._username_api_closed_at is not None:
                 self._username_api_closed_at = None
@@ -846,15 +879,22 @@ class MonitorService:
         # a threshold's worth of blocked Worker calls.
         known_closed = await self.username_api_known_closed()
         home_serving = bool(settings.home_fetch_token and home_fetch.broker.connected)
+        knocks = 1 if known_closed else max(1, settings.username_api_knocks)
         if known_closed:
             logger.info(
                 "Username API door: known shut since {} — one knock this sweep",
                 self._username_api_closed_at,
             )
         else:
+            # WHY it is believed open matters, and used to be unsayable: a
+            # sweep that rediscovers a shut door pays `knocks` blocked Worker
+            # calls at ~9 s and 6 upstream attempts each, and the log gave no
+            # way to tell "nothing recorded yet" from "recorded, then not
+            # trusted". A sweep that keeps paying it is a misconfiguration
+            # the logs should name, not a mystery.
             logger.info(
-                "Username API door: believed open — up to {} knocks before it "
-                "closes", settings.sweep_breaker_threshold,
+                "Username API door: believed open ({}) — up to {} knock(s) "
+                "before it closes", self._door_open_reason(), knocks,
             )
         # Is the PHONE serving this sweep's pages, or is this host?
         #
@@ -879,7 +919,7 @@ class MonitorService:
             breaker_threshold=settings.sweep_breaker_threshold,
             concurrency=settings.sweep_concurrency,
             cooldown=settings.sweep_breaker_cooldown_seconds,
-            username_door_threshold=1 if known_closed else None,
+            username_door_threshold=knocks,
         )
         throttle.pending_usernames = [uname for _, uname in targets]
         home_pages_before = home_fetch.broker.delivered

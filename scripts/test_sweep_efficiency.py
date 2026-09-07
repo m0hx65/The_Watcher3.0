@@ -467,6 +467,70 @@ async def test_the_story_phase_reads_the_reel_the_phone_delivered() -> None:
            any("NO STORY" in t for t in texts2), repr(texts2))
 
 
+async def test_the_shut_door_verdict_survives_a_restart() -> None:
+    """Two sweeps in a row opened with "believed open" and paid five blocked
+    Worker calls — 45 s and thirty refused upstream attempts — to rediscover
+    a door the sweep before had already found shut. The verdict has to reach
+    the database and be read back by a FRESH service, and when it is not
+    trusted the log has to say which of the two reasons it is."""
+    await _pause_everything()
+    names = [f"verdict{i}" for i in range(3)]
+    for i, u in enumerate(names):
+        await _new_account(u, instagram_id=str(7000 + i))
+    await _set_door(False)
+
+    ig = ScriptedInstagram()          # every username lookup refused
+    ig.profile = lambda u: ProfileFetchResult(
+        username=u, http_status=200, source="public_page", api_status=401,
+        parsed={"username": u, "followers_count": 10, "following_count": 5,
+                "is_private": False, "instagram_id": "42",
+                "has_public_story": False},
+    )
+    first = _service(ig)
+    expect("a fresh service starts out believing the door is open",
+           not await first.username_api_known_closed())
+    await first.check_all()
+    async with get_session() as session:
+        stored = await crud.get_setting(session, "username_api_closed_at")
+    expect("the sweep wrote the verdict to the database",
+           stored is not None, repr(stored))
+
+    # A new MonitorService is what a redeploy produces: nothing in memory.
+    restarted = _service(ig)
+    expect("and a restarted service reads it back",
+           await restarted.username_api_known_closed(), repr(stored))
+    expect("so the next sweep knocks once, not USERNAME_API_KNOCKS times",
+           settings.username_api_knocks > 1)
+
+    # The two ways it can legitimately not be trusted, each named in the log
+    # line rather than both showing as a bare "believed open".
+    fresh = _service(ig)
+    await fresh.username_api_known_closed()
+    reason = fresh._door_open_reason()
+    expect("a trusted verdict is not reported as a reason to knock",
+           "nothing recorded" not in reason, reason)
+
+    old_window = settings.username_api_recheck_seconds
+    try:
+        settings.username_api_recheck_seconds = 0
+        zeroed = _service(ig)
+        expect("with the window at 0 the verdict is never trusted",
+               not await zeroed.username_api_known_closed())
+        expect("and the log says so, by name",
+               "USERNAME_API_RECHECK_SECONDS is 0" in zeroed._door_open_reason(),
+               zeroed._door_open_reason())
+    finally:
+        settings.username_api_recheck_seconds = old_window
+
+    async with get_session() as session:
+        await crud.delete_setting(session, "username_api_closed_at")
+    blank = _service(ig)
+    await blank.username_api_known_closed()
+    expect("with nothing stored the log says that instead",
+           "nothing recorded" in blank._door_open_reason(),
+           blank._door_open_reason())
+
+
 async def test_the_phone_stands_by_while_this_host_can_fetch_pages() -> None:
     """Instagram started serving Render's own page requests again (measured
     2026-09-07): 17 accounts, 17 pages, half a second each. The phone was
@@ -721,6 +785,7 @@ async def main() -> int:
     await test_a_prefetched_page_skips_this_hosts_refused_door()
     await test_the_sweep_asks_only_for_the_reels_it_will_read()
     await test_the_story_phase_reads_the_reel_the_phone_delivered()
+    await test_the_shut_door_verdict_survives_a_restart()
     await test_the_phone_stands_by_while_this_host_can_fetch_pages()
     await test_a_private_account_never_buys_a_reel_query()
     await test_privacy_is_read_from_the_newest_successful_reading()

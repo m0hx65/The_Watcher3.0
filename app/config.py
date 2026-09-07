@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     username_api_recheck_seconds: int = Field(
         default=43200, alias="USERNAME_API_RECHECK_SECONDS"
     )
+    # How many refused username lookups in a row — with none answering — a
+    # sweep spends before concluding the API is shut, when no stored verdict
+    # says so already. This used to borrow SWEEP_BREAKER_THRESHOLD, which is
+    # the number for a far more drastic call (abandoning the sweep), and the
+    # two deserve different evidence. One knock is ~9 s and six blocked
+    # upstream attempts, so five of them is 45 s and thirty refused requests
+    # per rediscovery. Closing ONE door needs less: the fallback (the profile
+    # page and the id route) is proven, the door reopens the moment any knock
+    # answers 200, and it is re-tested every sweep regardless.
+    username_api_knocks: int = Field(default=2, alias="USERNAME_API_KNOCKS")
 
     # Scheduler
     check_interval: int = Field(default=1800, alias="CHECK_INTERVAL")
