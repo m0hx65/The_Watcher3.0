@@ -1,3 +1,11 @@
+# wireproxy — userspace WireGuard exposed as a local SOCKS5 proxy, for the
+# page tunnel (app/monitor/page_tunnel.py). Built from source at a pinned
+# version; `go install` checks the module against Go's checksum database
+# (sum.golang.org), so nothing here is an unverified download. Static
+# (CGO_ENABLED=0), so it runs on the slim image below as is.
+FROM golang:1.26 AS wireproxy
+RUN CGO_ENABLED=0 GOBIN=/out go install github.com/windtf/wireproxy/cmd/wireproxy@v1.1.3
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,6 +30,7 @@ COPY app ./app
 # The home fetcher's script, so the phone can update itself from the bot
 # (GET /home-fetch/worker.py) when it cannot reach GitHub.
 COPY tools/home_fetcher/home_fetcher.py ./tools/home_fetcher/home_fetcher.py
+COPY --from=wireproxy /out/wireproxy /usr/local/bin/wireproxy
 
 RUN mkdir -p /app/data/media
 

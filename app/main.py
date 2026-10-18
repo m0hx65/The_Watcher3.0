@@ -26,6 +26,7 @@ from app.bot.panel_bump import PanelBumper
 from app.config import settings
 from app.database import crud
 from app.database.session import dispose_engine, get_session, init_db
+from app.monitor import page_tunnel
 from app.monitor.instagram import InstagramClient
 from app.monitor.media_hasher import MediaHasher
 from app.monitor.service import MonitorService
@@ -38,6 +39,9 @@ from app.workers.scheduler import WatcherScheduler
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     quiet_health_check_logs()
     logger.info("Starting The Watcher V3.0…")
+    # The page tunnel first: it decides where this host's profile-page
+    # requests leave from, and the route line below should say so.
+    await page_tunnel.tunnel.start()
     # Say the route once, at boot. A cloud host's own IP is 401-blocked, so a
     # misconfigured IG_PROXY_URL looks exactly like Instagram blocking us.
     logger.info("Instagram requests route via: {}", instagram_route())
@@ -187,6 +191,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await stories.close()
         except Exception as exc:
             logger.warning("HTTP client shutdown error: {}", exc)
+
+        try:
+            await page_tunnel.tunnel.stop()
+        except Exception as exc:
+            logger.warning("Page tunnel shutdown error: {}", exc)
 
         await dispose_engine()
         logger.info("Shutdown complete.")

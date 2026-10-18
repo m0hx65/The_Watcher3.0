@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     home_fetch_battery_alerts: str = Field(
         default="50,20,10,5", alias="HOME_FETCH_BATTERY_ALERTS"
     )
+    # The page tunnel (app/monitor/page_tunnel.py): this host's profile-page
+    # requests leave through a WireGuard VPN instead of this host's own IP,
+    # which Instagram sends to its login page. Either the config text itself
+    # or a path to the .conf file; unset, a Render Secret File named
+    # page_tunnel.conf is used when present. Only the page requests use it.
+    page_tunnel_config: Optional[str] = Field(default=None, alias="PAGE_TUNNEL_CONFIG")
+    # Or a plain proxy for the page requests only (http://, socks5h://) — a
+    # residential proxy, say. Used when no tunnel is configured.
+    page_proxy_url: Optional[str] = Field(default=None, alias="PAGE_PROXY_URL")
 
     # How many times a 401/403 from the Cloudflare Worker is re-asked. One
     # worker call is already 6 upstream attempts with rotating UAs and hosts —

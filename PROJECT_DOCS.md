@@ -721,6 +721,24 @@ phone up, five accounts still failed every sweep:
   the failure said only "username API skipped"; it now names each page
   door's answer.
 
+**The page tunnel (2026-10-18) — counts without the phone.** Instagram serves
+the page by IP reputation, not "home vs datacenter": the owner's PC got full
+pages through Proton VPN (M247, Bucharest), a datacenter network, while
+Render's IP is sent to the login page whatever headers it sends (the owner's
+own browser test: `"country_code":"RO"` in the served page). So
+`app/monitor/page_tunnel.py` runs wireproxy — userspace WireGuard exposed as
+a localhost SOCKS5 proxy, built from source in the Dockerfile — and routes
+ONLY this host's profile-page request through it. Configured by a WireGuard
+.conf (Proton: account.protonvpn.com → Downloads → WireGuard configuration)
+as a Render Secret File `page_tunnel.conf`, or `PAGE_TUNNEL_CONFIG` (text or
+path); `PAGE_PROXY_URL` is the plain-proxy alternative. Nothing is routed
+until a request through it has come back; a down tunnel leaves the page door
+as it was and the no-counts notice names it; a watchdog restarts it. While
+it serves pages, a sweep's id probe is cache-only (as with the phone), which
+also drops the Worker's ~9 s id call per account; the id route is asked only
+when a page fails. Unverified on Render itself until a config is supplied:
+outbound UDP, and Proton's free plan allows one connection at a time.
+
 The sweep-complete message is one line. Which door served the readings — the
 page-only and id-only counts, and the verdict on the profile API — is a
 standing condition rather than an event, so it is recorded in

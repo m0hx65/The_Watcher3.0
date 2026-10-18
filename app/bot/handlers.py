@@ -29,7 +29,7 @@ from app.bot import keyboards
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
-from app.monitor import home_fetch
+from app.monitor import home_fetch, page_tunnel
 from app.monitor.analytics import compute_rhythm, render_rhythm
 from app.monitor.health import fetch_health, render_health_lines
 from app.monitor.service import MonitorService
@@ -717,6 +717,10 @@ def instagram_route() -> str:
         # PROXY_URL wraps the whole session, so it applies to the hop that
         # reaches the worker — not to the worker's own egress to Instagram.
         route += " + outbound proxy"
+    if page_tunnel.tunnel.configured:
+        route += f" · page tunnel {page_tunnel.tunnel.describe()}"
+    elif settings.page_proxy_url:
+        route += " · pages via PAGE_PROXY_URL"
     if settings.home_fetch_token:
         route += f" · home fetcher {home_fetch.broker.describe()}"
     return route

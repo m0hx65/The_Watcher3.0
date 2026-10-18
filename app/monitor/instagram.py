@@ -23,7 +23,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException, Timeout
 
 from app.config import settings
-from app.monitor import home_fetch
+from app.monitor import home_fetch, page_tunnel
 from app.monitor.health import IG_PROFILE, IG_REEL, fetch_health
 from app.monitor.public_page import PARTIAL_FIELDS, parse_public_profile
 from app.utils.logger import logger
@@ -524,13 +524,15 @@ class InstagramClient:
                 status, parsed = self._parse_home_reel(home)
                 if parsed is not None or status == 404:
                     return await self._fill_probe(probe, status, parsed, via="home")
-        if cached_ok and phone:
-            # A sweep with the phone up: the reel was prefetched (served from
-            # the cache just above) or is still on its way. Either way DON'T
-            # spend ~9 s on the refused Worker or block on a live phone
-            # request — the profile page carries this account's story status,
-            # and a rename is caught next sweep once its reel lands. This is
-            # what keeps a sweep's per-account cost near zero.
+        tunnel_pages = bool(page_tunnel.tunnel.up and not self.direct_page_door_failing)
+        if cached_ok and (phone or tunnel_pages):
+            # A sweep whose pages are being served — by the phone, or through
+            # the page tunnel: DON'T spend ~9 s per account on the Worker's id
+            # route up front (measured 2026-10-18: 9.0-9.5 s each, every
+            # account) or block on a live phone request. The profile page
+            # carries this account's handle, avatar and story status; if the
+            # page then fails, the check asks by id after all (_do_check).
+            # This is what keeps a sweep's per-account cost near zero.
             probe.via = "cache-miss"
             return probe
 
@@ -1075,11 +1077,13 @@ class InstagramClient:
             return None
 
         fetch_health.record_status(IG_PROFILE, 200)
+        door = outcome.get("door") or "direct"
+        if door == "direct" and outcome.get("route") not in (None, "this host"):
+            door = f"direct, via {outcome['route']}"
         logger.info(
             "@{} answered on the public page ({}) after the API blocked us — "
             "partial data ({} of {} fields)",
-            username, outcome.get("door") or "direct", len(parsed),
-            len(PARTIAL_FIELDS),
+            username, door, len(parsed), len(PARTIAL_FIELDS),
         )
         return ProfileFetchResult(
             username=username,
@@ -1227,10 +1231,16 @@ class InstagramClient:
     async def _probe_page_direct(self, username: str) -> dict[str, Any]:
         username = username.strip().lstrip("@")
         url = f"https://{PROFILE_PAGE_HOST}/{username}/"
+        # This host's own IP is sent to the login page (2026-10-18), so when
+        # the page tunnel is up — or a page-only proxy is set — this one
+        # request leaves through it instead. Nothing else does.
+        proxy = page_tunnel.page_proxy()
+        route = page_tunnel.page_route()
         result: dict[str, Any] = {
             "status": 0, "bytes": 0, "parsed": None, "error": None,
-            "door": "direct",
+            "door": "direct", "route": route,
         }
+        extra: dict[str, Any] = {"proxy": proxy} if proxy else {}
         try:
             # Bounded hard: a refused datacenter IP is sometimes answered with
             # a 429 at once and sometimes left hanging; the session's default
@@ -1238,20 +1248,20 @@ class InstagramClient:
             # fallback door came to cost 40 s per account.
             response = await asyncio.wait_for(
                 self._session.get(
-                    url, headers={"Accept-Language": "en-US,en;q=0.9"}
+                    url, headers={"Accept-Language": "en-US,en;q=0.9"}, **extra
                 ),
                 timeout=self._DIRECT_PAGE_TIMEOUT,
             )
         except asyncio.TimeoutError:
             result["error"] = f"timed out after {self._DIRECT_PAGE_TIMEOUT:.0f}s"
             logger.info(
-                "Public page for @{} did not answer this host within {:.0f}s",
-                username, self._DIRECT_PAGE_TIMEOUT,
+                "Public page for @{} did not answer {} within {:.0f}s",
+                username, route, self._DIRECT_PAGE_TIMEOUT,
             )
             return result
         except Exception as exc:
             result["error"] = repr(exc)
-            logger.warning("Public page fetch failed for @{}: {}", username, exc)
+            logger.warning("Public page fetch failed for @{} via {}: {}", username, route, exc)
             return result
 
         body = getattr(response, "text", "") or ""
@@ -1261,8 +1271,8 @@ class InstagramClient:
         if response.status_code != 200:
             result["error"] = f"HTTP {response.status_code}"
             logger.info(
-                "Public page for @{} answered HTTP {} ({} bytes)",
-                username, response.status_code, len(body),
+                "Public page for @{} answered HTTP {} via {} ({} bytes)",
+                username, response.status_code, route, len(body),
             )
             return result
 
@@ -1281,16 +1291,16 @@ class InstagramClient:
             # Not a markup change, and nothing in the parser can fix it.
             result["error"] = "redirected to the login page"
             logger.info(
-                "Public page for @{}: Instagram redirected this host to its "
-                "login page ({} bytes) — the page door is shut to this IP",
-                username, len(body),
+                "Public page for @{}: Instagram redirected {} to its login "
+                "page ({} bytes) — the page door is shut to that IP",
+                username, route, len(body),
             )
         elif parsed is None:
             result["error"] = "no profile payload in the page"
             logger.info(
-                "Public page for @{} was served ({} bytes) but carried no "
-                "profile payload — login wall or markup change",
-                username, len(body),
+                "Public page for @{} was served via {} ({} bytes) but carried "
+                "no profile payload — login wall or markup change",
+                username, route, len(body),
             )
         return result
 

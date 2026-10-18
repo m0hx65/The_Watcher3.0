@@ -29,7 +29,7 @@ from app.monitor.change_detector import (
     detect_changes,
     pic_fingerprints_differ,
 )
-from app.monitor import home_fetch
+from app.monitor import home_fetch, page_tunnel
 from app.monitor.instagram import (
     IdProbe,
     InstagramClient,
@@ -1444,19 +1444,29 @@ class MonitorService:
                 home = "the home fetcher runs an out-of-date home_fetcher.py"
             else:
                 home = "the home fetcher's pages carried no profile either"
-            here = (
-                "Instagram is refusing this server's own profile-page requests"
-                if self.instagram.direct_page_door_failing
-                else "this server's own page requests got no profile"
+            tunnel = page_tunnel.tunnel
+            if tunnel.configured and not tunnel.up:
+                here = f"the page tunnel is down ({tunnel.error or 'starting'})"
+            elif self.instagram.direct_page_door_failing:
+                here = (
+                    "Instagram is refusing this server's profile-page requests"
+                    + (" — through the page tunnel too" if tunnel.up else "")
+                )
+            else:
+                here = "this server's own page requests got no profile"
+            fix = (
+                "Start the phone's home fetcher to get full readings back."
+                if tunnel.configured
+                else "Start the phone's home fetcher, or set up the page "
+                     "tunnel (PAGE_TUNNEL_CONFIG), to get full readings back."
             )
             logger.warning(
                 "No counts this sweep: {}, and {}", here, home,
             )
             return (
-                f"\n📵 No follower/following counts this sweep — {here}, and "
-                f"{esc(home)}. Without the page a check can only read the "
-                "username, picture and story status. Start the phone's home "
-                "fetcher to get full readings back."
+                f"\n📵 No follower/following counts this sweep — {esc(here)}, "
+                f"and {esc(home)}. Without the page a check can only read the "
+                f"username, picture and story status. {fix}"
             )
         if not blind and with_counts > 0 and self._counts_blind_announced:
             self._counts_blind_announced = False
