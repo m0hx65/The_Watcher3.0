@@ -83,6 +83,10 @@ class ProfileFetchResult:
     # for the one-line timing the check logs — the sweep was slow for a long
     # time before anyone could say WHICH door was slow.
     timings: dict[str, float] = field(default_factory=dict)
+    # True when the page failed only because the home fetcher had the job in
+    # hand and had not delivered it yet — late, not refused. A sweep's retry
+    # round will find that page waiting; settling for less now loses it.
+    page_pending: bool = False
 
     @property
     def success(self) -> bool:
@@ -994,6 +998,9 @@ class InstagramClient:
             page_error = self._describe_page_failure(outcome)
             if page_error:
                 last_error = f"{last_error or f'HTTP {last_status}'}; page: {page_error}"
+            page_pending = bool(outcome.get("pending") or outcome.get("home_pending"))
+        else:
+            page_pending = False
 
         # Record the terminal outcome once per fetch (retries within a single
         # fetch are one logical attempt against the endpoint).
@@ -1004,6 +1011,7 @@ class InstagramClient:
             error=last_error or f"failed after {self.max_retries} attempts",
             api_status=api_status,
             timings=timings,
+            page_pending=page_pending,
         )
 
     @staticmethod
@@ -1163,6 +1171,7 @@ class InstagramClient:
         # Neither door answered — report this host's own outcome, and note the
         # home fetcher's alongside it.
         result["home_error"] = home.get("error")
+        result["home_pending"] = bool(home.get("pending"))
         return result
 
     @property
@@ -1326,6 +1335,7 @@ class InstagramClient:
             )
             if page is None:
                 result["error"] = "home fetcher took the job but did not answer in time"
+                result["pending"] = True
                 return result
 
         result["status"] = page.status

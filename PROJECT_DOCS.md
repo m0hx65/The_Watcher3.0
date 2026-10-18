@@ -457,7 +457,16 @@ sweep itself is paced by `_SweepThrottle`:
   goes through — this is what stops the summary reporting failures the owner
   can reproduce as successes by hand a minute later.
 - **Order is shuffled every sweep**, so the same tail of accounts doesn't
-  absorb every block sweep after sweep.
+  absorb every block sweep after sweep — **except that accounts whose last
+  check failed go first** (`consecutive_failures > 0`, so it survives a
+  restart; shuffled within each group). They hold the oldest readings, the
+  front of a sweep is where the gate is coolest, and the phone fetches pages
+  in sweep order, so theirs come back first.
+- **A late phone page waits for the retry round.** When the phone has a page
+  in hand but has not delivered it (`ProfileFetchResult.page_pending`), the
+  first pass does not settle for an id-only reading — that would count as an
+  answer and the retry round would never come back for the full page. Only a
+  page still late in the retry round falls back to the id route.
 
 ### 6.3 WatcherScheduler (`app/workers/scheduler.py`)
 

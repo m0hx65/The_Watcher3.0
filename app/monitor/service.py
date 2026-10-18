@@ -948,6 +948,21 @@ class MonitorService:
         # in the window when it closes, so a fixed order made the same tail of
         # accounts absorb every block sweep after sweep.
         random.shuffle(targets)
+        # ...except that the accounts whose last check FAILED go first. They
+        # are the ones with the oldest reading, and the front of a sweep is
+        # where a check has the best odds: the gate has had the whole interval
+        # to cool, the throttle has no blocks on the books yet, and the phone
+        # fetches pages in sweep order, so their pages come back first. The
+        # shuffle above still decides the order within each group, and
+        # `consecutive_failures` is stored, so this holds across a restart.
+        failed_last = {a.id for a in accounts if (a.consecutive_failures or 0) > 0}
+        if failed_last:
+            targets.sort(key=lambda target: target[0] not in failed_last)  # stable
+            logger.info(
+                "Checking first the {} account(s) whose last check failed: {}",
+                len(failed_last),
+                ", ".join(f"@{u}" for aid, u in targets if aid in failed_last),
+            )
         noun = "profile" if len(targets) == 1 else "profiles"
         await self.notifier.send_text(
             f"👁 Sweep started — {len(targets)} {noun} queued."
@@ -1661,6 +1676,9 @@ class MonitorService:
                 skip_username_api=throttle.username_door_closed,
                 instagram_id=instagram_id,
                 paced=True,  # the throttle slot above IS the spacing
+                # The retry rounds come back for this account, so a page the
+                # phone is still delivering is worth that wait.
+                page_can_wait=settings.sweep_retry_rounds > 0,
             )
             # Recorded inside the slot so the next account's pacing — and any
             # cooldown this block just triggered — already accounts for it.
@@ -1788,6 +1806,7 @@ class MonitorService:
         skip_username_api: bool = False,
         instagram_id: Optional[str] = None,
         paced: bool = False,
+        page_can_wait: bool = False,
     ) -> dict:
         """One full check. `thorough` (the default) lets a blocked fetch try
         every colo it can — right for on-demand checks, which are one account
@@ -1812,7 +1831,7 @@ class MonitorService:
                 result = await self._do_check(
                     account_id, username, notify_unchanged,
                     thorough=thorough, skip_username_api=skip_username_api,
-                    instagram_id=instagram_id,
+                    instagram_id=instagram_id, page_can_wait=page_can_wait,
                 )
                 self._log_check_timing(username, result, time.monotonic() - started)
                 return result
@@ -1862,6 +1881,7 @@ class MonitorService:
         thorough: bool = True,
         skip_username_api: bool = False,
         instagram_id: Optional[str] = None,
+        page_can_wait: bool = False,
     ) -> dict:
         logger.info("Checking @{}", username)
         timings: dict[str, float] = {}
@@ -1914,7 +1934,24 @@ class MonitorService:
         timings["username side"] = time.monotonic() - clock
         timings.update(fetch.timings)
 
-        if not fetch.success and probe is not None and probe.via == "cache-miss":
+        if (
+            not fetch.success
+            and probe is not None
+            and probe.via == "cache-miss"
+            and page_can_wait
+            and fetch.page_pending
+        ):
+            # Late, not refused: the phone has this page in hand. An id-only
+            # reading now would count as an answer and the retry round would
+            # never come back for the page — measured 2026-10-18, two
+            # accounts settled for username + picture while their full pages
+            # landed a minute later. Fail it for now; the round reads it.
+            logger.info(
+                "@{}: the home fetcher has this page in hand but has not "
+                "delivered it yet — leaving it to the retry round rather than "
+                "settling for an id-only reading", username,
+            )
+        elif not fetch.success and probe is not None and probe.via == "cache-miss":
             # The sweep skipped the live id route because the phone's page was
             # going to answer — and the page did not. Ask by id now, through
             # the Worker only (the phone already had its turn). Without this a

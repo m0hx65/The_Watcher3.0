@@ -1283,6 +1283,157 @@ async def test_no_counts_is_said_once() -> None:
         await _set_door(False)
 
 
+async def test_a_late_page_waits_for_the_retry_round() -> None:
+    """Measured 2026-10-18 (first sweep after the rescue shipped): the phone
+    had @whos.lisianna's and @8dvuu's pages in hand but had not delivered
+    them within 30 s, the id rescue answered instead, the id-only reading
+    counted as an answer — and the retry round, which would have found both
+    full pages waiting a minute later, never ran for them. A LATE page is now
+    left to the retry round; only a page still late there settles for id."""
+    old = (home_fetch.broker, settings.home_fetch_token, settings.sweep_retry_rounds,
+           service_mod._SWEEP_RETRY_COOLDOWN_SECONDS, service_mod._SWEEP_RETRY_GAP_SECONDS)
+    settings.home_fetch_token = "sekrit"
+    settings.sweep_retry_rounds = 1
+    service_mod._SWEEP_RETRY_COOLDOWN_SECONDS = 0.0
+    service_mod._SWEEP_RETRY_GAP_SECONDS = (0.0, 0.0)
+    home_fetch.broker = FakeBroker({}, connected=True)
+    await _set_door(True)
+    try:
+        async with get_session() as session:
+            for a in await crud.list_accounts(session, only_active=True):
+                await crud.set_account_active(session, a.username, False)
+        await _new_account("late_lands", instagram_id="4000")
+        await _new_account("late_stays", instagram_id="4001")
+        asks: dict[str, int] = {}
+
+        def profile(u: str) -> ProfileFetchResult:
+            asks[u] = asks.get(u, 0) + 1
+            if u == "late_lands" and asks[u] > 1:  # delivered by the retry round
+                return ProfileFetchResult(
+                    username=u, http_status=200, source="public_page", api_status=None,
+                    parsed={"username": u, "followers_count": 10, "following_count": 5,
+                            "is_private": True, "instagram_id": "4000"},
+                )
+            return ProfileFetchResult(
+                username=u, http_status=401, page_pending=True,
+                error="page: home: home fetcher took the job but did not answer in time",
+            )
+
+        ig = _CacheMissInstagram()
+        ig.profile = profile
+        ig.probe = lambda i: _answered(i, {"4000": "late_lands", "4001": "late_stays"}[i])
+        service = _service(ig)
+        result = await service.check_all()
+
+        live = [(c, kw) for c, kw in zip(ig.probe_calls, ig.probe_kwargs) if not kw.get("cached_ok")]
+        expect("both pages were asked twice: the first pass, then the retry round",
+               asks == {"late_lands": 2, "late_stays": 2}, repr(asks))
+        expect("the page that landed is read in full, with no id call",
+               all(c != "4000" for c, _ in live), repr(live))
+        expect("only the page still late in the retry round settles for id",
+               [c for c, _ in live] == ["4001"], repr(live))
+        expect("so the sweep has one page reading and one id-only reading, no failure",
+               result["page_only"] == 1 and result["id_only"] == 1 and result["failed"] == 0,
+               repr(result))
+
+        # A page that came back WITHOUT a profile is refused, not late: the
+        # first pass asks by id at once, as before.
+        async with get_session() as session:
+            for a in await crud.list_accounts(session, only_active=True):
+                await crud.set_account_active(session, a.username, False)
+        await _new_account("shell_page", instagram_id="4002")
+        ig2 = _CacheMissInstagram()
+        ig2.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=401, error="page: home: no profile payload in the page",
+        )
+        ig2.probe = lambda i: _answered(i, "shell_page_new")
+        service2 = _service(ig2)
+        result2 = await service2.check_all()
+        expect("a refused page is still asked about by id on the first pass",
+               len(ig2.profile_calls) == 1 and result2["id_only"] == 1, repr((ig2.profile_calls, result2)))
+    finally:
+        (home_fetch.broker, settings.home_fetch_token, settings.sweep_retry_rounds,
+         service_mod._SWEEP_RETRY_COOLDOWN_SECONDS, service_mod._SWEEP_RETRY_GAP_SECONDS) = old
+        await _set_door(False)
+
+
+async def test_the_client_tells_a_late_page_from_a_refused_one() -> None:
+    old_proxy, old_token, old_broker = (
+        settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker
+    )
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.home_fetch_token = "sekrit"
+    session = _MockSession(lambda url, p: _MockResponse(429, {}, text=""))
+    try:
+        home_fetch.broker = FakeBroker({}, connected=True)  # takes the job, never delivers
+        async with InstagramClient(max_retries=5, session=session) as client:
+            late = await client.fetch_profile("slow", auth_attempts=1, api=False, cached_page_ok=True)
+        expect("a page the phone took but has not delivered is late",
+               not late.success and late.page_pending, repr(late))
+        home_fetch.broker = FakeBroker({"shell": home_fetch.PageResult(200, "<html>shell</html>")})
+        async with InstagramClient(max_retries=5, session=session) as client:
+            refused = await client.fetch_profile("shell", auth_attempts=1, api=False)
+        expect("a page that came back without a profile is not",
+               not refused.success and not refused.page_pending, repr(refused))
+        home_fetch.broker = FakeBroker({}, connected=False)
+        async with InstagramClient(max_retries=5, session=session) as client:
+            off = await client.fetch_profile("off", auth_attempts=1, api=False)
+        expect("nor is a phone that is off", not off.page_pending, repr(off))
+    finally:
+        settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker = (
+            old_proxy, old_token, old_broker
+        )
+
+
+async def test_a_sweep_starts_with_the_accounts_that_failed_last_time() -> None:
+    """The owner's ask (2026-10-18): a new sweep starts with the accounts
+    whose last check failed — the oldest readings, checked while the gate is
+    coolest, and first in the phone's prefetch queue."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    await _set_door(True)
+    try:
+        async with get_session() as session:
+            for a in await crud.list_accounts(session, only_active=True):
+                await crud.set_account_active(session, a.username, False)
+        names = [f"order{i}" for i in range(8)]
+        for i, name in enumerate(names):
+            await _new_account(name, instagram_id=str(5000 + i))
+        failed = {"order3", "order6"}
+        for _ in range(6):  # the rest are shuffled: one lucky order proves nothing
+            async with get_session() as session:
+                for a in await crud.list_accounts(session, only_active=True):
+                    a.consecutive_failures = 2 if a.username in failed else 0
+            fake = FakeBroker({}, connected=True)
+            home_fetch.broker = fake
+            ig = ScriptedInstagram()
+            ig.probe = lambda i: _answered(i, f"order{int(i) - 5000}")
+            await _service(ig).check_all()
+            checked = [f"order{int(i) - 5000}" for i in ig.probe_calls]
+            if set(checked[:2]) != failed:
+                break
+            if set(fake.prefetched[:2]) != failed:
+                break
+        expect("the accounts that failed last time are checked first",
+               set(checked[:2]) == failed and sorted(checked) == sorted(names), repr(checked))
+        expect("and are first in the phone's queue", set(fake.prefetched[:2]) == failed,
+               repr(fake.prefetched))
+        # Nothing failed last time: the plain shuffle, nothing reordered.
+        async with get_session() as session:
+            for a in await crud.list_accounts(session, only_active=True):
+                a.consecutive_failures = 0
+        orders = set()
+        for _ in range(6):
+            ig = ScriptedInstagram()
+            ig.probe = lambda i: _answered(i, f"order{int(i) - 5000}")
+            await _service(ig).check_all()
+            orders.add(tuple(ig.probe_calls))
+        expect("with no failures the order is still shuffled", len(orders) > 1, repr(len(orders)))
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
 async def main() -> int:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -1328,6 +1479,9 @@ async def main() -> int:
     await test_a_bad_page_in_hand_is_read_once_and_named()
     await test_a_login_redirect_is_called_one()
     await test_no_counts_is_said_once()
+    await test_a_late_page_waits_for_the_retry_round()
+    await test_the_client_tells_a_late_page_from_a_refused_one()
+    await test_a_sweep_starts_with_the_accounts_that_failed_last_time()
 
     await engine.dispose()
     print()
