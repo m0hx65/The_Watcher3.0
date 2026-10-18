@@ -736,8 +736,13 @@ until a request through it has come back; a down tunnel leaves the page door
 as it was and the no-counts notice names it; a watchdog restarts it. While
 it serves pages, a sweep's id probe is cache-only (as with the phone), which
 also drops the Worker's ~9 s id call per account; the id route is asked only
-when a page fails. Unverified on Render itself until a config is supplied:
-outbound UDP, and Proton's free plan allows one connection at a time.
+when a page fails. Verified on Render the same day with a Proton Free config
+(server RO-FREE#22): Render allows the outbound UDP, and the first check
+(@65xim) read its page "direct, via the page tunnel" in 1.0 s, 9 of 11
+fields. Render logs "Detected a new open port UDP:…" for wireproxy's socket;
+that is harmless, nothing is exposed. Proton Free allows one connection at a
+time, and a config Instagram stops serving is replaced by one for another free
+server in the same secret file.
 
 The sweep-complete message is one line. Which door served the readings — the
 page-only and id-only counts, and the verdict on the profile API — is a
