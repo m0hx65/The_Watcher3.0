@@ -36,6 +36,8 @@ Setup — two values, in a file named ``home_fetcher.env`` next to this script
 
     python home_fetcher.py --new-token     prints a fresh random token to use
     python home_fetcher.py                 runs the worker
+    python home_fetcher.py --update        replaces this file with the copy the
+                                           bot serves (no GitHub needed)
 
 Only Python 3.9+ is needed. curl_cffi (``pip install curl_cffi``) is used
 when installed — it impersonates Chrome down to the TLS handshake — but the
@@ -119,9 +121,10 @@ UPLOAD_TIMEOUT = 90
 # one fresh connection per thread per sweep.
 IDLE_RECONNECT_SECONDS = 20.0
 # What this build knows, sent with every request so the bot can tell an
-# out-of-date copy apart (2 = picks the profile block out of the two
-# `xig_user_by_username` blocks a page carries).
-WORKER_VERSION = 2
+# out-of-date copy apart. 2 = picks the profile block out of the two
+# `xig_user_by_username` blocks a page carries; 3 = can update itself from
+# the bot (--update).
+WORKER_VERSION = 3
 # When the page carries no payload (login wall, 404, block page) the bot only
 # needs enough of it to say what it was.
 NO_PAYLOAD_BODY_LIMIT = 64 * 1024
@@ -639,6 +642,53 @@ def run(url: str, token: str, worker: str) -> int:
         _log(f"{len(jobs)} job(s) taken" + (f" ({depth} waiting to fetch)" if depth > 1 else ""))
 
 
+_VERSION_LINE = re.compile(r"^WORKER_VERSION = (\d+)", re.MULTILINE)
+
+
+def self_update(url: str, token: str, worker: str, target: Optional[Path] = None) -> int:
+    """Replace this script with the copy the bot serves.
+
+    From the bot, not GitHub: the phone could not reach
+    raw.githubusercontent.com at all (2026-10-18, a two-minute connect
+    timeout), while the bot is the one server it talks to every few seconds.
+    The new copy is checked before it lands — it must compile and be the
+    worker script — and written beside this one, then moved over it in one
+    step, so a failed or partial download never leaves a broken worker.
+    The running worker keeps the old code until it is restarted."""
+    target = target or Path(__file__).resolve()
+    link = BotLink(url, token, worker)
+    try:
+        status, body = link.request("GET", "/home-fetch/worker.py", timeout=60)
+    except (http.client.HTTPException, OSError) as exc:
+        _log(f"update failed - the bot is unreachable ({exc})")
+        return 1
+    finally:
+        link.close()
+    if status != 200:
+        hint = " (check HOME_FETCH_TOKEN)" if status == 401 else ""
+        _log(f"update failed - the bot answered HTTP {status}{hint}")
+        return 1
+    try:
+        source = body.decode("utf-8")
+        compile(source, str(target), "exec")
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        _log(f"update failed - what the bot sent does not compile ({exc})")
+        return 1
+    match = _VERSION_LINE.search(source)
+    if match is None:
+        _log("update failed - what the bot sent is not the worker script")
+        return 1
+    staged = target.with_name(target.name + ".new")
+    staged.write_bytes(body)
+    os.replace(staged, target)
+    _log(
+        f"updated {target.name}: version {WORKER_VERSION} -> {match.group(1)}. "
+        "Restart it to run the new copy (start.sh does so within 10 s of "
+        "`pkill -f home_fetcher.py`)."
+    )
+    return 0
+
+
 def main() -> int:
     if "--new-token" in sys.argv:
         print(secrets.token_urlsafe(32))
@@ -650,6 +700,8 @@ def main() -> int:
             f"{ENV_FILE.name} next to this script or in the environment"
         )
         return 2
+    if "--update" in sys.argv:
+        return self_update(url, token, worker)
     try:
         return run(url, token, worker)
     except KeyboardInterrupt:

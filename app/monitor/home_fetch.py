@@ -34,6 +34,7 @@ Two things make it fast rather than merely working:
 from __future__ import annotations
 
 import asyncio
+import html
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -77,11 +78,18 @@ REEL_PAUSE_SECONDS = 1800.0
 # out of the two payload blocks a page carries; version 1 sends whichever
 # comes first, which for some accounts is always the posts grid — those
 # accounts then fail every sweep with nothing on the bot's side able to help.
-WORKER_VERSION_CURRENT = 2
+# Version 3 can update itself from this bot (`--update`).
+WORKER_VERSION_CURRENT = 3
+# Fetches the script from THIS bot (GET /home-fetch/worker.py), not GitHub:
+# the phone could not reach raw.githubusercontent.com at all (2026-10-18). It
+# reads the URL and token from the worker's own settings file, so it works
+# for any old copy — including one with no --update — and a phone that has
+# never seen the new route. start.sh restarts the worker after the pkill.
 WORKER_UPDATE_COMMAND = (
-    "cd ~/home_fetcher && curl -fsSLO https://raw.githubusercontent.com/"
-    "m0hx65/The_Watcher3.0/main/tools/home_fetcher/home_fetcher.py"
-    " && pkill -f home_fetcher.py"
+    'cd ~/home_fetcher && . ./home_fetcher.env && curl -fsS '
+    '-H "X-Watcher-Token: $HOME_FETCH_TOKEN" '
+    '"${WATCHER_URL%/}/home-fetch/worker.py" -o home_fetcher.py.new '
+    '&& mv home_fetcher.py.new home_fetcher.py && pkill -f home_fetcher.py'
 )
 
 
@@ -250,7 +258,7 @@ class HomeFetchBroker:
             "<code>home_fetcher.py</code>. It sends the wrong part of some "
             "profile pages, so those accounts fail every sweep. Update it in "
             "Termux on the phone (start.sh restarts it with the new copy):\n"
-            f"<code>{WORKER_UPDATE_COMMAND}</code>"
+            f"<code>{html.escape(WORKER_UPDATE_COMMAND, quote=False)}</code>"
         )
 
     def note_sweep(self, jobs: int) -> None:

@@ -19,6 +19,9 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
 COPY app ./app
+# The home fetcher's script, so the phone can update itself from the bot
+# (GET /home-fetch/worker.py) when it cannot reach GitHub.
+COPY tools/home_fetcher/home_fetcher.py ./tools/home_fetcher/home_fetcher.py
 
 RUN mkdir -p /app/data/media
 

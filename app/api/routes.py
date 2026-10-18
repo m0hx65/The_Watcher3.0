@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import re
 import secrets
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -216,6 +218,35 @@ async def home_fetch_next_job(
         for job in jobs
     ]
     return {"job": handed[0] if handed else None, "jobs": handed}
+
+
+# The worker script itself, bundled into the image (see the Dockerfile).
+WORKER_SCRIPT = Path(__file__).resolve().parents[2] / "tools" / "home_fetcher" / "home_fetcher.py"
+_WORKER_VERSION_RE = re.compile(r"^WORKER_VERSION = (\d+)", re.MULTILINE)
+
+
+@router.get("/home-fetch/worker.py")
+async def home_fetch_worker_script(
+    x_watcher_token: Optional[str] = Header(default=None),
+) -> Response:
+    """The current home_fetcher.py, for the phone to update itself from.
+
+    Served by the bot because the phone could not reach GitHub to update
+    (2026-10-18: raw.githubusercontent.com timed out after two minutes from
+    the phone's line) — while this host is the one server it reaches all day,
+    every few seconds. Behind the same token as the job endpoints. The
+    version rides along in X-Watcher-Worker-Version."""
+    _check_home_token(x_watcher_token)
+    try:
+        source = await asyncio.to_thread(WORKER_SCRIPT.read_text, encoding="utf-8")
+    except OSError:
+        raise HTTPException(status_code=404, detail="worker script not bundled with this build")
+    match = _WORKER_VERSION_RE.search(source)
+    return Response(
+        content=source,
+        media_type="text/x-python; charset=utf-8",
+        headers={"X-Watcher-Worker-Version": match.group(1) if match else "unknown"},
+    )
 
 
 @router.post("/home-fetch/jobs/{job_id}")

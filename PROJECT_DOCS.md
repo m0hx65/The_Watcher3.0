@@ -705,6 +705,10 @@ phone up, five accounts still failed every sweep:
   as "no profile payload". Both now pick the block with the profile's fields.
   The worker reports `X-Watcher-Version` (2 = this fix) and the bot messages
   the owner once when the phone runs an older copy, with the update command.
+  That command fetches the script from the bot (`GET /home-fetch/worker.py`,
+  token-gated, the file bundled into the image by the Dockerfile) — the
+  phone's line timed out on raw.githubusercontent.com — and from version 3
+  the worker does it itself: `python home_fetcher.py --update`.
 - A renamed or deleted account's old page is an error shell, and with the
   phone up the id route was cache-only — so "renamed", "gone" and "bad page"
   looked the same forever (@vrcuvr). A sweep check whose page fails now asks

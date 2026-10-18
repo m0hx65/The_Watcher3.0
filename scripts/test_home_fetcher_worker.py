@@ -148,9 +148,80 @@ def test_an_idle_connection_is_reopened_and_a_busy_one_kept() -> None:
         server.server_close()
 
 
+class _ScriptServer(BaseHTTPRequestHandler):
+    """Serves GET /home-fetch/worker.py the way the bot does."""
+
+    protocol_version = "HTTP/1.1"
+    status = 200
+    body = b""
+    token_seen: list = []
+
+    def do_GET(self) -> None:
+        _ScriptServer.token_seen.append(self.headers.get("X-Watcher-Token"))
+        ok = self.path == "/home-fetch/worker.py"
+        self.send_response(_ScriptServer.status if ok else 404)
+        payload = _ScriptServer.body if ok else b"{}"
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def test_the_worker_updates_itself_from_the_bot() -> None:
+    """The phone could not reach raw.githubusercontent.com (2026-10-18) but
+    reaches the bot all day, so --update takes the script from the bot. A
+    download that is refused, broken or not the worker leaves the file as it
+    was — a phone with a half-written script is a phone that stops working."""
+    import tempfile
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ScriptServer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    old_copy = b"WORKER_VERSION = 1\nprint('old')\n"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "home_fetcher.py"
+            target.write_bytes(old_copy)
+
+            _ScriptServer.status, _ScriptServer.body = 200, b"WORKER_VERSION = 99\nprint('new')\n"
+            code = hf.self_update(url, "tok", "tester", target=target)
+            expect("a good copy replaces the file", code == 0 and target.read_bytes() == _ScriptServer.body,
+                   repr((code, target.read_bytes())))
+            expect("the request carried the token", _ScriptServer.token_seen[-1] == "tok",
+                   repr(_ScriptServer.token_seen))
+            expect("nothing is left staged beside it", not (Path(tmp) / "home_fetcher.py.new").exists())
+
+            for name, status, body in (
+                ("a refused download", 401, b"no"),
+                ("a script that does not compile", 200, b"WORKER_VERSION = 4\ndef broken(:\n"),
+                ("something that is not the worker", 200, b"print('hello')\n"),
+            ):
+                target.write_bytes(old_copy)
+                _ScriptServer.status, _ScriptServer.body = status, body
+                code = hf.self_update(url, "tok", "tester", target=target)
+                expect(f"{name} leaves the old file untouched",
+                       code == 1 and target.read_bytes() == old_copy, repr((code, target.read_bytes())))
+
+            target.write_bytes(old_copy)
+            server.shutdown()
+            server.server_close()
+            code = hf.self_update(url, "tok", "tester", target=target)
+            expect("an unreachable bot fails cleanly", code == 1 and target.read_bytes() == old_copy,
+                   repr(code))
+    finally:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+
+
 def main() -> int:
     test_the_profile_block_is_picked_in_either_order()
     test_an_idle_connection_is_reopened_and_a_busy_one_kept()
+    test_the_worker_updates_itself_from_the_bot()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")
