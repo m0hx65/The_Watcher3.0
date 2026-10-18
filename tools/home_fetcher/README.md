@@ -94,6 +94,19 @@ with every poll, and if it drops to 20% while not charging (the charger fell
 out, the power went) the bot sends you one alert, another at 10%, and a
 "charging again" once it's back on power (`HOME_FETCH_LOW_BATTERY_PERCENT`).
 
+## Updating the worker
+
+The worker sends its build number with every poll, and the bot messages you
+once when the copy on the phone is out of date. To update, in Termux:
+
+    cd ~/home_fetcher && curl -fsSLO https://raw.githubusercontent.com/m0hx65/The_Watcher3.0/main/tools/home_fetcher/home_fetcher.py && pkill -f home_fetcher.py
+
+`start.sh` restarts it within 10 seconds with the new copy, and the first
+line it logs names the version (`version 2` or later). Version 2
+(2026-10-18) picks the profile out of the two payload blocks a profile page
+carries; version 1 sent whichever came first, and for some accounts that is
+always the posts grid, so those accounts failed every sweep.
+
 ## Setup on a Windows PC
 
 Same worker, same settings file. Put a shortcut to `home_fetcher.bat` in the
@@ -114,5 +127,5 @@ the bot uses it whenever it happens to be polling during a sweep.
 
 | Call | Auth | Meaning |
 |---|---|---|
-| `GET /home-fetch/jobs?wait=25&batch=8` | `X-Watcher-Token`, `X-Watcher-Worker`, `X-Watcher-Battery`, `X-Watcher-Charging` | Long-poll: `{"jobs": [{"id", "username"}, …]}` (`job` = the first, for old workers) |
+| `GET /home-fetch/jobs?wait=25&batch=8` | `X-Watcher-Token`, `X-Watcher-Worker`, `X-Watcher-Version`, `X-Watcher-Battery`, `X-Watcher-Charging` | Long-poll: `{"jobs": [{"id", "username"}, …]}` (`job` = the first, for old workers) |
 | `POST /home-fetch/jobs/<id>` | same, plus `X-IG-Status`, `X-IG-Final-Url`, `X-IG-Payload`, gzip body | Instagram's status and the page's payload (or the head of the page when it has none) |

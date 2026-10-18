@@ -105,6 +105,9 @@ _RETRIABLE_STATUSES = (401, 403, 429, 0)
 # every lookup. Read by the next sweep (one knock instead of a threshold's
 # worth) and by manual checks (skip it), cleared when a knock answers 200.
 _USERNAME_API_DOOR_KEY = "username_api_closed_at"
+# Set while sweeps are reading no counts at all (see _counts_blind_note), so a
+# restart does not announce the same standing condition a second time.
+_COUNTS_BLIND_KEY = "counts_blind_since"
 
 # `record(api_status=...)` default: "not given" is not the same as None. None
 # means the username API was deliberately not asked; not given means the
@@ -471,6 +474,12 @@ class MonitorService:
         # The last finished sweep's shape — counts and which doors served it.
         # Read by /status; None until a sweep has finished this process.
         self.last_sweep: Optional[dict] = None
+        # Whether the owner has been told that sweeps are reading no counts
+        # at all (no page door answering). Said once when it starts and once
+        # when it ends — not every sweep in between. Persisted, and loaded on
+        # the first sweep, so a restart does not say it again.
+        self._counts_blind_announced = False
+        self._counts_blind_loaded = False
         # (account_id, item pk) -> consecutive failed downloads. See
         # _DOWNLOAD_ATTEMPTS.
         self._download_failures: dict[tuple[Optional[int], str], int] = {}
@@ -1326,6 +1335,9 @@ class MonitorService:
                     f"{deferred} account(s) deferred to avoid making it "
                     "worse. They'll retry shortly / next sweep."
                 )
+            summary += await self._counts_blind_note(
+                checked=checked, with_counts=answered - id_only
+            )
         if backfill_ids:
             async with get_session() as session:
                 accounts_after = await crud.list_accounts(session, only_active=True)
@@ -1382,6 +1394,73 @@ class MonitorService:
         if id_backfill is not None:
             result["id_backfill"] = id_backfill
         return result
+
+    async def _counts_blind_note(self, *, checked: int, with_counts: int) -> str:
+        """A summary line for the moment sweeps stop reading counts — and the
+        moment they start again. "" for every sweep in between.
+
+        With the profile API login-walled, the counts, bio and privacy flag
+        come only from the profile page, and Instagram serves that page only
+        to an IP it trusts. When neither this host nor the home fetcher gets
+        it, every check falls back to the numeric-id route: username, picture
+        and story status, nothing else. The summary still said "17 profiles
+        checked", which read as a healthy sweep — and the owner was left
+        asking why the tool had stopped working. A standing condition, so it
+        is said when it starts and when it ends, not on every sweep.
+        """
+        blind = checked > 0 and with_counts == 0
+        if not self._counts_blind_loaded:
+            try:
+                async with get_session() as session:
+                    raw = await crud.get_setting(session, _COUNTS_BLIND_KEY)
+                self._counts_blind_announced = raw is not None
+                self._counts_blind_loaded = True
+            except Exception as exc:  # unknown: say nothing rather than repeat
+                logger.warning("Could not read the counts-blind flag: {}", exc)
+                return ""
+        if blind and not self._counts_blind_announced:
+            self._counts_blind_announced = True
+            await self._persist_counts_blind(True)
+            if not settings.home_fetch_token:
+                home = "no home fetcher is set up (HOME_FETCH_TOKEN)"
+            elif not home_fetch.broker.connected:
+                home = f"the home fetcher is {home_fetch.broker.describe()}"
+            elif home_fetch.broker.outdated:
+                home = "the home fetcher runs an out-of-date home_fetcher.py"
+            else:
+                home = "the home fetcher's pages carried no profile either"
+            here = (
+                "Instagram is refusing this server's own profile-page requests"
+                if self.instagram.direct_page_door_failing
+                else "this server's own page requests got no profile"
+            )
+            logger.warning(
+                "No counts this sweep: {}, and {}", here, home,
+            )
+            return (
+                f"\n📵 No follower/following counts this sweep — {here}, and "
+                f"{esc(home)}. Without the page a check can only read the "
+                "username, picture and story status. Start the phone's home "
+                "fetcher to get full readings back."
+            )
+        if not blind and with_counts > 0 and self._counts_blind_announced:
+            self._counts_blind_announced = False
+            await self._persist_counts_blind(False)
+            return "\n📊 Follower/following counts are being read again."
+        return ""
+
+    async def _persist_counts_blind(self, blind: bool) -> None:
+        try:
+            async with get_session() as session:
+                if blind:
+                    await crud.set_setting(
+                        session, _COUNTS_BLIND_KEY,
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                else:
+                    await crud.delete_setting(session, _COUNTS_BLIND_KEY)
+        except Exception as exc:  # the in-memory flag still stands
+            logger.warning("Could not persist the counts-blind flag: {}", exc)
 
     # ---------- Went-dark radar ----------
 
@@ -1808,19 +1887,7 @@ class MonitorService:
             )
             timings[f"id/{probe.via}" if probe.via else "id"] = time.monotonic() - clock
             if probe.gone:
-                # The id itself no longer resolves: deactivated, deleted or
-                # banned. Not a rename — a rename keeps the id.
-                gone = ProfileFetchResult(
-                    username=username, http_status=404,
-                    error="the stored Instagram ID no longer resolves",
-                )
-                result = await self._handle_failure(
-                    account_id, username, gone, id_probe=probe
-                )
-                result["id_status"] = probe.status
-                result["api_status"] = None
-                result["timings"] = timings
-                return result
+                return await self._id_gone(account_id, username, probe, timings)
             if probe.answered and probe.username and probe.username != username:
                 username = await self._apply_rename(
                     account_id, username, probe.username
@@ -1846,6 +1913,28 @@ class MonitorService:
         )
         timings["username side"] = time.monotonic() - clock
         timings.update(fetch.timings)
+
+        if not fetch.success and probe is not None and probe.via == "cache-miss":
+            # The sweep skipped the live id route because the phone's page was
+            # going to answer — and the page did not. Ask by id now, through
+            # the Worker only (the phone already had its turn). Without this a
+            # renamed or deleted account failed every sweep in silence: its
+            # old username's page is an error shell, and the one route that
+            # can tell "renamed" from "gone" from "bad page" was never asked.
+            # One Worker call, and only for an account that has otherwise
+            # failed.
+            clock = time.monotonic()
+            probe = await self.instagram.probe_by_id(
+                instagram_id, ask_phone=False
+            )
+            timings[f"id/{probe.via or 'live'}"] = time.monotonic() - clock
+            if probe.gone:
+                return await self._id_gone(account_id, username, probe, timings)
+            if probe.answered and probe.username and probe.username != username:
+                username = await self._apply_rename(
+                    account_id, username, probe.username
+                )
+
         id_status = probe.status if probe is not None else None
         if fetch.success:
             clock = time.monotonic()
@@ -1899,6 +1988,24 @@ class MonitorService:
         )
         result["id_status"] = id_status
         result["api_status"] = fetch.api_status
+        result["timings"] = timings
+        return result
+
+    async def _id_gone(
+        self, account_id: int, username: str, probe: IdProbe,
+        timings: dict[str, float],
+    ) -> dict:
+        """The stored id itself no longer resolves: deactivated, deleted or
+        banned. Not a rename — a rename keeps the id."""
+        gone = ProfileFetchResult(
+            username=username, http_status=404,
+            error="the stored Instagram ID no longer resolves",
+        )
+        result = await self._handle_failure(
+            account_id, username, gone, id_probe=probe
+        )
+        result["id_status"] = probe.status
+        result["api_status"] = None
         result["timings"] = timings
         return result
 

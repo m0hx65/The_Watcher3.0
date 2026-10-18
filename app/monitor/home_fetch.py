@@ -72,6 +72,18 @@ KINDS = (KIND_PAGE, KIND_REEL)
 REEL_REFUSALS_BEFORE_PAUSE = 2
 REEL_PAUSE_SECONDS = 1800.0
 
+# The worker build this bot expects (tools/home_fetcher WORKER_VERSION). A
+# copy that sends no version is 1. Version 2 (2026-10-18) picks the profile
+# out of the two payload blocks a page carries; version 1 sends whichever
+# comes first, which for some accounts is always the posts grid — those
+# accounts then fail every sweep with nothing on the bot's side able to help.
+WORKER_VERSION_CURRENT = 2
+WORKER_UPDATE_COMMAND = (
+    "cd ~/home_fetcher && curl -fsSLO https://raw.githubusercontent.com/"
+    "m0hx65/The_Watcher3.0/main/tools/home_fetcher/home_fetcher.py"
+    " && pkill -f home_fetcher.py"
+)
+
 
 @dataclass
 class PageJob:
@@ -144,6 +156,12 @@ class HomeFetchBroker:
         # The reel route's standing with Instagram, from this home line.
         self._reel_refusals = 0
         self._reel_paused_until = 0.0
+        # Which build of the worker script last polled, and the workers the
+        # owner has already been told are out of date — by name, so a phone
+        # on an old build and a PC on a new one, polling in turn, do not
+        # re-arm each other's alert on every poll.
+        self.worker_version: Optional[int] = None
+        self._outdated_alerted: set[str] = set()
 
     # ----------------------------------------------------------- state
 
@@ -189,11 +207,51 @@ class HomeFetchBroker:
                 else ", charging" if self.charging else ", not charging"
             )
             battery = f", battery {self.battery}%{state}"
+        if self.outdated:
+            battery += f", OUT-OF-DATE script v{self.worker_version}"
         if self.connected:
             return f"connected ({who}, last poll {seen:.0f}s ago{battery})"
         minutes = seen / 60.0
         ago = f"{seen:.0f}s" if minutes < 1 else f"{minutes:.0f} min"
         return f"not connected ({who} last polled {ago} ago{battery})"
+
+    @property
+    def outdated(self) -> bool:
+        return (
+            self.worker_version is not None
+            and self.worker_version < WORKER_VERSION_CURRENT
+        )
+
+    def note_version(self, raw: Optional[str]) -> Optional[str]:
+        """Record the worker's build (X-Watcher-Version; absent = 1) and
+        return the alert to send when it is out of date — once per worker per
+        process, not once per poll. An up-to-date poll from that worker (it
+        was updated) re-arms it."""
+        try:
+            version = int(raw) if raw else 1
+        except ValueError:
+            version = 1
+        self.worker_version = version
+        name = self._worker or ""
+        if not self.outdated:
+            self._outdated_alerted.discard(name)
+            return None
+        if name in self._outdated_alerted:
+            return None
+        self._outdated_alerted.add(name)
+        who = f"the home fetcher ({self._worker})" if self._worker else "the home fetcher"
+        logger.warning(
+            "{} runs home_fetcher.py v{}; this bot expects v{} — some "
+            "accounts' pages will come back without their profile until it "
+            "is updated", who, version, WORKER_VERSION_CURRENT,
+        )
+        return (
+            f"📱 <b>{who[0].upper() + who[1:]}</b> is running an out-of-date "
+            "<code>home_fetcher.py</code>. It sends the wrong part of some "
+            "profile pages, so those accounts fail every sweep. Update it in "
+            "Termux on the phone (start.sh restarts it with the new copy):\n"
+            f"<code>{WORKER_UPDATE_COMMAND}</code>"
+        )
 
     def note_sweep(self, jobs: int) -> None:
         """How many answers the phone delivered during the sweep that just

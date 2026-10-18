@@ -132,6 +132,7 @@ class FakeBroker:
 
     def __init__(self, *, connected: bool = True) -> None:
         self.connected = connected
+        self.outdated = False
         self.cache: dict[str, home_fetch.PageResult] = {}
         self.reel_cache: dict[str, home_fetch.PageResult] = {}
         self.asked: list[str] = []

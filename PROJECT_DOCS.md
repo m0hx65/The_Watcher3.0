@@ -678,6 +678,36 @@ ANYTHING for a minute, so a reel nobody can have costs the phone the page
 door it exists for — which is how a live page request came to time out at
 30 s. Pages are never held back by this.
 
+**2026-10-18 — the phone is the route again, and four things it got wrong.**
+Instagram now sends this host's page requests to its login page (Render's
+~416 KB "page" with no payload is the 417 KB `/accounts/login/?next=…`
+page; `_probe_page_direct` now names that), the Worker's `?page=` route is
+still 429, and the profile Relay query by `doc_id` answers `null` to a
+logged-out caller even with a real LSD token. So without the phone (or a
+residential proxy) a sweep reads usernames, avatars and story status by id
+and no counts at all — the summary says so once when it starts and once when
+it ends (`_counts_blind_note`, persisted as `counts_blind_since`). With the
+phone up, five accounts still failed every sweep:
+
+- A profile page carries `"xig_user_by_username"` **twice** — the profile
+  query and the posts-grid query (`pk`, `id`, timeline only) — in either
+  order. Both the bot's parser and the worker took the first; grid-first
+  accounts (@leen_m204, @jeeda.younes, @talia.takheen, @__ralanee__) failed
+  as "no profile payload". Both now pick the block with the profile's fields.
+  The worker reports `X-Watcher-Version` (2 = this fix) and the bot messages
+  the owner once when the phone runs an older copy, with the update command.
+- A renamed or deleted account's old page is an error shell, and with the
+  phone up the id route was cache-only — so "renamed", "gone" and "bad page"
+  looked the same forever (@vrcuvr). A sweep check whose page fails now asks
+  by id through the Worker (`probe_by_id(ask_phone=False)`) before giving up.
+- The phone's upload connections sat idle between sweeps and a NAT forgot
+  them silently: pages fetched in ~2 s reached the bot 111 s after pickup, as
+  each upload sat out the 90 s timeout. `BotLink` reopens a connection idle
+  for more than `IDLE_RECONNECT_SECONDS` (20 s).
+- A cached page with no payload was parsed and logged twice per check, and
+  the failure said only "username API skipped"; it now names each page
+  door's answer.
+
 The sweep-complete message is one line. Which door served the readings — the
 page-only and id-only counts, and the verdict on the profile API — is a
 standing condition rather than an event, so it is recorded in

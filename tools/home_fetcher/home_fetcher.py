@@ -109,6 +109,19 @@ SOFT_BLOCK_PAUSE_SECONDS = 60.0
 # Uploads run here so a slow link never holds up the next fetch or poll.
 UPLOAD_THREADS = 2
 UPLOAD_TIMEOUT = 90
+# A kept connection left unused this long is reopened before the next request.
+# The upload threads sit idle for the whole gap between sweeps, and a phone's
+# VPN or carrier NAT forgets an idle connection without telling either end:
+# the next upload went out into nothing and waited the full UPLOAD_TIMEOUT for
+# a reply. Measured 2026-10-18: pages fetched in ~2 s each reached the bot
+# 111 s after pickup, all at once, as both upload threads came back from that
+# timeout. Within a sweep the uploads are seconds apart, so this only costs
+# one fresh connection per thread per sweep.
+IDLE_RECONNECT_SECONDS = 20.0
+# What this build knows, sent with every request so the bot can tell an
+# out-of-date copy apart (2 = picks the profile block out of the two
+# `xig_user_by_username` blocks a page carries).
+WORKER_VERSION = 2
 # When the page carries no payload (login wall, 404, block page) the bot only
 # needs enough of it to say what it was.
 NO_PAYLOAD_BODY_LIMIT = 64 * 1024
@@ -278,6 +291,10 @@ def _fetch_with_stdlib(url: str, headers: dict) -> tuple[int, bytes, str]:
 
 _PAYLOAD_KEY = '"xig_user_by_username":'
 _OBJECT_LIMIT = 200_000
+# The page carries the key twice (see extract_payload); the cap only bounds a
+# malformed page.
+_MAX_OCCURRENCES = 8
+_PROFILE_MARKERS = ("follower_count", "following_count", "is_private")
 
 
 def _extract_object(text: str, start: int) -> Optional[str]:
@@ -313,15 +330,29 @@ def _extract_object(text: str, start: int) -> Optional[str]:
 def extract_payload(body: bytes) -> Optional[bytes]:
     """The profile payload out of the page, wrapped so the bot's parser reads
     it exactly as it reads the page — a few KB instead of 700 KB. None when
-    the page carries none (login wall, 404, block page)."""
+    the page carries none (login wall, 404, block page).
+
+    The key appears twice: once for the profile, once for the posts grid
+    (pk, id and the timeline only), in either order. Taking the first one
+    sent the bot the grid block for some accounts every sweep (measured
+    2026-10-18), so this picks the block that has the profile's fields."""
     text = body.decode("utf-8", "replace")
-    at = text.find(_PAYLOAD_KEY)
-    if at < 0:
-        return None
-    raw = _extract_object(text, at + len(_PAYLOAD_KEY))
-    if raw is None:
-        return None
-    return ('{"data":{' + _PAYLOAD_KEY + raw + "}}").encode("utf-8")
+    start = 0
+    for _ in range(_MAX_OCCURRENCES):
+        at = text.find(_PAYLOAD_KEY, start)
+        if at < 0:
+            return None
+        start = at + len(_PAYLOAD_KEY)
+        raw = _extract_object(text, start)
+        if raw is None:
+            continue
+        try:
+            block = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(block, dict) and any(k in block for k in _PROFILE_MARKERS):
+            return ('{"data":{' + _PAYLOAD_KEY + raw + "}}").encode("utf-8")
+    return None
 
 
 # ------------------------------------------------------------- the device
@@ -390,6 +421,7 @@ class BotLink:
         self._token = token
         self._worker = worker
         self._conn: Optional[http.client.HTTPConnection] = None
+        self._last_used = 0.0
         self.connects = 0
         self.last_connect_seconds = 0.0
 
@@ -422,9 +454,12 @@ class BotLink:
         all_headers = {
             "X-Watcher-Token": self._token,
             "X-Watcher-Worker": self._worker,
+            "X-Watcher-Version": str(WORKER_VERSION),
             "Connection": "keep-alive",
             **(headers or {}),
         }
+        if self._conn is not None and time.monotonic() - self._last_used > IDLE_RECONNECT_SECONDS:
+            self.close()  # likely forgotten by a NAT on the way — see IDLE_RECONNECT_SECONDS
         last_error: Optional[Exception] = None
         for attempt in (1, 2):
             conn = self._conn
@@ -437,6 +472,7 @@ class BotLink:
                              body=body if method == "POST" else None, headers=all_headers)
                 response = conn.getresponse()
                 data = response.read()
+                self._last_used = time.monotonic()
                 if response.getheader("Connection", "").lower() == "close":
                     self.close()
                 return response.status, data
@@ -528,7 +564,7 @@ def _fetch_loop(url: str, token: str, worker: str,
 
 
 def run(url: str, token: str, worker: str) -> int:
-    _log(f"polling {url} as '{worker}'  (engine: {ENGINE})")
+    _log(f"polling {url} as '{worker}'  (engine: {ENGINE}, version {WORKER_VERSION})")
     percent, charging = read_battery()
     if percent is not None:
         state = "charging" if charging else "not charging" if charging is not None else "unknown"

@@ -277,6 +277,18 @@ def _parse_user(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
+def _is_grid_block_only(body: str) -> bool:
+    """True for the posts-grid payload block on its own — what an old phone
+    script sends when the grid block came first on the page. Small, carries
+    the timeline connection, and none of the profile's fields."""
+    return (
+        len(body) < 4096
+        and '"polaris_ordered_timeline_connection"' in body
+        and '"follower_count"' not in body
+        and '"is_private"' not in body
+    )
+
+
 class _SessionLike(Protocol):
     async def get(self, url: str, *, params: Any = ..., headers: Any = ...) -> Any: ...
     async def close(self) -> None: ...
@@ -474,7 +486,7 @@ class InstagramClient:
         return parsed
 
     async def probe_by_id(
-        self, user_id: str, *, cached_ok: bool = False
+        self, user_id: str, *, cached_ok: bool = False, ask_phone: bool = True
     ) -> IdProbe:
         """Ask Instagram about a NUMERIC id and report exactly what it said.
 
@@ -489,6 +501,10 @@ class InstagramClient:
         refusing lately, in which case the phone is asked live first and the
         Worker only when the phone has nothing. The Worker's refusal costs
         ~9 s of upstream retries; the phone answers in about one.
+
+        `ask_phone=False` keeps the phone out of the live routes: a sweep
+        that has to ask after all (its page failed) must not then sit on a
+        live phone request — the phone already had its chance at the page.
         """
         probe = IdProbe(user_id=str(user_id or ""))
         if not probe.user_id:
@@ -497,7 +513,7 @@ class InstagramClient:
         if cached is not None:
             return await self._fill_probe(probe, 200, cached, via="cache")
 
-        phone = settings.home_fetch_token and home_fetch.broker.connected
+        phone = bool(settings.home_fetch_token and home_fetch.broker.connected)
         if cached_ok and settings.home_fetch_token:
             home = home_fetch.broker.cached_reel(probe.user_id)
             if home is not None:
@@ -514,6 +530,7 @@ class InstagramClient:
             probe.via = "cache-miss"
             return probe
 
+        phone = phone and ask_phone
         worker_refusing = time.monotonic() < self._worker_reel_blocked_until
         order = ["home", "worker"] if (phone and worker_refusing) else ["worker", "home"]
         status, parsed = 0, None
@@ -962,7 +979,7 @@ class InstagramClient:
         timings: dict[str, float] = {"api": time.monotonic() - started}
         if allow_fallback and last_status in (401, 403):
             page_started = time.monotonic()
-            fallback = await self.fetch_profile_via_public_page(
+            fallback, outcome = await self._page_fallback(
                 username, cached_page_ok=cached_page_ok
             )
             timings["page"] = time.monotonic() - page_started
@@ -970,6 +987,13 @@ class InstagramClient:
                 fallback.api_status = api_status
                 fallback.timings = {**fallback.timings, **timings}
                 return fallback
+            # Say why the page doors failed too. The API's refusal alone read
+            # as the whole story ("username API skipped …") on accounts whose
+            # real problem was the page — the cause was in the log only for
+            # whoever went looking two lines up.
+            page_error = self._describe_page_failure(outcome)
+            if page_error:
+                last_error = f"{last_error or f'HTTP {last_status}'}; page: {page_error}"
 
         # Record the terminal outcome once per fetch (retries within a single
         # fetch are one logical attempt against the endpoint).
@@ -982,9 +1006,21 @@ class InstagramClient:
             timings=timings,
         )
 
-    async def fetch_profile_via_public_page(
+    @staticmethod
+    def _describe_page_failure(outcome: dict[str, Any]) -> str:
+        """The page doors' failure in one phrase: each door that was asked
+        and what it said, e.g. "direct: skipped …; home: no profile payload"."""
+        parts = []
+        door = outcome.get("door") or "direct"
+        if outcome.get("error"):
+            parts.append(f"{door}: {outcome['error']}")
+        if outcome.get("home_error") and door != "home":
+            parts.append(f"home: {outcome['home_error']}")
+        return "; ".join(parts)
+
+    async def _page_fallback(
         self, username: str, *, cached_page_ok: bool = False
-    ) -> Optional[ProfileFetchResult]:
+    ) -> tuple[Optional[ProfileFetchResult], dict[str, Any]]:
         """Profile data from the page's embedded Relay payload, or None.
 
         Deliberately NOT routed through the Worker: sent directly, this request
@@ -999,12 +1035,20 @@ class InstagramClient:
         reels_count, story_count or is_business. Absent is not empty — the
         caller carries those forward rather than writing a None over them.
 
-        Returns None when the page is blocked or carries no payload, leaving the
-        caller's original error intact. Never returns zeros for missing data.
+        Returns (None, outcome) when the page is blocked or carries no
+        payload — the caller's error stands, and `outcome` says what each door
+        answered so the failure can name it. Never returns zeros for missing
+        data.
         """
         outcome = await self.probe_public_page(
             username, cached_page_ok=cached_page_ok
         )
+        return self._page_result(username, outcome), outcome
+
+    @staticmethod
+    def _page_result(
+        username: str, outcome: dict[str, Any]
+    ) -> Optional[ProfileFetchResult]:
         parsed = outcome.get("parsed")
         if parsed is None:
             if outcome.get("status") == 404:
@@ -1060,6 +1104,7 @@ class InstagramClient:
         Instagram. Learning that from a log needs the log to contain it.
         """
         timings: dict[str, float] = {}
+        in_hand: Optional[dict[str, Any]] = None
         # The answer may already be here. A sweep hands the phone its whole
         # list up front, so by the time this account is checked its page is
         # usually sitting in the broker — free, in memory, no wait. Taking it
@@ -1103,10 +1148,16 @@ class InstagramClient:
             return result
         if not settings.home_fetch_token:
             return result
-        clock = time.monotonic()
-        home = await self.probe_home_page(username, cached_ok=cached_page_ok)
-        timings["home"] = time.monotonic() - clock
-        home["timings"] = timings
+        if in_hand is not None:
+            # The phone's answer was already read above, and asking the home
+            # door again with the same `cached_ok` returns that very page —
+            # parsed and logged a second time, for the same nothing.
+            home = in_hand
+        else:
+            clock = time.monotonic()
+            home = await self.probe_home_page(username, cached_ok=cached_page_ok)
+            timings["home"] = time.monotonic() - clock
+            home["timings"] = timings
         if home.get("parsed") is not None or home.get("status") == 404:
             return home
         # Neither door answered — report this host's own outcome, and note the
@@ -1213,7 +1264,19 @@ class InstagramClient:
         # loop even when it is fast.
         parsed = await asyncio.to_thread(parse_public_profile, body, username)
         result["parsed"] = parsed
-        if parsed is None:
+        final_url = str(getattr(response, "url", "") or "")
+        if parsed is None and "/accounts/login" in final_url:
+            # Instagram sent this host to its login page instead of the
+            # profile — the refusal it gives an IP it does not trust (measured
+            # 2026-10-18: Render's ~416 KB "page" was the 417 KB login page).
+            # Not a markup change, and nothing in the parser can fix it.
+            result["error"] = "redirected to the login page"
+            logger.info(
+                "Public page for @{}: Instagram redirected this host to its "
+                "login page ({} bytes) — the page door is shut to this IP",
+                username, len(body),
+            )
+        elif parsed is None:
             result["error"] = "no profile payload in the page"
             logger.info(
                 "Public page for @{} was served ({} bytes) but carried no "
@@ -1276,7 +1339,22 @@ class InstagramClient:
             return result
         parsed = await asyncio.to_thread(parse_public_profile, page.body, username)
         result["parsed"] = parsed
-        if parsed is None:
+        if parsed is None and _is_grid_block_only(page.body):
+            # A home_fetcher.py from before 2026-10-18 extracts the FIRST of
+            # the page's two payload blocks, and for some accounts that is
+            # always the posts grid. Nothing here can recover the profile
+            # from it — the phone's copy of the script has to be updated.
+            result["error"] = (
+                "the home fetcher sent the posts-grid block instead of the "
+                "profile — its home_fetcher.py is out of date"
+            )
+            logger.warning(
+                "Home fetcher: page for @{} came back as the posts-grid block, "
+                "not the profile — the phone runs an out-of-date "
+                "home_fetcher.py; update it (see tools/home_fetcher/README.md)",
+                username,
+            )
+        elif parsed is None:
             result["error"] = "no profile payload in the page"
             head = " ".join(page.body[:160].split())
             logger.info(

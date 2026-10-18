@@ -176,6 +176,7 @@ async def home_fetch_next_job(
     x_watcher_battery: Optional[str] = Header(default=None),
     x_watcher_charging: Optional[str] = Header(default=None),
     x_watcher_kinds: Optional[str] = Header(default=None),
+    x_watcher_version: Optional[str] = Header(default=None),
 ) -> dict:
     """Long-poll for the next pages to fetch — up to `batch` of them (capped),
     waiting only for the first. Answers {"job": null, "jobs": []} after
@@ -200,6 +201,9 @@ async def home_fetch_next_job(
     )
     if alert:
         spawn(_send_alert(request, alert), name="home-fetch:battery-alert")
+    outdated = home_fetch.broker.note_version(x_watcher_version)
+    if outdated:
+        spawn(_send_alert(request, outdated), name="home-fetch:outdated-alert")
     kinds = None
     if x_watcher_kinds:
         kinds = [k.strip() for k in x_watcher_kinds.split(",") if k.strip()]

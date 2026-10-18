@@ -62,6 +62,12 @@ _SCAN_LIMIT = 4_000_000
 # on malformed input.
 _OBJECT_LIMIT = 200_000
 _KEY = '"xig_user_by_username":'
+# The page carries the key more than once — see `_profile_object`. Two
+# occurrences on every capture so far; the cap only bounds a malformed page.
+_MAX_OCCURRENCES = 8
+# Fields only the PROFILE block has. The posts-grid block that shares its key
+# carries pk, id and the timeline connection, and none of these.
+_PROFILE_MARKERS = ("follower_count", "following_count", "is_private")
 
 # What the payload is trusted for. Everything else Instagram's API returns
 # (reels_count, story_count, is_business) is absent here and must stay absent
@@ -124,6 +130,37 @@ def _extract_object(page: str, start: int) -> Optional[str]:
     return None
 
 
+def _profile_object(window: str, username: str) -> Optional[dict[str, Any]]:
+    """The profile block among the page's `xig_user_by_username` blocks.
+
+    The page preloads two Relay queries under that same key: the profile
+    (PolarisLoggedOutDesktopWWWProfileRootContentQuery — counts, bio, flags)
+    and the posts grid (…ProfilePostsTabContentQuery — just pk, id and the
+    timeline). Instagram streams them in either order: measured 2026-10-18,
+    @65xim and @whos.lisianna came profile-first, @leen_m204, @jeeda.younes
+    and @talia.takheen grid-first, and @95rxi both ways on two fetches a
+    minute apart. Taking the first occurrence failed every grid-first page
+    as "no profile payload", the same accounts sweep after sweep.
+    """
+    start = 0
+    for _ in range(_MAX_OCCURRENCES):
+        key_at = window.find(_KEY, start)
+        if key_at < 0:
+            return None
+        start = key_at + len(_KEY)
+        raw = _extract_object(window, start)
+        if raw is None:
+            continue
+        try:
+            block = json.loads(raw)
+        except ValueError:
+            logger.debug("A payload block for @{} was not valid JSON", username)
+            continue
+        if isinstance(block, dict) and any(k in block for k in _PROFILE_MARKERS):
+            return block
+    return None
+
+
 def _text(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -153,19 +190,8 @@ def parse_public_profile(page: str, username: str) -> Optional[dict[str, Any]]:
     if not page:
         return None
 
-    window = page[:_SCAN_LIMIT]
-    key_at = window.find(_KEY)
-    if key_at < 0:
-        return None
-    raw = _extract_object(window, key_at + len(_KEY))
-    if raw is None:
-        return None
-    try:
-        user = json.loads(raw)
-    except ValueError:
-        logger.debug("Profile payload for @{} was not valid JSON", username)
-        return None
-    if not isinstance(user, dict):
+    user = _profile_object(page[:_SCAN_LIMIT], username)
+    if user is None:
         return None
 
     parsed: dict[str, Any] = {}

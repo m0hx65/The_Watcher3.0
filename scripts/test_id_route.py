@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 from unittest.mock import AsyncMock
@@ -477,8 +478,11 @@ async def test_a_shut_username_door_does_not_stop_the_sweep() -> None:
     expect("the sweep did NOT stop", "Sweep stopped" not in summary, summary)
     # Which door served the readings is a standing condition, not an event:
     # it is recorded for /status rather than repeated in the notification.
-    expect("the sweep message is one line, not four",
-           "\n" not in summary, summary)
+    # The one line allowed is the notice that NO counts were read — said when
+    # that starts, not every sweep (see test_no_counts_is_said_once).
+    _first, _, rest = summary.partition("\n")
+    expect("the sweep message is one line plus the no-counts notice, not four",
+           rest.startswith("📵") and "\n" not in rest, summary)
     last = ig.service.last_sweep
     expect("but /status can say the checks were id-only",
            last["id_only"] == 6, repr(last))
@@ -825,6 +829,7 @@ class FakeBroker:
     def __init__(self, pages: dict, *, connected: bool = True) -> None:
         self.pages = pages
         self.connected = connected
+        self.outdated = False
         self.asked: list[str] = []
         self.prefetched: list[str] = []
         self.prefetched_reels: list[tuple[str, str]] = []
@@ -1086,6 +1091,198 @@ async def test_probe_reports_what_instagram_said() -> None:
         settings.ig_proxy_url = old
 
 
+# ---------- 5. the 2026-10-18 sweep: the page fails with the phone up ---------
+
+class _CacheMissInstagram(ScriptedInstagram):
+    """The phone is up, so a sweep's first probe reads its cache only (and
+    misses); any later probe is the live one, answered by `self.probe`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.probe_kwargs: list[dict] = []
+
+    async def probe_by_id(self, user_id: str, **kw) -> IdProbe:
+        self.probe_kwargs.append(dict(kw))
+        self.probe_calls.append(str(user_id))
+        if kw.get("cached_ok"):
+            return IdProbe(user_id=str(user_id), via="cache-miss")
+        probe = self.probe(str(user_id))
+        probe.via = probe.via or "worker"
+        return probe
+
+
+async def test_a_failed_page_is_asked_about_by_id() -> None:
+    """@vrcuvr's page came back as an error shell sweep after sweep, and with
+    the phone up the id route was never asked live — so a rename or a deleted
+    account looked exactly like a bad page, forever. Now the id is asked, by
+    the Worker only (the phone already had its turn at the page)."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    home_fetch.broker = FakeBroker({}, connected=True)
+    await _set_door(True)
+    try:
+        async with get_session() as session:
+            for a in await crud.list_accounts(session, only_active=True):
+                await crud.set_account_active(session, a.username, False)
+        renamed_id = await _new_account("vrcuvr", instagram_id="3000")
+        await _new_account("deleted_one", instagram_id="3001")
+        await _new_account("still_blocked", instagram_id="3002")
+        ig = _CacheMissInstagram()
+        ig.profile = lambda u: ProfileFetchResult(
+            username=u, http_status=401,
+            error="username API skipped; page: home: no profile payload in the page",
+        )
+        answers = {
+            "3000": _answered("3000", "vrcuvr_new"),
+            "3001": IdProbe(user_id="3001", status=404),
+            "3002": IdProbe(user_id="3002", status=401),
+        }
+        ig.probe = lambda i: answers[i]
+        service = _service(ig)
+        result = await service.check_all()
+        texts = _sent(service)
+
+        live = [kw for kw in ig.probe_kwargs if not kw.get("cached_ok")]
+        expect("each failed page was followed by one live id probe",
+               len(live) == 3, repr(ig.probe_kwargs))
+        expect("and none of them waits on the phone",
+               all(kw.get("ask_phone") is False for kw in live), repr(live))
+        async with get_session() as session:
+            account = await session.get(MonitoredAccount, renamed_id)
+        expect("the rename found by id is persisted", account.username == "vrcuvr_new",
+               account.username)
+        expect("and announced", any("vrcuvr_new" in t and "vrcuvr" in t for t in texts),
+               repr(texts))
+        expect("the renamed account reads as an id-only answer, not a failure",
+               result["id_only"] == 1, repr(result))
+        expect("the deleted account is said to be gone at once",
+               any("deleted_one" in t for t in texts if "Sweep" not in t), repr(texts))
+        expect("the still-blocked one stays a failure", "@still_blocked" in texts[-1],
+               texts[-1])
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
+GRID_ONLY = (
+    '{"data":{"xig_user_by_username":{"pk":"58510515250","polaris_ordered_timeline_connection":'
+    '{"edges":[],"page_info":{"end_cursor":null,"has_next_page":false}},"id":"17841400000000000"}}}'
+)
+
+
+async def test_a_bad_page_in_hand_is_read_once_and_named() -> None:
+    """Each failing account's cached page was parsed and logged twice per
+    check, and the failure said only "username API skipped" — the page's
+    real problem (an out-of-date phone script sending the posts-grid block)
+    was two log lines up."""
+    from app.monitor import instagram as instagram_mod
+
+    old_proxy, old_token, old_broker = (
+        settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker
+    )
+    settings.ig_proxy_url = "https://ig-proxy.example.workers.dev"
+    settings.home_fetch_token = "sekrit"
+    fake = FakeBroker({}, connected=True)
+    fake.cache["talia"] = home_fetch.PageResult(200, GRID_ONLY, "https://www.instagram.com/talia/")
+    home_fetch.broker = fake
+    real_parse = instagram_mod.parse_public_profile
+    parses: list[str] = []
+
+    def counting(body: str, username: str):
+        parses.append(username)
+        return real_parse(body, username)
+
+    instagram_mod.parse_public_profile = counting
+    session = _MockSession(lambda url, p: _MockResponse(429, {}, text=""))
+    try:
+        async with InstagramClient(max_retries=5, session=session) as client:
+            client._direct_page_blocked_until = time.monotonic() + 600  # door known shut
+            result = await client.fetch_profile(
+                "talia", auth_attempts=1, api=False, cached_page_ok=True,
+            )
+        expect("the check fails", not result.success and result.http_status == 401, repr(result))
+        expect("the page in hand was parsed once, not twice", parses == ["talia"], repr(parses))
+        expect("the phone was not asked again", fake.asked == [], repr(fake.asked))
+        expect("the failure names the page's problem, not just the API",
+               "page:" in (result.error or "") and "out of date" in (result.error or ""),
+               repr(result.error))
+    finally:
+        instagram_mod.parse_public_profile = real_parse
+        settings.ig_proxy_url, settings.home_fetch_token, home_fetch.broker = (
+            old_proxy, old_token, old_broker
+        )
+
+
+class _RedirectedResponse(_MockResponse):
+    def __init__(self, status_code: int, text: str, url: str) -> None:
+        super().__init__(status_code, {}, text=text)
+        self.url = url
+
+
+async def test_a_login_redirect_is_called_one() -> None:
+    """Render's 416 KB "page" with no payload was Instagram's login page
+    (417 KB, measured 2026-10-18) — a shut door, not a markup change."""
+    login = "https://www.instagram.com/accounts/login/?next=%2Fpageuser%2F&source=omni_redirect"
+    session = _MockSession(lambda url, p: _RedirectedResponse(200, "<html>Log in</html>", login))
+    async with InstagramClient(max_retries=1, session=session) as client:
+        probe = await client.probe_public_page("pageuser", allow_home=False, force_direct=True)
+    expect("a redirect to the login page is named as such",
+           probe.get("error") == "redirected to the login page", repr(probe.get("error")))
+    session = _MockSession(lambda url, p: _RedirectedResponse(
+        200, "<html>shell</html>", "https://www.instagram.com/pageuser/"))
+    async with InstagramClient(max_retries=1, session=session) as client:
+        probe = await client.probe_public_page("pageuser", allow_home=False, force_direct=True)
+    expect("a served page without a payload is still just that",
+           probe.get("error") == "no profile payload in the page", repr(probe.get("error")))
+
+
+async def test_no_counts_is_said_once() -> None:
+    """With the page shut to this server and the phone off, every check was
+    id-only and the summary still read "17 profiles checked" — so the owner
+    asked why the tool had stopped working. Say it when it starts and when
+    it ends; not every sweep in between, and not again after a restart."""
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    home_fetch.broker = FakeBroker({}, connected=False)
+    async with get_session() as session:
+        await crud.delete_setting(session, service_mod._COUNTS_BLIND_KEY)
+    def _names(prefix: str):
+        return lambda i: _answered(i, f"{prefix}{int(i) - 1000}")
+
+    id_only = lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401")  # noqa: E731
+    try:
+        _, texts, _ = await _sweep_with(
+            id_only, _names("blinda"), [f"blinda{k}" for k in range(2)],
+            door_known_closed=True,
+        )
+        expect("the first sweep without counts says so, and why",
+               "📵" in texts[-1] and "not connected" in texts[-1], texts[-1])
+        _, texts, _ = await _sweep_with(  # a new service: also a restart
+            id_only, _names("blindb"), [f"blindb{k}" for k in range(2)],
+            door_known_closed=True,
+        )
+        expect("the next one, after a restart too, does not repeat it",
+               "📵" not in texts[-1] and "\n" not in texts[-1], texts[-1])
+        page = lambda u: ProfileFetchResult(  # noqa: E731
+            username=u, http_status=200, source="public_page", api_status=401,
+            parsed={"username": u, "followers_count": 10, "following_count": 5,
+                    "is_private": True, "instagram_id": "42"},
+        )
+        _, texts, _ = await _sweep_with(
+            page, _names("blindc"), [f"blindc{k}" for k in range(2)],
+            door_known_closed=True,
+        )
+        expect("counts coming back is said once", "📊" in texts[-1], texts[-1])
+        _, texts, _ = await _sweep_with(
+            page, _names("blindd"), [f"blindd{k}" for k in range(2)],
+            door_known_closed=True,
+        )
+        expect("and then nothing more", "📊" not in texts[-1] and "📵" not in texts[-1], texts[-1])
+    finally:
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+        await _set_door(False)
+
+
 async def main() -> int:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -1126,6 +1323,11 @@ async def main() -> int:
     await test_this_hosts_page_door_is_skipped_after_repeated_refusals()
     await test_the_phone_answers_the_reel_question()
     await test_probe_reports_what_instagram_said()
+
+    await test_a_failed_page_is_asked_about_by_id()
+    await test_a_bad_page_in_hand_is_read_once_and_named()
+    await test_a_login_redirect_is_called_one()
+    await test_no_counts_is_said_once()
 
     await engine.dispose()
     print()

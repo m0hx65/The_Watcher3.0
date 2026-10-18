@@ -155,6 +155,44 @@ def test_login_wall_and_junk_yield_nothing() -> None:
            parse_public_profile('"xig_user_by_username":{"username":"x"}', "x") is None)
 
 
+GRID_BLOCK = (
+    '<script type="application/json" data-sjs>{"require":[["RelayPrefetchedStreamCache",'
+    '"next",[],["adp_PolarisLoggedOutDesktopWWWProfilePostsTabContentQueryRelayPreloader_6a7d",'
+    '{"__bbox":{"complete":true,"result":{"data":{"xig_user_by_username":{"pk":"7880052534",'
+    '"polaris_ordered_timeline_connection":{"edges":[],"page_info":{"end_cursor":null,'
+    '"has_next_page":false}},"id":"17841407816045006"}},"extensions":{"is_final":true}}}}]]]}'
+    "</script>"
+)
+
+
+def test_the_profile_block_wins_over_the_posts_grid() -> None:
+    """Measured 2026-10-18: every page carries the key twice — the profile
+    query and the posts-grid query — and Instagram streams them in either
+    order. Reading the first occurrence failed the grid-first accounts
+    (@leen_m204, @jeeda.younes, @talia.takheen …) every sweep."""
+    grid_first = REAL_PAGE.replace("<body>\n", "<body>\n" + GRID_BLOCK, 1)
+    profile_first = REAL_PAGE.replace("</body>", GRID_BLOCK + "</body>", 1)
+    expect("the fixture really has the grid block first",
+           grid_first.index("polaris_ordered_timeline_connection")
+           < grid_first.index('"follower_count"'))
+    for name, page in (("grid first", grid_first), ("profile first", profile_first)):
+        parsed = parse_public_profile(page, "65xim") or {}
+        expect(f"{name}: the profile's numbers are read",
+               parsed.get("followers_count") == 118 and parsed.get("following_count") == 577
+               and parsed.get("is_private") is True, repr(parsed))
+        expect(f"{name}: the id is the profile's pk", parsed.get("instagram_id") == "7880052534",
+               repr(parsed.get("instagram_id")))
+    expect("a page with only the grid block is no profile",
+           parse_public_profile(f"<html><body>{GRID_BLOCK}</body></html>", "65xim") is None)
+    # What an out-of-date phone script delivers for a grid-first page.
+    old_phone_payload = (
+        '{"data":{"xig_user_by_username":{"pk":"58510515250","polaris_ordered_timeline_connection":'
+        '{"edges":[],"page_info":{"end_cursor":null,"has_next_page":false}},"id":"17841400000000000"}}}'
+    )
+    expect("nor is the grid block on its own, as an old phone script sends it",
+           parse_public_profile(old_phone_payload, "talia.takheen") is None)
+
+
 def test_bidi_marks_are_stripped() -> None:
     """og:title wrapped RTL names in invisible marks, so a name diffed as
     changing to a character-for-character identical value."""
@@ -192,6 +230,7 @@ def main() -> int:
     test_public_capture_uses_the_payload_too()
     test_the_pages_avatar_is_the_small_variant()
     test_login_wall_and_junk_yield_nothing()
+    test_the_profile_block_wins_over_the_posts_grid()
     test_bidi_marks_are_stripped()
     test_large_page_is_bounded()
 
