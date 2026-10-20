@@ -23,8 +23,11 @@ page_tunnel.conf. Several configs may be given one after another (each from
 its own [Interface] line): the first that answers is used, and the next takes
 over when it stops — or when Instagram keeps refusing its IP. Started at boot
 and proved end to end — a request through it must come back — before anything
-is routed through it. A tunnel that does not come up leaves the page door
-exactly as it was and says why.
+is routed through it. Boot waits for the first config only; if it gives no
+answer the others are tried in the background at once, so silent configs do
+not hold the app's port closed. A tunnel that does not come up leaves the
+page door exactly as it was and says why — per config, including whether its
+server answered the WireGuard handshake.
 
 The watchdog keeps PROVING it, not just keeping the process alive. Measured
 2026-10-20: wireproxy kept running while nothing came back through it, and
@@ -182,6 +185,18 @@ class PageTunnel:
         # to one lap per ROTATE_WINDOW.
         self._refused: Optional[tuple[int, str]] = None
         self._left_at: dict[int, float] = {}
+        # Set by start() when the first config gave no answer at boot: the
+        # watchdog's first look runs the rest of the lap.
+        self._boot_lap = False
+        # Whether the last launch opened its port, whether that wireproxy's
+        # server answered the WireGuard handshake, and, per config, whether
+        # it had when it last gave no answer: "handshake OK, nothing came
+        # back" on every config is the account (Proton Free's one
+        # connection), not the servers.
+        self._opened = False
+        self._handshake = False
+        self._shook: dict[int, bool] = {}
+        self._account_hint_given = False
         self._checked_at = 0.0
         self._restarts = 0
         # One outage is one WARNING: the re-tries after it log at INFO, on a
@@ -283,7 +298,6 @@ class PageTunnel:
         os.chmod(self._dir, 0o700)
         self._port = _free_port()
         self._conf = self._dir / "wireproxy.conf"
-        self._use(0)
         self._wake = asyncio.Event()
         if len(usable) > 1:
             logger.info(
@@ -292,13 +306,30 @@ class PageTunnel:
                 "refusing its IP",
                 len(usable), ", ".join(_label(c) for c in usable),
             )
-        if not await self._bring_up():
+        # Boot waits for the FIRST config only. The app does not serve until
+        # this returns, and a config that gives no answer costs ~20 s (on
+        # Render, 2026-10-21: the DNS lookup inside the tunnel timing out,
+        # config after config) — five silent ones held the port closed for
+        # ~100 s. The rest of the lap runs in the watchdog at once.
+        if await self._switch_to(0):
+            pass
+        elif len(usable) > 1:
+            self._note_no_answer()
+            self._boot_lap = True
+            self._wake.set()
+            others = len(usable) - 1
+            logger.info(
+                "Page tunnel: {} gave no answer at boot — trying {} in the "
+                "background; profile pages go out from this host meanwhile",
+                self.label,
+                "the other config" if others == 1 else f"its other {others} configs",
+            )
+        else:
             self._down_reported = True
             self._down_attempts = 1
             logger.warning(
-                "Page tunnel did not come up{}: {} — profile pages go out from "
+                "Page tunnel did not come up: {} — profile pages go out from "
                 "this host as before. wireproxy said: {}",
-                f" on any of its {len(usable)} configs" if len(usable) > 1 else "",
                 self.error, " | ".join(self._output) or "nothing",
             )
         self._watchdog = asyncio.create_task(self._watch(), name="page-tunnel:watchdog")
@@ -348,6 +379,8 @@ class PageTunnel:
             )
         self.up, self.egress_ip, self.error = True, ip, None
         self._down_reported, self._down_attempts = False, 0
+        self._account_hint_given = False
+        self._shook.pop(self._index, None)
         return True
 
     # ---------------------------------------------------------- internal
@@ -377,14 +410,15 @@ class PageTunnel:
             encoding="utf-8",
         )
 
-    async def _bring_up(self) -> bool:
+    async def _bring_up(self, *, skip_current: bool = False) -> bool:
         """(Re)start wireproxy and prove it: on the current config first — a
         fresh process is a fresh WireGuard handshake from a fresh UDP port,
         which is all a stalled session needs — then on each other config in
         turn, for a server that has stopped answering altogether. True once
-        one answers."""
+        one answers. `skip_current`: the current config was just tried (the
+        boot lap)."""
         first = self._index
-        for step in range(len(self._configs)):
+        for step in range(1 if skip_current else 0, len(self._configs)):
             if await self._switch_to(first + step):
                 if step:
                     logger.warning(
@@ -392,13 +426,48 @@ class PageTunnel:
                         _label(self._configs[first]), self.label,
                     )
                 return True
+            if len(self._configs) > 1:
+                self._note_no_answer()
+        self._judge_lap()
         return False
+
+    def _note_no_answer(self) -> None:
+        """One line per config that gave no answer in a lap — when several
+        fail, only the last one's wireproxy output reaches the WARNING, and
+        "the server never answered" (dead, or UDP blocked) reads nothing like
+        "the handshake worked and nothing passes" (measured on Render
+        2026-10-21: RO-FREE#22 "Received handshake response" and keepalives,
+        then the DNS lookup for the IP check timing out)."""
+        self._shook[self._index] = self._opened and self._handshake
+        verdict = ""
+        if self._opened:  # wireproxy ran; it was the path that stayed silent
+            verdict = (" — handshake OK, nothing came back" if self._handshake
+                       else " — no handshake from the server")
+        logger.info("Page tunnel: {} gave no answer ({}){}", self.label, self.error, verdict)
+
+    def _judge_lap(self) -> None:
+        """After a lap in which no config answered: if every one of them
+        shook hands and then passed nothing, that is not several servers
+        failing at once. Said once per outage."""
+        count = len(self._configs)
+        if count < 2 or self._account_hint_given:
+            return
+        if len(self._shook) == count and all(self._shook.values()):
+            self._account_hint_given = True
+            logger.warning(
+                "Page tunnel: all {} configs answered the WireGuard handshake "
+                "and then passed nothing — that looks like the Proton account, "
+                "not the servers. Proton Free allows one connection at a time: "
+                "check that no other device (the PC's or the phone's Proton "
+                "app) is connected on this account", count,
+            )
 
     async def _switch_to(self, index: int) -> bool:
         """Run config `index` in a fresh wireproxy and prove it."""
         self._use(index)
         await self._terminate()
-        return await self._launch() and await self.check()
+        self._opened = await self._launch()
+        return self._opened and await self.check()
 
     def _fresh_configs(self) -> list[int]:
         """The other configs a refused one may move to, in file order after
@@ -443,6 +512,7 @@ class PageTunnel:
                 )
                 return True
             self._left_at[index] = loop.time()
+            self._note_no_answer()
         silent = ", ".join(_label(self._configs[i]) for i in fresh)
         if await self._switch_to(start):
             same = self.egress_ip == old_ip
@@ -472,6 +542,7 @@ class PageTunnel:
     async def _launch(self) -> bool:
         assert self._conf is not None and self._port is not None
         self._output.clear()
+        self._handshake = False
         self._proc = await asyncio.create_subprocess_exec(
             *self._command, "-c", str(self._conf),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -502,6 +573,10 @@ class PageTunnel:
         async for raw in proc.stdout:
             line = raw.decode("utf-8", "replace").strip()
             if line:
+                if "Received handshake response" in line and proc is self._proc:
+                    # Kept apart from _output: on a dead path the keepalives
+                    # and DNS retries soon push it out of those 20 lines.
+                    self._handshake = True
                 self._output.append(line[:300])
                 logger.debug("wireproxy: {}", line[:300])
 
@@ -546,6 +621,20 @@ class PageTunnel:
         at once when a page request through it went unanswered; one that
         fails the proof is restarted, then moved to the next config. A down
         one is restarted on a back-off."""
+        if self._boot_lap:
+            # Before the crash-loop branch: a first config whose wireproxy
+            # exited at boot must not hold the others back for its back-off.
+            self._boot_lap = False
+            if not await self._bring_up(skip_current=True):
+                self._down_reported = True
+                self._down_attempts = 1
+                logger.warning(
+                    "Page tunnel did not come up on any of its {} configs: {} "
+                    "— profile pages go out from this host as before. "
+                    "wireproxy said: {}", len(self._configs), self.error,
+                    " | ".join(self._output) or "nothing",
+                )
+            return
         if self._proc is None or self._proc.returncode is not None:
             code = self._proc.returncode if self._proc is not None else None
             self.up = False

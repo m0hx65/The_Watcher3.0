@@ -787,6 +787,25 @@ at 0%, a sweep of 13 failures and 4 id-only readings. Now:
   that is not a new route: the cooldown stands. When the tunnel is up and a
   sweep still reads no counts, the no-counts notice suggests adding configs
   for more Proton free servers;
+- **boot waits for the first config only** (2026-10-21). `main.py` awaits
+  `tunnel.start()` before the app serves, and `start()` used to try every
+  config in turn. On Render each silent config cost ~20 s (the DNS lookup
+  for the IP check timing out inside the tunnel), so five of them kept the
+  port closed for ~100 s. Now `start()` proves the first config, as before
+  and just as bounded, and if it gives no answer, the watchdog's first look
+  tries the rest at once (`_boot_lap`), not after the 5-minute re-check.
+  With one config, nothing changes;
+- **each config that gives no answer says why.** Before, only the last
+  config's wireproxy output reached the log. Now each one gets its own INFO
+  line: its label, the error, and either "handshake OK, nothing came back"
+  or "no handshake from the server". "No handshake" means the server is dead
+  or UDP is blocked. "Handshake OK" is what Render showed for RO-FREE#22 on
+  2026-10-21: "Received handshake response" and keepalives, then the DNS
+  lookup timing out and curl `(97) SOCKS5 reply 4`. When every config in a
+  lap shook hands and passed nothing, one WARNING per outage says it looks
+  like the Proton account rather than the servers: Proton Free allows one
+  connection, so another device (the PC's or the phone's Proton app) may be
+  holding it;
 - a down tunnel retries on a back-off (5 → 10 → 20 → 30 min), one WARNING
   per outage and INFO after;
 - the page door's refusal streak is booked against the tunnel's path

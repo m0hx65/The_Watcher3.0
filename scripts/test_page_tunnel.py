@@ -23,7 +23,11 @@ What must hold:
   breaker tripping on answers through the tunnel) is moved to the next
   config, and the door tries the new IP at once — never on one odd page,
   never on timeouts alone, never with one config, and at most one lap of
-  refused configs per cooldown window.
+  refused configs per cooldown window;
+- boot waits for the first config only, the rest are tried in the background
+  at once; each config that gives no answer says whether its server answered
+  the WireGuard handshake, and "handshake OK, nothing came back" on every one
+  is called out once as the Proton account, not the servers.
 
 Runs fully offline: a stand-in "wireproxy" (a real SOCKS5 relay in Python)
 and a local HTTP server stand in for the VPN and the IP-check site.
@@ -94,7 +98,9 @@ TWO_CONFS = (
 # A stand-in wireproxy: reads "-c <config>", binds the [Socks5] address, and
 # relays CONNECTs for real — or, with mode "dead", accepts and drops them,
 # or with "crash", exits at once. An endpoint listed in $FAKE_WG_DEAD is a
-# path that died under a running process: still accepting, nothing back.
+# path that died under a running process: still accepting, nothing back. It
+# says "Received handshake response" as the real one does, unless its
+# endpoint is listed in $FAKE_WG_SILENT (a server that never answers).
 FAKE_WIREPROXY = textwrap.dedent('''\
     import asyncio, os, re, sys
     conf = open(sys.argv[sys.argv.index("-c") + 1]).read()
@@ -106,11 +112,14 @@ FAKE_WIREPROXY = textwrap.dedent('''\
         print("fatal: cannot reach the peer", flush=True)
         sys.exit(3)
 
-    def path_dead():
+    def listed(var):
         try:
-            return endpoint in open(os.environ["FAKE_WG_DEAD"]).read().split()
+            return endpoint in open(os.environ[var]).read().split()
         except (KeyError, OSError):
             return False
+
+    def path_dead():
+        return listed("FAKE_WG_DEAD")
 
     async def pipe(r, w):
         try:
@@ -142,6 +151,8 @@ FAKE_WIREPROXY = textwrap.dedent('''\
         await asyncio.gather(pipe(r, tw), pipe(tr, w))
 
     async def main():
+        if not listed("FAKE_WG_SILENT"):
+            print("DEBUG: peer(c2Vy...dmVy) - Received handshake response", flush=True)
         server = await asyncio.start_server(client, host, int(port))
         print("wireproxy stand-in listening", flush=True)
         async with server:
@@ -180,6 +191,9 @@ class _Fixture:
         self.dead = Path(self.tmp.name) / "dead.txt"
         self.dead.write_text("", encoding="utf-8")
         os.environ["FAKE_WG_DEAD"] = str(self.dead)
+        self.silent = Path(self.tmp.name) / "silent.txt"
+        self.silent.write_text("", encoding="utf-8")
+        os.environ["FAKE_WG_SILENT"] = str(self.silent)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _IpCheck)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.check_url = f"http://127.0.0.1:{self.server.server_port}/"
@@ -767,6 +781,117 @@ async def test_one_config_is_never_moved(fx: _Fixture) -> None:
             setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
 
 
+async def test_boot_waits_for_the_first_config_only(fx: _Fixture) -> None:
+    """Measured on Render 2026-10-21: the app does not serve until the tunnel's
+    start() returns, start() tried every config in turn, and each silent one
+    cost ~20 s (the DNS lookup inside the tunnel timing out) — five of them
+    held the port closed for ~100 s. Boot now waits for the first config
+    only; the others are tried in the background at once, not after the
+    5-minute re-check."""
+    names = ("page_tunnel_config", "CHECK_URL", "CHECK_URL_SECOND", "tunnel")
+    old = {n: getattr(settings if n == "page_tunnel_config" else page_tunnel, n) for n in names}
+    settings.page_tunnel_config = str(fx.two_confs)
+    page_tunnel.CHECK_URL = page_tunnel.CHECK_URL_SECOND = fx.check_url
+    fx.dead.write_text("203.0.113.9:51820", encoding="utf-8")
+    lines: list[tuple[str, str]] = []
+    sink = logger.add(lambda m: lines.append((m.record["level"].name, m.record["message"])),
+                      level="INFO")
+    try:
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start()
+        expect("boot returns after the first config, without trying the rest",
+               not tunnel.up and tunnel.label == "TEST-FREE#1" and tunnel._boot_lap,
+               tunnel.describe())
+        expect("and says which config gave no answer, and that its handshake worked",
+               any("TEST-FREE#1 gave no answer" in m and "handshake OK, nothing came back" in m
+                   for _, m in lines), repr(lines))
+        took = await _until(lambda: tunnel.up and tunnel.label == "TEST-FREE#2", 10.0)
+        expect("the next config takes over in the background at once — the watchdog's "
+               "60 s look and the 5-minute re-check are not waited for",
+               took and page_tunnel.WATCH_INTERVAL >= 60 and page_tunnel.RECHECK_INTERVAL >= 300,
+               tunnel.describe())
+        expect("and boot's lap is not reported as an outage",
+               not any("did not come up" in m for _, m in lines), repr(lines))
+        await tunnel.stop()
+
+        settings.page_tunnel_config = str(fx.conf)
+        single = fx.tunnel("ok")
+        page_tunnel.tunnel = single
+        await single.start()
+        expect("one config that gives no answer at boot is reported as before",
+               not single.up and not single._boot_lap and single._down_attempts == 1
+               and any(level == "WARNING" and m.startswith("Page tunnel did not come up:")
+                       for level, m in lines), repr(lines[-3:]))
+        await single.stop()
+    finally:
+        logger.remove(sink)
+        fx.dead.write_text("", encoding="utf-8")
+        for n, value in old.items():
+            setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
+
+
+async def test_each_silent_config_says_why(fx: _Fixture) -> None:
+    """Measured on Render 2026-10-21: with several configs failing, only the
+    last one's wireproxy output reached the log — and RO-FREE#22's said
+    "Received handshake response" and kept getting keepalives while nothing
+    passed. A server that never answers (dead, or UDP blocked) and a
+    handshake that works with nothing behind it (Proton Free's one
+    connection, taken by another device) need different fixes; each config
+    now says which, and every config shaking hands is called the account's."""
+    names = ("page_tunnel_config", "CHECK_URL", "CHECK_URL_SECOND", "tunnel")
+    old = {n: getattr(settings if n == "page_tunnel_config" else page_tunnel, n) for n in names}
+    settings.page_tunnel_config = str(fx.two_confs)
+    page_tunnel.CHECK_URL = page_tunnel.CHECK_URL_SECOND = fx.check_url
+    fx.dead.write_text("203.0.113.9:51820 198.51.100.4:51820", encoding="utf-8")
+    lines: list[tuple[str, str]] = []
+    sink = logger.add(lambda m: lines.append((m.record["level"].name, m.record["message"])),
+                      level="INFO")
+
+    def account() -> list[str]:
+        return [m for level, m in lines if level == "WARNING" and "Proton account" in m]
+
+    try:
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start()
+        done = await _until(lambda: any("did not come up on any of its 2 configs" in m
+                                        for _, m in lines))
+        notes = [m for level, m in lines if level == "INFO" and "gave no answer (" in m]
+        expect("each config that gives no answer gets its own line",
+               done and len(notes) == 2 and "TEST-FREE#1" in notes[0] and "TEST-FREE#2" in notes[1],
+               repr(notes))
+        expect("saying its handshake worked and nothing came back",
+               all("handshake OK, nothing came back" in n for n in notes), repr(notes))
+        expect("every config shaking hands with nothing behind it is called the account's",
+               len(account()) == 1, repr(lines))
+        tunnel._watchdog.cancel()
+        await tunnel._bring_up()
+        expect("once per outage, not once per lap", len(account()) == 1, repr(account()))
+        expect("and no line carries a key",
+               not any("aGVsbG8" in m or "PrivateKey" in m or "cHVibGlj" in m for _, m in lines))
+        await tunnel.stop()
+
+        lines.clear()
+        fx.silent.write_text("198.51.100.4:51820", encoding="utf-8")
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start()
+        await _until(lambda: any("did not come up on any" in m for _, m in lines))
+        notes = [m for level, m in lines if level == "INFO" and "gave no answer (" in m]
+        expect("a server that never answered the handshake is said to be the server",
+               any("TEST-FREE#2" in n and "no handshake from the server" in n for n in notes),
+               repr(notes))
+        expect("and then it is not called the account's", account() == [], repr(account()))
+        await tunnel.stop()
+    finally:
+        logger.remove(sink)
+        fx.dead.write_text("", encoding="utf-8")
+        fx.silent.write_text("", encoding="utf-8")
+        for n, value in old.items():
+            setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
+
+
 async def main() -> int:
     fx = _Fixture()
     try:
@@ -781,6 +906,8 @@ async def main() -> int:
         await test_the_door_asks_for_a_move_only_when_instagram_answers()
         await test_a_refused_ip_moves_to_the_next_config(fx)
         await test_one_config_is_never_moved(fx)
+        await test_boot_waits_for_the_first_config_only(fx)
+        await test_each_silent_config_says_why(fx)
     finally:
         fx.close()
     print()
