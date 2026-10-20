@@ -39,6 +39,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{DB_FILE.as_posix()}
 from app.config import settings  # noqa: E402
 from app.database.models import Base  # noqa: E402
 from app.database.session import dispose_engine, engine  # noqa: E402
+from app.monitor import page_tunnel  # noqa: E402
 from app.monitor import service as service_mod  # noqa: E402
 from app.monitor.service import MonitorService, _SweepThrottle  # noqa: E402
 
@@ -319,6 +320,65 @@ async def test_retry_rounds_recover_blocked_accounts() -> None:
            repr(attempts))
 
 
+async def test_id_only_retries_stop_when_a_round_recovers_nothing() -> None:
+    """Measured 2026-10-20: the username API shut, no page door open, and the
+    same 13 accounts refused by id on the sweep and on BOTH retry rounds —
+    26 more ~9 s Worker calls and five minutes, for nothing. The id route's
+    gate refuses per account; with nothing changed, a second round asks the
+    same refusing route the same question. A page door that opens meanwhile
+    is a change, and earns the next round."""
+    service = MonitorService(
+        instagram=AsyncMock(), hasher=AsyncMock(),
+        notifier=AsyncMock(), stories=None,
+    )
+    asks: dict[str, int] = {}
+
+    def refused(username: str) -> dict:
+        return {"ok": False, "username": username, "status": 401, "id_status": 401}
+
+    async def always_refused(account_id, username, **kw):
+        asks[username] = asks.get(username, 0) + 1
+        return refused(username)
+
+    def blocked() -> list:
+        return [(i, f"id{i}", refused(f"id{i}")) for i in range(3)]
+
+    service._run_check = always_refused  # type: ignore[assignment]
+    outcomes = blocked()
+    settings.sweep_retry_rounds = 3
+    try:
+        recovered = await service._retry_blocked(outcomes, skip_username_api=True)
+        expect("a round by id that recovers nothing ends the pass",
+               recovered == 0 and asks == {"id0": 1, "id1": 1, "id2": 1}, repr(asks))
+
+        # The page tunnel comes back during the first round: the next one runs.
+        asks.clear()
+
+        async def tunnel_returns(account_id, username, **kw):
+            asks[username] = asks.get(username, 0) + 1
+            if sum(asks.values()) == 1:
+                page_tunnel.tunnel.epoch += 1
+            if asks[username] >= 2:
+                return {"ok": True, "username": username, "status": 200}
+            return refused(username)
+
+        service._run_check = tunnel_returns  # type: ignore[assignment]
+        outcomes = blocked()
+        recovered = await service._retry_blocked(outcomes, skip_username_api=True)
+        expect("but a page door that opened meanwhile earns the next round",
+               recovered == 3 and asks == {"id0": 2, "id1": 2, "id2": 2}, repr(asks))
+
+        # With the username API still asked, every round runs, as before.
+        asks.clear()
+        service._run_check = always_refused  # type: ignore[assignment]
+        outcomes = blocked()
+        await service._retry_blocked(outcomes)
+        expect("with the username API in play every round still runs",
+               asks == {"id0": 3, "id1": 3, "id2": 3}, repr(asks))
+    finally:
+        settings.sweep_retry_rounds = 3
+
+
 async def test_retry_budget_stops_a_long_outage() -> None:
     """A genuine outage must not stretch the sweep past its wall-clock budget."""
     service = MonitorService(
@@ -359,6 +419,7 @@ async def main() -> int:
     await test_slot_serializes_by_default()
     await test_guard_pauses_before_it_defers()
     await test_retry_rounds_recover_blocked_accounts()
+    await test_id_only_retries_stop_when_a_round_recovers_nothing()
     await test_retry_budget_stops_a_long_outage()
     await test_staggered_check_defers_after_open()
 

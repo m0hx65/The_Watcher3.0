@@ -64,6 +64,7 @@ class _ShutDoor:
 
     def __init__(self) -> None:
         self.direct_page_door_failing = True
+        self.direct_page_failures = 2  # its refusals in a row, as logged
 
     async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
         return ProfileFetchResult(

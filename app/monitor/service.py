@@ -1074,11 +1074,24 @@ class MonitorService:
             # — see _staggered_check.)
             throttle.pages_prefetched = True
             self._prefetch_pages(throttle.pending_usernames)
-        elif known_closed:
+        elif known_closed and not self.instagram.direct_page_door_failing:
             logger.info(
                 "This host's page door is answering — the home fetcher stands "
                 "by rather than fetching {} page(s) nobody would read",
                 len(targets),
+            )
+        elif known_closed:
+            # Neither page door is open going in. This line used to say the
+            # host's door was "answering" whenever the phone was offline —
+            # measured 2026-10-20, right after 18 refusals in a row through a
+            # dead page tunnel, which sent the reader looking in the wrong place.
+            logger.warning(
+                "No page door is open going into this sweep — {} ({} "
+                "refusals in a row), and {}. Unless one answers, checks read by "
+                "numeric id only: username, picture and story status, no counts",
+                self._host_page_door_state(),
+                self.instagram.direct_page_failures,
+                self._home_door_state() or "the home fetcher is connected",
             )
         results = await asyncio.gather(
             *(
@@ -1436,30 +1449,29 @@ class MonitorService:
         if blind and not self._counts_blind_announced:
             self._counts_blind_announced = True
             await self._persist_counts_blind(True)
-            if not settings.home_fetch_token:
-                home = "no home fetcher is set up (HOME_FETCH_TOKEN)"
-            elif not home_fetch.broker.connected:
-                home = f"the home fetcher is {home_fetch.broker.describe()}"
-            elif home_fetch.broker.outdated:
-                home = "the home fetcher runs an out-of-date home_fetcher.py"
-            else:
-                home = "the home fetcher's pages carried no profile either"
-            tunnel = page_tunnel.tunnel
-            if tunnel.configured and not tunnel.up:
-                here = f"the page tunnel is down ({tunnel.error or 'starting'})"
-            elif self.instagram.direct_page_door_failing:
-                here = (
-                    "Instagram is refusing this server's profile-page requests"
-                    + (" — through the page tunnel too" if tunnel.up else "")
+            home = self._home_door_state()
+            if home is None:
+                home = (
+                    "the home fetcher runs an out-of-date home_fetcher.py"
+                    if home_fetch.broker.outdated
+                    else "the home fetcher's pages carried no profile either"
                 )
+            tunnel = page_tunnel.tunnel
+            here = self._host_page_door_state()
+            if tunnel.configured and not tunnel.up:
+                fix = (
+                    "The tunnel restarts itself, and moves to the next config "
+                    "in page_tunnel.conf when there is one. If it stays down, "
+                    "add a config for another Proton free server to that file, "
+                    "or start the phone's home fetcher."
+                )
+            elif tunnel.configured:
+                fix = "Start the phone's home fetcher to get full readings back."
             else:
-                here = "this server's own page requests got no profile"
-            fix = (
-                "Start the phone's home fetcher to get full readings back."
-                if tunnel.configured
-                else "Start the phone's home fetcher, or set up the page "
-                     "tunnel (PAGE_TUNNEL_CONFIG), to get full readings back."
-            )
+                fix = (
+                    "Start the phone's home fetcher, or set up the page "
+                    "tunnel (PAGE_TUNNEL_CONFIG), to get full readings back."
+                )
             logger.warning(
                 "No counts this sweep: {}, and {}", here, home,
             )
@@ -1473,6 +1485,29 @@ class MonitorService:
             await self._persist_counts_blind(False)
             return "\n📊 Follower/following counts are being read again."
         return ""
+
+    def _host_page_door_state(self) -> str:
+        """Why this host's own page door is not serving profiles, as the
+        start of a sentence."""
+        tunnel = page_tunnel.tunnel
+        if tunnel.configured and not tunnel.up:
+            return f"the page tunnel is down ({tunnel.error or 'starting'})"
+        if self.instagram.direct_page_door_failing:
+            return (
+                "Instagram is refusing this server's profile-page requests"
+                + (" — through the page tunnel too" if tunnel.up else "")
+            )
+        return "this server's own page requests got no profile"
+
+    @staticmethod
+    def _home_door_state() -> Optional[str]:
+        """Why the home fetcher cannot serve pages, or None when it is
+        connected."""
+        if not settings.home_fetch_token:
+            return "no home fetcher is set up (HOME_FETCH_TOKEN)"
+        if not home_fetch.broker.connected:
+            return f"the home fetcher is {home_fetch.broker.describe()}"
+        return None
 
     async def _persist_counts_blind(self, blind: bool) -> None:
         try:
@@ -1759,6 +1794,14 @@ class MonitorService:
 
         Bounded by `sweep_retry_budget_seconds` so a genuine hard block can't
         stretch the sweep indefinitely. Returns how many accounts recovered.
+
+        By id only (`skip_username_api`), a round that recovers nothing ends
+        the pass unless a page door opened during it. The id route's gate
+        refuses per ACCOUNT, not per request — measured 2026-10-20, the same
+        13 accounts refused on all three asks, five minutes of Worker calls
+        for nothing — so asking again what that route just refused, with
+        nothing else changed, only adds to the blocked traffic that keeps it
+        shut. The first round always runs.
         """
         rounds = max(0, settings.sweep_retry_rounds)
         if not rounds:
@@ -1766,6 +1809,7 @@ class MonitorService:
         deadline = time.monotonic() + max(0, settings.sweep_retry_budget_seconds)
         cooldown = _SWEEP_RETRY_COOLDOWN_SECONDS
         recovered = 0
+        doors = self._page_doors_signature()
 
         for round_no in range(1, rounds + 1):
             retriable = [
@@ -1786,9 +1830,12 @@ class MonitorService:
                 round_no, rounds, len(retriable), cooldown,
             )
             await asyncio.sleep(cooldown)
+            round_recovered = 0
+            cut_short = False
             for pos, (idx, aid, uname) in enumerate(retriable):
                 if time.monotonic() >= deadline:
                     logger.info("Retry budget spent mid-round — stopping")
+                    cut_short = True
                     break
                 retry = await self._run_check(
                     aid, uname, thorough=False,
@@ -1797,14 +1844,38 @@ class MonitorService:
                 )
                 if retry.get("ok"):
                     outcomes[idx] = (aid, uname, retry)
-                    recovered += 1
+                    round_recovered += 1
                 if pos < len(retriable) - 1:
                     await asyncio.sleep(random.uniform(*_SWEEP_RETRY_GAP_SECONDS))
+            recovered += round_recovered
             cooldown = min(_SWEEP_RETRY_COOLDOWN_MAX_SECONDS, cooldown * 2)
+            now_doors = self._page_doors_signature()
+            if (
+                skip_username_api and not round_recovered and not cut_short
+                and now_doors == doors
+            ):
+                if round_no < rounds:
+                    logger.info(
+                        "Retry round {} recovered none of {} by id, and no "
+                        "page door opened meanwhile — leaving them to the "
+                        "next sweep rather than asking that route again",
+                        round_no, len(retriable),
+                    )
+                break
+            doors = now_doors
 
         if recovered:
             logger.info("{} account(s) recovered on retry", recovered)
         return recovered
+
+    @staticmethod
+    def _page_doors_signature() -> tuple[int, bool]:
+        """What can make an account refused by id answer on the next round:
+        the page tunnel coming (back) up, or the phone connecting."""
+        return (
+            page_tunnel.tunnel.epoch,
+            bool(settings.home_fetch_token and home_fetch.broker.connected),
+        )
 
     async def _run_check(
         self,

@@ -324,6 +324,9 @@ class InstagramClient:
         # skipped for a while and the home fetcher (if any) takes over at once.
         self._direct_page_failures = 0
         self._direct_page_blocked_until = 0.0
+        # Which page-tunnel path that streak was booked against — see
+        # _sync_direct_page_route.
+        self._direct_page_epoch = page_tunnel.tunnel.epoch
         # The Worker's reel route. Refused per colo, and each refusal is ~9 s
         # of upstream retries; after a few in a row the phone is asked first
         # for a while, the Worker only when the phone has no answer.
@@ -1117,6 +1120,7 @@ class InstagramClient:
         """
         timings: dict[str, float] = {}
         in_hand: Optional[dict[str, Any]] = None
+        self._sync_direct_page_route()
         # The answer may already be here. A sweep hands the phone its whole
         # list up front, so by the time this account is checked its page is
         # usually sitting in the broker — free, in memory, no wait. Taking it
@@ -1199,10 +1203,41 @@ class InstagramClient:
         phone each. False at boot, so a host Instagram is currently serving
         asks for nothing from home.
         """
+        self._sync_direct_page_route()
         return (
             self._direct_page_failures >= self._DIRECT_PAGE_HANDOVER_FAILURES
             or time.monotonic() < self._direct_page_blocked_until
         )
+
+    @property
+    def direct_page_failures(self) -> int:
+        """This host's page door's refusals in a row, for logs."""
+        self._sync_direct_page_route()
+        return self._direct_page_failures
+
+    def _sync_direct_page_route(self) -> None:
+        """Forget a refusal streak booked against a page-tunnel path that has
+        since been replaced.
+
+        The streak is evidence about one ROUTE. When the tunnel comes back up
+        — restarted, or moved to another config and so another IP — the path
+        that earned it is gone, and the 30-minute cooldown it set would keep
+        a sweep off a door that answers again (measured 2026-10-20: the
+        tunnel was dead for hours, and nothing told the door to look again
+        once it came back)."""
+        epoch = page_tunnel.tunnel.epoch
+        if epoch == self._direct_page_epoch:
+            return
+        self._direct_page_epoch = epoch
+        if self._direct_page_failures or self._direct_page_blocked_until:
+            logger.info(
+                "The page tunnel is up again ({}) — this host's page door is "
+                "tried again now instead of waiting out a cooldown its old "
+                "path earned ({} refusals in a row)",
+                page_tunnel.tunnel.describe(), self._direct_page_failures,
+            )
+            self._direct_page_failures = 0
+            self._direct_page_blocked_until = 0.0
 
     def _note_direct_page(self, outcome: dict[str, Any]) -> None:
         """Book this host's page door: an answer with the payload resets the
@@ -1227,6 +1262,15 @@ class InstagramClient:
                 self._direct_page_failures, outcome.get("error"),
                 self._DIRECT_PAGE_COOLDOWN / 60,
             )
+
+    @staticmethod
+    def _page_route_unanswered(route: str, reason: str) -> None:
+        """A page request that got no answer at all, through the page tunnel,
+        says the tunnel's path may be dead — Instagram refusing it answers
+        with a 429 or a login redirect instead. Ask the tunnel to re-prove
+        itself now rather than at its next scheduled look."""
+        if route == page_tunnel.TUNNEL_ROUTE:
+            page_tunnel.tunnel.report_failure(reason)
 
     async def _probe_page_direct(self, username: str) -> dict[str, Any]:
         username = username.strip().lstrip("@")
@@ -1258,10 +1302,13 @@ class InstagramClient:
                 "Public page for @{} did not answer {} within {:.0f}s",
                 username, route, self._DIRECT_PAGE_TIMEOUT,
             )
+            self._page_route_unanswered(route, result["error"])
             return result
         except Exception as exc:
-            result["error"] = repr(exc)
-            logger.warning("Public page fetch failed for @{} via {}: {}", username, route, exc)
+            reason = page_tunnel.short_error(exc)
+            result["error"] = f"{type(exc).__name__}: {reason}"
+            logger.warning("Public page fetch failed for @{} via {}: {}", username, route, reason)
+            self._page_route_unanswered(route, reason)
             return result
 
         body = getattr(response, "text", "") or ""

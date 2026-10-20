@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     # which Instagram sends to its login page. Either the config text itself
     # or a path to the .conf file; unset, a Render Secret File named
     # page_tunnel.conf is used when present. Only the page requests use it.
+    # Several configs one after another (each from its own [Interface]) are
+    # a failover list: the next takes over when one stops answering.
     page_tunnel_config: Optional[str] = Field(default=None, alias="PAGE_TUNNEL_CONFIG")
     # Or a plain proxy for the page requests only (http://, socks5h://) — a
     # residential proxy, say. Used when no tunnel is configured.

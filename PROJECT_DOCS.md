@@ -455,7 +455,12 @@ sweep itself is paced by `_SweepThrottle`:
   bounded by `SWEEP_RETRY_BUDGET_SECONDS`) re-check blocked accounts one at a
   time. A block lands on a *request*, not an account, so a paced retry often
   goes through — this is what stops the summary reporting failures the owner
-  can reproduce as successes by hand a minute later.
+  can reproduce as successes by hand a minute later. By id only (the
+  username API shut), a round that recovers nothing ends the pass unless a
+  page door opened during it (the tunnel came back, the phone connected):
+  the id route's gate refuses per account, and on 2026-10-20 the same 13
+  accounts were refused on the sweep and on both rounds, five minutes of
+  Worker calls for nothing. The first round always runs.
 - **Order is shuffled every sweep**, so the same tail of accounts doesn't
   absorb every block sweep after sweep — **except that accounts whose last
   check failed go first** (`consecutive_failures > 0`, so it survives a
@@ -743,6 +748,33 @@ fields. Render logs "Detected a new open port UDP:…" for wireproxy's socket;
 that is harmless, nothing is exposed. Proton Free allows one connection at a
 time, and a config Instagram stops serving is replaced by one for another free
 server in the same secret file.
+
+**The tunnel is proven, not just kept running (2026-10-20).** On 2026-10-20
+wireproxy kept running while nothing came back through it. The watchdog only
+re-checked a tunnel already marked down, so this one stayed "up" for hours:
+19 page timeouts in a row (`curl: (28) Connection timed out`), a 30-minute
+cooldown on the page door, `/status` saying "up", and, with the phone flat
+at 0%, a sweep of 13 failures and 4 id-only readings. Now:
+- an up tunnel is re-proven every `PROVE_INTERVAL` (10 min) through the
+  IP-check site, with a second site as witness so one site's outage is not
+  read as the tunnel's;
+- a page request through it that gets **no answer at all** (a timeout, a
+  reset; not a 429 or a login redirect, which came back through the path)
+  wakes the watchdog to re-prove it at once;
+- a dead path is restarted (a fresh WireGuard handshake from a fresh UDP
+  port), then moved to the **next config**: `page_tunnel.conf` may hold
+  several Proton configs one after another, each from its own `[Interface]`
+  line, named in logs and `/status` by the server Proton writes under
+  `[Peer]` (`# RO-FREE#22`). One connection at a time, so this is failover,
+  not load sharing;
+- a down tunnel retries on a back-off (5 → 10 → 20 → 30 min), one WARNING
+  per outage and INFO after;
+- the page door's refusal streak is booked against the tunnel's path
+  (`PageTunnel.epoch`), so when the tunnel comes back the door is tried again
+  at once instead of waiting out a cooldown the dead path earned;
+- the sweep-start line no longer says the page door "is answering" when it
+  has been refused and only the phone is missing; it says no page door is
+  open, and why.
 
 The sweep-complete message is one line. Which door served the readings — the
 page-only and id-only counts, and the verdict on the profile API — is a

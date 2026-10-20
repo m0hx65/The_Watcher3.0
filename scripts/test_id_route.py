@@ -163,6 +163,7 @@ class ScriptedInstagram:
         # modelled here are the page-served regime, where it is refusing and
         # the phone is the route.
         self.direct_page_door_failing = True
+        self.direct_page_failures = 2  # its refusals in a row, as logged
         self.profile_calls: list[str] = []
         self.profile_kwargs: list[dict] = []
         self.probe_calls: list[str] = []
@@ -574,6 +575,38 @@ async def test_a_door_found_shut_last_sweep_is_knocked_once() -> None:
            ig.api_asks() == 4, repr(ig.profile_kwargs))
     expect("the summary announces the reopening", "answering username lookups again" in summary, summary)
     expect("and the DB forgets the verdict", not await _door_closed_in_db())
+
+
+async def test_the_sweep_start_says_when_no_page_door_is_open() -> None:
+    """Measured 2026-10-20: going into a sweep after 18 page refusals in a
+    row through a dead page tunnel, with the phone's battery flat, the log
+    said "This host's page door is answering". It was the line for "the
+    phone is not serving", whatever the reason — and it pointed the reader
+    away from the one door that had actually failed."""
+    from app.utils.logger import logger
+
+    old_broker, old_token = home_fetch.broker, settings.home_fetch_token
+    settings.home_fetch_token = "sekrit"
+    home_fetch.broker = FakeBroker({}, connected=False)
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(m.record["message"]), level="INFO")
+    try:
+        await _sweep_with(
+            lambda u: ProfileFetchResult(username=u, http_status=401, error="HTTP 401"),
+            lambda i: _answered(i, f"start{int(i) - 1000}"),
+            ["start0", "start1"], door_known_closed=True,
+        )
+    finally:
+        logger.remove(sink)
+        home_fetch.broker, settings.home_fetch_token = old_broker, old_token
+    expect("a failing page door is not called 'answering'",
+           not any("page door is answering" in line for line in lines),
+           repr([line for line in lines if "page door" in line]))
+    said = [line for line in lines if "No page door is open going into this sweep" in line]
+    expect("the sweep start says no page door is open, and why",
+           len(said) == 1 and "refusing this server's profile-page requests" in said[0]
+           and "2 refusals in a row" in said[0] and "the home fetcher is" in said[0],
+           repr(said))
 
 
 async def test_a_sweep_hands_the_phone_the_whole_list_up_front() -> None:
@@ -1464,6 +1497,7 @@ async def main() -> int:
     await test_retry_rounds_re_ask_by_id_when_the_door_is_shut()
     test_retriable_looks_at_both_routes()
     await test_a_door_found_shut_last_sweep_is_knocked_once()
+    await test_the_sweep_start_says_when_no_page_door_is_open()
     await test_a_sweep_hands_the_phone_the_whole_list_up_front()
     await test_the_page_answers_the_story_question_when_the_reel_route_is_refused()
     await test_a_manual_check_skips_a_door_known_to_be_shut()
