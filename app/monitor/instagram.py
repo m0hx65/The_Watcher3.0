@@ -325,8 +325,10 @@ class InstagramClient:
         self._direct_page_failures = 0
         self._direct_page_blocked_until = 0.0
         # Which page-tunnel path that streak was booked against — see
-        # _sync_direct_page_route.
+        # _sync_direct_page_route — and whether Instagram ANSWERED any of it
+        # through the tunnel (so it is refusing the IP, not losing the path).
         self._direct_page_epoch = page_tunnel.tunnel.epoch
+        self._direct_page_tunnel_answered = False
         # The Worker's reel route. Refused per colo, and each refusal is ~9 s
         # of upstream retries; after a few in a row the phone is asked first
         # for a while, the Worker only when the phone has no answer.
@@ -1229,6 +1231,7 @@ class InstagramClient:
         if epoch == self._direct_page_epoch:
             return
         self._direct_page_epoch = epoch
+        self._direct_page_tunnel_answered = False
         if self._direct_page_failures or self._direct_page_blocked_until:
             logger.info(
                 "The page tunnel is up again ({}) — this host's page door is "
@@ -1243,24 +1246,42 @@ class InstagramClient:
         """Book this host's page door: an answer with the payload resets the
         streak; a 404 is an answer about the username, not about this host;
         anything else (429, login redirect, empty shell, timeout) is a refusal,
-        and enough of them in a row close the door for a cooldown."""
+        and enough of them in a row close the door for a cooldown.
+
+        A door closed on refusals that came back through the page tunnel —
+        Instagram answered at least once, so the path works and it is the IP
+        it will not serve — also asks the tunnel to move to its next config.
+        Not on one odd page: only when the breaker trips. Not on timeouts
+        alone: those went to the tunnel's own restart path as they came."""
         if outcome.get("parsed") is not None:
             self._direct_page_failures = 0
             self._direct_page_blocked_until = 0.0
+            self._direct_page_tunnel_answered = False
             return
         if outcome.get("status") == 404:
             return
         self._direct_page_failures += 1
+        through_tunnel = outcome.get("route") == page_tunnel.TUNNEL_ROUTE
+        if through_tunnel and outcome.get("status"):
+            self._direct_page_tunnel_answered = True
         if self._direct_page_failures >= self._DIRECT_PAGE_BREAKER_FAILURES:
             self._direct_page_blocked_until = (
                 time.monotonic() + self._DIRECT_PAGE_COOLDOWN
             )
+            moving = bool(
+                through_tunnel
+                and self._direct_page_tunnel_answered
+                and page_tunnel.tunnel.report_refused(
+                    str(outcome.get("error")), epoch=self._direct_page_epoch
+                )
+            )
             logger.info(
                 "This host's page requests were refused {} times in a row "
-                "(last: {}) — skipping that door for {:.0f} min; the home "
+                "(last: {}) — skipping that door for {:.0f} min{}; the home "
                 "fetcher, if any, is asked straight away",
                 self._direct_page_failures, outcome.get("error"),
                 self._DIRECT_PAGE_COOLDOWN / 60,
+                ", or until the page tunnel's next config is up" if moving else "",
             )
 
     @staticmethod

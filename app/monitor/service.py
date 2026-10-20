@@ -1466,7 +1466,12 @@ class MonitorService:
                     "or start the phone's home fetcher."
                 )
             elif tunnel.configured:
-                fix = "Start the phone's home fetcher to get full readings back."
+                fix = (
+                    "Start the phone's home fetcher to get full readings back, "
+                    "or add configs for more Proton free servers to "
+                    "page_tunnel.conf — the tunnel moves to the next one when "
+                    "Instagram keeps refusing its IP."
+                )
             else:
                 fix = (
                     "Start the phone's home fetcher, or set up the page "

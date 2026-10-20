@@ -18,7 +18,12 @@ What must hold:
   — restarted, and handed to the next config (2026-10-20: it stayed "up" for
   hours while every page through it timed out);
 - the page door's cooldown, earned on a path that is gone, is forgotten when
-  the tunnel comes back.
+  the tunnel comes back;
+- a path that works but whose IP Instagram keeps refusing (the page door's
+  breaker tripping on answers through the tunnel) is moved to the next
+  config, and the door tries the new IP at once — never on one odd page,
+  never on timeouts alone, never with one config, and at most one lap of
+  refused configs per cooldown window.
 
 Runs fully offline: a stand-in "wireproxy" (a real SOCKS5 relay in Python)
 and a local HTTP server stand in for the VPN and the IP-check site.
@@ -33,6 +38,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -49,6 +55,7 @@ from app.config import settings  # noqa: E402
 from app.monitor import home_fetch, page_tunnel  # noqa: E402
 from app.monitor.instagram import InstagramClient  # noqa: E402
 from app.monitor.page_tunnel import PageTunnel  # noqa: E402
+from app.utils.logger import logger  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -544,6 +551,222 @@ async def test_only_an_unanswered_page_request_suspects_the_tunnel() -> None:
         page_tunnel.tunnel = old_tunnel
 
 
+class _Timeout(Exception):
+    pass
+
+
+class _Scripted:
+    """A page session that answers each request as scripted — an HTTP status,
+    or "silent" for no answer at all — then 429 for ever after."""
+
+    def __init__(self, *answers: Any) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, dict]] = []
+
+    async def get(self, url: str, **kw: Any):
+        self.calls.append((url, kw))
+        answer = self.answers.pop(0) if self.answers else 429
+        if answer == "silent":
+            raise _Timeout("Failed to perform, curl: (28) Connection timed out after "
+                           "10000 milliseconds.")
+        return types.SimpleNamespace(status_code=answer, text="", url="")
+
+    async def close(self) -> None:
+        pass
+
+
+async def _refuse(client: InstagramClient, times: int, *, forced: bool = True) -> dict:
+    out: dict = {}
+    for _ in range(times):
+        out = await client.probe_public_page("pageuser", allow_home=False, force_direct=forced)
+    return out
+
+
+async def test_the_door_asks_for_a_move_only_when_instagram_answers() -> None:
+    """The page door's side: a breaker tripped on pages that came BACK
+    through the tunnel (a 429, a login redirect) asks it to move; a timeout
+    is the tunnel's own restart path, as before; one refused page asks
+    nothing; neither does a door that went out from this host."""
+    old_tunnel = page_tunnel.tunnel
+    try:
+        up = PageTunnel()
+        up.up, up._port, up._configs, up._wake = True, 1080, ["a", "b"], asyncio.Event()
+        failures: list[str] = []
+        moves: list[tuple[str, int]] = []
+        up.report_failure = failures.append  # type: ignore[method-assign]
+        up.report_refused = lambda reason, *, epoch: moves.append((reason, epoch)) or True  # type: ignore[method-assign]
+        page_tunnel.tunnel = up
+
+        async with InstagramClient(max_retries=1, session=_Scripted(429)) as client:
+            await _refuse(client, 1)
+            expect("one refused page through the tunnel asks for no move",
+                   moves == [] and client.direct_page_failures == 1, repr(moves))
+            await _refuse(client, 2)
+            expect("the breaker's third refusal through the tunnel asks it to move",
+                   moves == [("HTTP 429", up.epoch)], repr(moves))
+
+        moves.clear()
+        async with InstagramClient(max_retries=1, session=_Scripted("silent", "silent", "silent")) as client:
+            await _refuse(client, 3)
+        expect("timeouts alone go to the restart path, not a move",
+               moves == [] and len(failures) == 3, repr((moves, failures)))
+
+        failures.clear()
+        async with InstagramClient(max_retries=1, session=_Scripted("silent", "silent", 429)) as client:
+            await _refuse(client, 3)
+        expect("but a streak Instagram answered through the tunnel asks for a move — "
+               "the answer proves the path, so the silence was Instagram's too",
+               len(moves) == 1 and len(failures) == 2, repr((moves, failures)))
+
+        moves.clear()
+        up.up = False
+        async with InstagramClient(max_retries=1, session=_Scripted()) as client:
+            await _refuse(client, 3)
+        expect("refusals from this host's own IP ask the tunnel for nothing", moves == [], repr(moves))
+    finally:
+        page_tunnel.tunnel = old_tunnel
+
+    real = PageTunnel()
+    real.up, real._port, real._configs, real._wake = True, 1080, ["a", "b"], asyncio.Event()
+    expect("a refusal booked on a path already replaced is dropped",
+           real.report_refused("HTTP 429", epoch=real.epoch - 1) is False and real._refused is None)
+    expect("one booked on the path in use is taken",
+           real.report_refused("HTTP 429", epoch=real.epoch) is True and real._refused is not None)
+    single = PageTunnel()
+    single.up, single._port, single._configs, single._wake = True, 1080, ["a"], asyncio.Event()
+    expect("with one config there is nowhere to move",
+           single.report_refused("HTTP 429", epoch=single.epoch) is False and single._refused is None)
+
+
+async def test_a_refused_ip_moves_to_the_next_config(fx: _Fixture) -> None:
+    """The gap df5de82 left (2026-10-21): the tunnel moved to its next config
+    only when the path was DEAD. A path Instagram refuses — 429s, login
+    redirects — "works", so the bot stayed on a refused IP while the owner's
+    other Proton configs sat unused. Now the page door's breaker, tripped on
+    answers that came back through the tunnel, moves it on, and the door
+    tries the new IP at once."""
+    names = ("page_tunnel_config", "CHECK_URL", "CHECK_URL_SECOND", "tunnel",
+             "WATCH_INTERVAL", "SUSPECT_MIN_GAP")
+    old = {n: getattr(settings if n == "page_tunnel_config" else page_tunnel, n) for n in names}
+    settings.page_tunnel_config = str(fx.two_confs)
+    page_tunnel.CHECK_URL = page_tunnel.CHECK_URL_SECOND = fx.check_url
+    page_tunnel.WATCH_INTERVAL, page_tunnel.SUSPECT_MIN_GAP = 0.05, 0.0
+    fx.dead.write_text("", encoding="utf-8")
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(m.record["message"]), level="WARNING")
+    try:
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start()
+        pid, epoch = tunnel._proc.pid, tunnel.epoch
+        session = _Scripted()
+        async with InstagramClient(max_retries=1, session=session) as client:
+            await _refuse(client, 2)
+            await asyncio.sleep(0.3)
+            expect("refused pages under the breaker move nothing",
+                   tunnel.label == "TEST-FREE#1" and tunnel._proc.pid == pid
+                   and tunnel.epoch == epoch and tunnel._refused is None, tunnel.describe())
+
+            lines.clear()
+            await _refuse(client, 1)
+            moved = await _until(lambda: tunnel.up and tunnel.label == "TEST-FREE#2")
+            expect("the breaker tripping on a refused IP moves the tunnel to the next config",
+                   moved and tunnel._proc.pid != pid, tunnel.describe())
+            expect("the new config counts as a new route", tunnel.epoch > epoch,
+                   repr((epoch, tunnel.epoch)))
+            rotation = [line for line in lines if "took over" in line]
+            expect("one WARNING names the old config, the new one and why",
+                   len(rotation) == 1 and "TEST-FREE#1" in rotation[0]
+                   and "TEST-FREE#2" in rotation[0] and "HTTP 429" in rotation[0], repr(lines))
+            expect("and never a key", not any("aGVsbG8" in line or "PrivateKey" in line
+                                              for line in lines), repr(lines))
+
+            calls = len(session.calls)
+            out = await client.probe_public_page("pageuser", allow_home=False)
+            expect("the page door tries the new IP at once instead of waiting out the cooldown",
+                   len(session.calls) == calls + 1 and out.get("route") == page_tunnel.TUNNEL_ROUTE
+                   and session.calls[-1][1].get("proxy") == tunnel.proxy_url,
+                   repr((out, session.calls[-1:])))
+
+            # A lap: the new config is refused too, and the old one was left
+            # minutes ago. Stay put; the page door's cooldown holds.
+            pid, epoch = tunnel._proc.pid, tunnel.epoch
+            await _refuse(client, 2)
+            await _until(lambda: tunnel._refused is None, 5.0)
+            await asyncio.sleep(0.3)
+            expect("once every config was refused within the window, the tunnel stays put",
+                   tunnel.up and tunnel.label == "TEST-FREE#2" and tunnel._proc.pid == pid
+                   and tunnel.epoch == epoch, tunnel.describe())
+            expect("and the page door's cooldown holds",
+                   client.direct_page_door_failing
+                   and client._direct_page_blocked_until > time.monotonic(),
+                   repr((client._direct_page_failures, client._direct_page_blocked_until)))
+
+            # The window passes, and so does the door's cooldown: its one
+            # re-test is refused, and this time the tunnel moves on.
+            for index in tunnel._left_at:
+                tunnel._left_at[index] -= page_tunnel.ROTATE_WINDOW
+            client._direct_page_blocked_until = 0.0
+            await _refuse(client, 1, forced=False)
+            moved = await _until(lambda: tunnel.up and tunnel.label == "TEST-FREE#1")
+            expect("after the window it moves again", moved and tunnel.epoch > epoch,
+                   tunnel.describe())
+
+            # The next config gives no answer when the tunnel gets there: it
+            # goes back to the refused one, and that is not a new route — the
+            # door's cooldown on that IP stands.
+            for index in tunnel._left_at:
+                tunnel._left_at[index] -= page_tunnel.ROTATE_WINDOW
+            fx.dead.write_text("198.51.100.4:51820", encoding="utf-8")
+            epoch = tunnel.epoch
+            lines.clear()
+            await _refuse(client, 3)
+            await _until(lambda: tunnel._refused is None, 5.0)
+            back = await _until(lambda: tunnel.up and any("gave no answer" in line for line in lines))
+            expect("a move to a config that gives no answer comes back to the one that works",
+                   back and tunnel.label == "TEST-FREE#1", tunnel.describe())
+            expect("on the same IP, with the page door's cooldown still standing",
+                   tunnel.epoch == epoch and client.direct_page_door_failing
+                   and client._direct_page_blocked_until > time.monotonic(),
+                   repr((epoch, tunnel.epoch, client._direct_page_blocked_until)))
+            expect("and the silent config is not tried again within the window",
+                   tunnel._fresh_configs() == [], repr(tunnel._left_at))
+        await tunnel.stop()
+    finally:
+        logger.remove(sink)
+        fx.dead.write_text("", encoding="utf-8")
+        for n, value in old.items():
+            setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
+
+
+async def test_one_config_is_never_moved(fx: _Fixture) -> None:
+    """With one config there is nowhere to go: a refused IP leaves the tunnel
+    alone and the page door's cooldown is what holds, exactly as before."""
+    names = ("page_tunnel_config", "CHECK_URL", "CHECK_URL_SECOND", "tunnel", "WATCH_INTERVAL")
+    old = {n: getattr(settings if n == "page_tunnel_config" else page_tunnel, n) for n in names}
+    settings.page_tunnel_config = str(fx.conf)
+    page_tunnel.CHECK_URL = page_tunnel.CHECK_URL_SECOND = fx.check_url
+    page_tunnel.WATCH_INTERVAL = 0.05
+    try:
+        tunnel = fx.tunnel("ok")
+        page_tunnel.tunnel = tunnel
+        await tunnel.start()
+        pid, epoch = tunnel._proc.pid, tunnel.epoch
+        async with InstagramClient(max_retries=1, session=_Scripted()) as client:
+            await _refuse(client, 3)
+            await asyncio.sleep(0.3)
+            expect("one config: a refused IP restarts and moves nothing",
+                   tunnel.up and tunnel._proc.pid == pid and tunnel.epoch == epoch
+                   and tunnel._refused is None, tunnel.describe())
+            expect("and the page door's cooldown holds as before",
+                   client.direct_page_door_failing
+                   and client._direct_page_blocked_until > time.monotonic())
+        await tunnel.stop()
+    finally:
+        for n, value in old.items():
+            setattr(settings if n == "page_tunnel_config" else page_tunnel, n, value)
+
+
 async def main() -> int:
     fx = _Fixture()
     try:
@@ -555,6 +778,9 @@ async def main() -> int:
         await test_a_dead_path_is_restarted_then_replaced(fx)
         await test_an_up_tunnel_is_proven_on_a_schedule(fx)
         await test_only_an_unanswered_page_request_suspects_the_tunnel()
+        await test_the_door_asks_for_a_move_only_when_instagram_answers()
+        await test_a_refused_ip_moves_to_the_next_config(fx)
+        await test_one_config_is_never_moved(fx)
     finally:
         fx.close()
     print()

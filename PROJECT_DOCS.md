@@ -767,6 +767,26 @@ at 0%, a sweep of 13 failures and 4 id-only readings. Now:
   line, named in logs and `/status` by the server Proton writes under
   `[Peer]` (`# RO-FREE#22`). One connection at a time, so this is failover,
   not load sharing;
+- a path that works but whose **IP Instagram keeps refusing** is moved on
+  too (2026-10-21). Until then the tunnel moved only when the path was dead:
+  a 429 or a login redirect comes back through the path, so the bot stayed
+  on a refused IP with the other configs unused. Now, when the page door's
+  breaker trips (3 refusals in a row) and Instagram answered at least one of
+  them through the tunnel, the door calls `report_refused`; the watchdog —
+  still the only thing that touches wireproxy — switches to the next config,
+  proves it with the same launch + IP check, and only then routes pages
+  through it. The epoch bump resets the door's cooldown, so the next check
+  tries the new IP at once. One WARNING per move names the old and new
+  server and the reason. Not on one odd page (only the breaker trip), not on
+  timeouts alone (those still go to the restart path above), and never with
+  one config. At most **one lap per 30 min** (`ROTATE_WINDOW`, the door's
+  cooldown): a config refused, or silent when a move sent the tunnel to it,
+  is not moved to again within it, so once every config has been refused
+  the tunnel stays put and the door's cooldown holds. A move whose next
+  configs all stay silent goes back to the refused one, and on the same IP
+  that is not a new route: the cooldown stands. When the tunnel is up and a
+  sweep still reads no counts, the no-counts notice suggests adding configs
+  for more Proton free servers;
 - a down tunnel retries on a back-off (5 → 10 → 20 → 30 min), one WARNING
   per outage and INFO after;
 - the page door's refusal streak is booked against the tunnel's path

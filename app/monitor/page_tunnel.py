@@ -21,9 +21,10 @@ Configured with a standard WireGuard .conf (Proton VPN: account.protonvpn.com
 PAGE_TUNNEL_CONFIG (the text, or a path) or as a Render Secret File named
 page_tunnel.conf. Several configs may be given one after another (each from
 its own [Interface] line): the first that answers is used, and the next takes
-over when it stops. Started at boot and proved end to end — a request through
-it must come back — before anything is routed through it. A tunnel that does
-not come up leaves the page door exactly as it was and says why.
+over when it stops — or when Instagram keeps refusing its IP. Started at boot
+and proved end to end — a request through it must come back — before anything
+is routed through it. A tunnel that does not come up leaves the page door
+exactly as it was and says why.
 
 The watchdog keeps PROVING it, not just keeping the process alive. Measured
 2026-10-20: wireproxy kept running while nothing came back through it, and
@@ -34,6 +35,14 @@ re-proven every PROVE_INTERVAL, at once when a page request through it gets no
 answer at all (`report_failure`), and one whose path is dead is restarted —
 a fresh WireGuard handshake from a fresh UDP port — then moved to the next
 config.
+
+A path that works is not enough: Instagram judges the IP. When the page door
+keeps getting REFUSED through the tunnel — its breaker trips on pages that
+came back (a 429, a login redirect, a page with no profile), not on timeouts
+— it calls `report_refused`, and the watchdog moves to the next config the
+same way, proven before anything is routed through it. At most one lap per
+ROTATE_WINDOW: once every config has been refused (or gave no answer when
+tried) within it, the tunnel stays put and the page door's cooldown holds.
 
 This is live data over a different route, never a cache — it does not touch
 the rule that a reading must be Instagram's state right now.
@@ -80,6 +89,11 @@ RESTART_BACKOFF_MAX = 600.0
 # A page timeout this soon after the tunnel was proven is not re-proven: the
 # path answered moments ago, so the timeout was Instagram's side.
 SUSPECT_MIN_GAP = 30.0
+# A config Instagram refused (or one that gave no answer when a refusal sent
+# the tunnel to it) is not moved to again for this long — the page door's own
+# cooldown (InstagramClient._DIRECT_PAGE_COOLDOWN), so a lap of refused IPs
+# costs one lap per cooldown window, not a merry-go-round.
+ROTATE_WINDOW = 1800.0
 
 
 def _load_config() -> Optional[str]:
@@ -162,6 +176,12 @@ class PageTunnel:
         # Set by `report_failure` to wake the watchdog before its next look.
         self._wake: Optional[asyncio.Event] = None
         self._suspect: Optional[str] = None
+        # Set by `report_refused`: (the epoch the refusals were booked on,
+        # why). When each config was last refused by Instagram, or gave no
+        # answer when a refusal sent the tunnel to it — what keeps rotation
+        # to one lap per ROTATE_WINDOW.
+        self._refused: Optional[tuple[int, str]] = None
+        self._left_at: dict[int, float] = {}
         self._checked_at = 0.0
         self._restarts = 0
         # One outage is one WARNING: the re-tries after it log at INFO, on a
@@ -174,9 +194,9 @@ class PageTunnel:
         self.error: Optional[str] = None
         self.label: Optional[str] = None
         # Bumped every time the tunnel is proven up after not being up, or
-        # comes back on another IP. The page door books its refusal streak
-        # against this: a streak earned on a path that is gone says nothing
-        # about the one that replaced it.
+        # comes back on another IP — moving to another config included. The
+        # page door books its refusal streak against this: a streak earned on
+        # a path that is gone says nothing about the one that replaced it.
         self.epoch = 0
 
     # ----------------------------------------------------------- state
@@ -209,6 +229,26 @@ class PageTunnel:
             return
         self._suspect = reason
         self._wake.set()
+
+    def report_refused(self, reason: str, *, epoch: int) -> bool:
+        """Instagram keeps refusing pages that came back THROUGH the tunnel —
+        the page door's breaker tripped on its answers (a 429, a login
+        redirect, a page with no profile). The path works; the IP is what
+        Instagram will not serve, and restarting the same config would not
+        change it.
+
+        Wakes the watchdog to move to the next config (it alone touches the
+        process). `epoch` is the path the refusals were booked on: a report
+        about a path already replaced is dropped. True when a move was asked
+        for — never with one config, where the page door's cooldown is all
+        there is."""
+        if self._wake is None or not self.up or len(self._configs) < 2:
+            return False
+        if epoch != self.epoch:
+            return False
+        self._refused = (epoch, reason)
+        self._wake.set()
+        return True
 
     # -------------------------------------------------------- lifecycle
 
@@ -248,7 +288,8 @@ class PageTunnel:
         if len(usable) > 1:
             logger.info(
                 "Page tunnel: {} configs ({}) — the first that answers is "
-                "used, the next takes over when it stops",
+                "used, the next takes over when it stops or Instagram keeps "
+                "refusing its IP",
                 len(usable), ", ".join(_label(c) for c in usable),
             )
         if not await self._bring_up():
@@ -344,10 +385,7 @@ class PageTunnel:
         one answers."""
         first = self._index
         for step in range(len(self._configs)):
-            if step:
-                self._use(first + step)
-            await self._terminate()
-            if await self._launch() and await self.check():
+            if await self._switch_to(first + step):
                 if step:
                     logger.warning(
                         "Page tunnel: {} gave no answer, so {} took over",
@@ -355,6 +393,81 @@ class PageTunnel:
                     )
                 return True
         return False
+
+    async def _switch_to(self, index: int) -> bool:
+        """Run config `index` in a fresh wireproxy and prove it."""
+        self._use(index)
+        await self._terminate()
+        return await self._launch() and await self.check()
+
+    def _fresh_configs(self) -> list[int]:
+        """The other configs a refused one may move to, in file order after
+        it: each one not left within ROTATE_WINDOW."""
+        now = asyncio.get_running_loop().time()
+        count = len(self._configs)
+        fresh: list[int] = []
+        for step in range(1, count):
+            index = (self._index + step) % count
+            left = self._left_at.get(index)
+            if left is None or now - left >= ROTATE_WINDOW:
+                fresh.append(index)
+        return fresh
+
+    async def _rotate(self, reason: str) -> bool:
+        """Move off a config whose IP Instagram keeps refusing (see
+        `report_refused`): to the first fresh config that is proven up, else
+        back to this one. False when there was nowhere to go and nothing was
+        touched — every other config was left within ROTATE_WINDOW."""
+        loop = asyncio.get_running_loop()
+        start, old_label, old_ip, epoch = self._index, self.label, self.egress_ip, self.epoch
+        self._left_at[start] = loop.time()
+        fresh = self._fresh_configs()
+        if not fresh:
+            logger.info(
+                "Page tunnel: Instagram is refusing pages through {} too ({}), "
+                "and every other config was refused or gave no answer in the "
+                "last {:.0f} min — staying on it; the page door's cooldown holds",
+                old_label, reason, ROTATE_WINDOW / 60,
+            )
+            return False
+        # Nothing is routed through it while it switches: the proof of the
+        # next config is what lets pages through again (and bumps the epoch,
+        # so the page door tries the new IP at once).
+        self.up = False
+        for index in fresh:
+            if await self._switch_to(index):
+                logger.warning(
+                    "Page tunnel: Instagram kept refusing pages through {} ({}), "
+                    "so {} took over — pages now leave from {}",
+                    old_label, reason, self.label, self.egress_ip,
+                )
+                return True
+            self._left_at[index] = loop.time()
+        silent = ", ".join(_label(self._configs[i]) for i in fresh)
+        if await self._switch_to(start):
+            same = self.egress_ip == old_ip
+            if same:
+                # Back on the very IP the page door's refusals are about:
+                # not a new route, so its cooldown stands. (check() bumped
+                # the epoch with no await since, so nothing has seen it.)
+                self.epoch = epoch
+            logger.warning(
+                "Page tunnel: Instagram kept refusing pages through {} ({}), "
+                "but {} gave no answer — staying on {}{}",
+                old_label, reason, silent, old_label,
+                "; the page door's cooldown holds" if same
+                else f", now leaving from {self.egress_ip}",
+            )
+        else:
+            logger.warning(
+                "Page tunnel: Instagram kept refusing pages through {} ({}), but "
+                "{} gave no answer and neither does {} now — profile pages go "
+                "out from this host's own IP until one does",
+                old_label, reason, silent, old_label,
+            )
+            self._down_reported = True
+            self._still_down(self._recheck_interval())
+        return True
 
     async def _launch(self) -> bool:
         assert self._conf is not None and self._port is not None
@@ -428,10 +541,11 @@ class PageTunnel:
 
     async def _tend(self) -> None:
         """One look. A wireproxy that exited is restarted (backing off on a
-        crash loop). An up tunnel is re-proven every PROVE_INTERVAL, and at
-        once when a page request through it went unanswered; one that fails
-        the proof is restarted, then moved to the next config. A down one is
-        restarted on a back-off."""
+        crash loop). An up tunnel whose IP Instagram keeps refusing moves to
+        the next config. An up tunnel is re-proven every PROVE_INTERVAL, and
+        at once when a page request through it went unanswered; one that
+        fails the proof is restarted, then moved to the next config. A down
+        one is restarted on a back-off."""
         if self._proc is None or self._proc.returncode is not None:
             code = self._proc.returncode if self._proc is not None else None
             self.up = False
@@ -452,6 +566,13 @@ class PageTunnel:
                 )
             return
         suspect, self._suspect = self._suspect, None
+        refused, self._refused = self._refused, None
+        if refused is not None and self.up and refused[0] == self.epoch:
+            # First: leaving this path also settles a timeout reported on it
+            # (the next config is proven before use). Only when there is
+            # nowhere to go is the suspect looked at below.
+            if await self._rotate(refused[1]):
+                return
         since = asyncio.get_running_loop().time() - self._checked_at
         if not self.up:
             if since < self._recheck_interval():
@@ -486,7 +607,8 @@ class PageTunnel:
                 logger.exception("Page tunnel watchdog: {}", exc)
 
     async def _nap(self, seconds: float) -> None:
-        """Sleep, or wake early when `report_failure` asks."""
+        """Sleep, or wake early when `report_failure` or `report_refused`
+        asks."""
         if self._wake is None:
             await asyncio.sleep(seconds)
             return
