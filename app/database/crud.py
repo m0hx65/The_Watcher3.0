@@ -397,25 +397,24 @@ async def get_latest_pic_baseline(
     return (row[0], row[1]) if row else (None, None)
 
 
-async def get_earlier_pic_urls(
+async def get_pic_history(
     session: AsyncSession, account_id: int, *, limit: int = 200
-) -> list[str]:
-    """Avatar URLs of the successful snapshots BEFORE the newest one (which is
-    the pic baseline), newest first — to recognise a reading that serves an
-    older upload than the baseline. `cleanup_old_snapshots` keeps 200 rows."""
+) -> list[tuple[str, datetime]]:
+    """(avatar URL, created_at) of the successful snapshots, newest first —
+    the newest being the pic baseline. For recognising a reading that serves
+    an older upload than the baseline. `cleanup_old_snapshots` keeps 200."""
     stmt = (
-        select(AccountSnapshot.profile_pic_url)
+        select(AccountSnapshot.profile_pic_url, AccountSnapshot.created_at)
         .where(
             AccountSnapshot.account_id == account_id,
             AccountSnapshot.http_status == 200,
             AccountSnapshot.profile_pic_url.is_not(None),
         )
         .order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id))
-        .offset(1)
         .limit(limit)
     )
     result = await session.execute(stmt)
-    return [row[0] for row in result.all()]
+    return [(row[0], row[1]) for row in result.all()]
 
 
 async def insert_snapshot(

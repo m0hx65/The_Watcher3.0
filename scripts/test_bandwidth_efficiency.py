@@ -378,6 +378,7 @@ async def test_a_stale_reading_of_the_old_picture_is_not_a_change(tmp: Path) -> 
            r.get("changed") is False, repr(r))
     expect("and is not downloaded", hasher.calls == downloads,
            f"calls={hasher.calls}")
+
     parsed["profile_pic_url"] = URL_B                          # fresh again
     r = await service.check_username("cached")
     expect("the current picture is not announced a second time",
@@ -385,6 +386,80 @@ async def test_a_stale_reading_of_the_old_picture_is_not_a_change(tmp: Path) -> 
     expect("one change, one photo",
            service.notifier.send_document.call_count
            + service.notifier.send_photo.call_count == 1)
+
+
+async def test_a_stale_door_keeps_its_evidence(tmp: Path) -> None:
+    # The API door last saw A (its own row, days old); the page door saw B a
+    # minute ago (the newest row). The API door now answers from a cache with
+    # A, twice. Overwriting the API row's A with B on the first stale reading
+    # erased the only record of A, so the second was downloaded and announced.
+    from datetime import datetime, timedelta, timezone
+
+    from app.database.models import AccountSnapshot
+    from app.monitor.media_hasher import pic_asset_id
+
+    now = datetime.now(timezone.utc)
+    async with get_session() as session:
+        account = MonitoredAccount(username="twocache", active=True, instagram_id="3009")
+        session.add(account)
+        await session.flush()
+        for age, url, fp, raw in (
+            (timedelta(days=2), URL_A, _fp(), None),
+            (timedelta(minutes=1), URL_B, _fp(shift=-100), {"source": "public_page"}),
+        ):
+            session.add(AccountSnapshot(
+                account_id=account.id, username="twocache", http_status=200,
+                followers_count=10, following_count=5, posts_count=0,
+                is_private=True, profile_pic_url=url, profile_pic_hash=fp,
+                raw_response=raw, created_at=now - age,
+            ))
+    parsed = _parsed("twocache", "3009", URL_A_ROTATED)
+    hasher = UrlHasher({pic_asset_id(URL_A): _fp(),
+                        pic_asset_id(URL_B): _fp(shift=-100)}, tmp / "p.jpg")
+    service = _service(FakeInstagram(parsed), hasher)
+    first = await service.check_username("twocache")
+    second = await service.check_username("twocache")
+    expect("neither stale reading is announced",
+           first.get("changed") is False and second.get("changed") is False,
+           f"{first!r} {second!r}")
+    expect("and neither is downloaded", hasher.calls == 0, f"calls={hasher.calls}")
+
+
+DEFAULT_AVATAR = (
+    "https://scontent-fra5-1.cdninstagram.com/v/t51.2885-19/"
+    "44884218_345707102882519_2446069589734326272_n.jpg?_nc_cat=1&oh=d&oe=1"
+)
+
+
+async def test_removing_the_picture_is_reported(tmp: Path) -> None:
+    # Every account without a picture shows Instagram's default avatar, one
+    # shared asset id; a new account starts on it. Removing a picture goes
+    # back to it, an EARLIER asset id. That is a change, not a stale reading,
+    # once the current picture has been up longer than any cache lives.
+    from datetime import datetime, timedelta, timezone
+
+    from app.database.models import AccountSnapshot
+    from app.monitor.media_hasher import pic_asset_id
+
+    now = datetime.now(timezone.utc)
+    async with get_session() as session:
+        account = MonitoredAccount(username="remover", active=True, instagram_id="3008")
+        session.add(account)
+        await session.flush()
+        for age, url, fp in ((timedelta(days=30), DEFAULT_AVATAR, _fp(shift=60)),
+                             (timedelta(days=2), URL_B, _fp(shift=-100))):
+            session.add(AccountSnapshot(
+                account_id=account.id, username="remover", http_status=200,
+                followers_count=10, following_count=5, posts_count=0,
+                is_private=True, profile_pic_url=url, profile_pic_hash=fp,
+                created_at=now - age,
+            ))
+    parsed = _parsed("remover", "3008", DEFAULT_AVATAR)
+    hasher = UrlHasher({pic_asset_id(DEFAULT_AVATAR): _fp(shift=60),
+                        pic_asset_id(URL_B): _fp(shift=-100)}, tmp / "p.jpg")
+    service = _service(FakeInstagram(parsed), hasher)
+    r = await service.check_username("remover")
+    expect("going back to the default avatar is reported", r.get("changed") is True, repr(r))
 
 
 # ---------- 2. The story media listing ----------
@@ -529,6 +604,8 @@ async def main() -> int:
     await test_upgrade_does_not_redownload_every_sweep(tmp)
     await test_a_picture_another_door_announced_is_not_announced_again(tmp)
     await test_a_stale_reading_of_the_old_picture_is_not_a_change(tmp)
+    await test_removing_the_picture_is_reported(tmp)
+    await test_a_stale_door_keeps_its_evidence(tmp)
     await test_story_listing_follows_the_live_flag()
     await test_highlight_scan_cadence()
     await test_story_phase_applies_the_cadence()

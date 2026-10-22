@@ -151,6 +151,47 @@ def avatar_quality(result: dict) -> str:
     return f"{measured} — the largest a logged-out request gets for this account"
 
 
+# How long after a picture first appears a reading of an EARLIER upload can
+# still be a cache talking: the phone's results and the page cache live
+# home_fetch.RESULT_TTL_SECONDS (15 minutes), the reel cache 90 s. Twice that,
+# for the margin.
+_STALE_PIC_WINDOW = timedelta(seconds=2 * home_fetch.RESULT_TTL_SECONDS)
+
+
+def _is_stale_pic(
+    current_asset: str,
+    baseline_asset: str,
+    history: list[tuple[str, datetime]],
+    now: datetime,
+) -> bool:
+    """True when a reading's avatar is an upload the account had BEFORE its
+    current one, read while a cache could still be serving that upload.
+
+    Every upload gets a new asset id, so an earlier id coming back is either a
+    cache or the account genuinely returning to it — and the second happens:
+    removing a picture brings back Instagram's default avatar, whose asset id
+    is shared by every account without one, including this account before it
+    first set a picture. So the guard only holds within _STALE_PIC_WINDOW of
+    the current picture's first sighting; after that the earlier id is a real
+    change. (A removal inside the window is reported by the first reading
+    after it, not lost.) `history` is (url, created_at), newest first.
+    """
+    since: Optional[datetime] = None
+    older: list[tuple[str, datetime]] = []
+    for index, (url, created_at) in enumerate(history):
+        if pic_asset_id(url) != baseline_asset:
+            older = history[index:]
+            break
+        since = created_at
+    if since is None or not older:
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if now - since > _STALE_PIC_WINDOW:
+        return False
+    return current_asset in {pic_asset_id(url) for url, _at in older}
+
+
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
     """An ISO timestamp from app_settings as an aware UTC datetime, or None."""
     if not raw:
@@ -2395,17 +2436,17 @@ class MonitorService:
             and current_asset == baseline_asset
         )
         # A reading can also be OLDER than the baseline: a door answering from
-        # a cache (the phone's results live 15 minutes) after a fresh reading
-        # saw the new picture. Every upload gets a new asset id, so an id the
-        # account had BEFORE its current one is a stale answer, not a change.
-        # Downloading it compared the old picture with the new baseline and
-        # announced the old photo as a change — then the next fresh reading
-        # announced the new one again.
+        # a cache after a fresh reading saw the new picture. Downloading it
+        # compared the old picture with the new baseline and announced the old
+        # photo as a change — then the next fresh reading announced the new one
+        # again. See _is_stale_pic for when an earlier upload id is stale.
         pic_stale = False
         if pic_url and current_asset and baseline_asset and current_asset != baseline_asset:
             async with get_session() as session:
-                earlier = await crud.get_earlier_pic_urls(session, account_id)
-            pic_stale = current_asset in {pic_asset_id(u) for u in earlier}
+                history = await crud.get_pic_history(session, account_id)
+            pic_stale = _is_stale_pic(
+                current_asset, baseline_asset, history, datetime.now(timezone.utc)
+            )
             if pic_stale:
                 logger.info(
                     "Avatar for @{} is an earlier upload ({}) than the stored one "
@@ -2704,8 +2745,13 @@ class MonitorService:
                 # both bloated the row and wiped the stored story/highlight
                 # state. The slim form keeps reel_data current instead.
                 previous.raw_response = slim_raw or None
-                previous.profile_pic_url = stored_pic_url
-                previous.profile_pic_hash = stored_pic_hash
+                if not pic_stale:
+                    # A stale reading's door row keeps the earlier upload it
+                    # last saw: writing the current one over it erased the
+                    # only record of that upload, and the next stale reading
+                    # of it was no longer recognised.
+                    previous.profile_pic_url = stored_pic_url
+                    previous.profile_pic_hash = stored_pic_hash
                 previous.error = None
                 # The picture's baseline is the newest row from ANY door (see
                 # detect_changes' pic_baseline), which may be another door's.
