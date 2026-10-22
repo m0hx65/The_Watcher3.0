@@ -135,6 +135,21 @@ def _humanize_seconds(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
+def avatar_quality(result: dict) -> str:
+    """The quality line of a fetched avatar's caption, from its MEASURED size.
+
+    This said "320px" for every non-HD avatar long after 320px stopped being
+    reachable: since the username API was walled (2026-09-05) the fallback is
+    the id route's or the page's 150px variant, and a private account's 150×150
+    went out captioned 320px.
+    """
+    size = result.get("size")
+    if result.get("hd"):
+        return f"HD · {size[0]}×{size[1]}" if size else "HD"
+    measured = f"{size[0]}×{size[1]}" if size else "standard"
+    return f"{measured} — the largest a logged-out request gets for this account"
+
+
 def _parse_utc(raw: Optional[str]) -> Optional[datetime]:
     """An ISO timestamp from app_settings as an aware UTC datetime, or None."""
     if not raw:
@@ -4416,9 +4431,8 @@ class MonitorService:
         result = await self.fetch_profile_picture(username)
         if not result.get("ok"):
             return {"ok": False, "hd": False, "error": result.get("error")}
-        quality = "HD" if result.get("hd") else "320px (anonymous max)"
         caption = (
-            f"👤 <b>@{esc(username)}</b> — profile picture · {quality}\n"
+            f"👤 <b>@{esc(username)}</b> — profile picture · {avatar_quality(result)}\n"
             f"SHA256: <code>{esc(result['sha256'])}</code>"
         )
         ok = await self.notifier.send_document(result["path"], caption=caption)
@@ -4590,9 +4604,11 @@ class MonitorService:
         """Download the CURRENT profile picture at the best available quality.
 
         Login-free, works for any username. Prefers the HD (up to 1080px) avatar
-        from saveinsta; falls back to the web profile_pic_url_hd (320px, the
-        anonymous ceiling for accounts saveinsta can't reach, e.g. private ones).
-        Returns {"ok", "path", "sha256", "byte_size", "hd", "error"}.
+        from saveinsta; falls back to whatever avatar the profile fetch carries
+        for accounts saveinsta can't reach, e.g. private ones: 320px while the
+        username API answered, the 150px variant since it was walled.
+        Returns {"ok", "path", "sha256", "byte_size", "size", "hd", "error"};
+        `size` is the measured (width, height), None if unreadable.
         """
         username = username.strip().lstrip("@").lower()
 
@@ -4614,14 +4630,14 @@ class MonitorService:
 
         if hashed is None:
             # No HD avatar (private account / saveinsta down) or its download
-            # failed mid-flight — fall back to the web profile_pic_url_hd (320px).
+            # failed mid-flight — fall back to the profile fetch's avatar.
             fetch = await self.instagram.fetch_profile(username)
             if not fetch.success or not fetch.parsed:
                 return {
                     "ok": False, "path": None,
                     "error": fetch.error or f"HTTP {fetch.http_status}",
                 }
-            web_url = fetch.parsed.get("profile_pic_url")  # already hd(320) or 150
+            web_url = fetch.parsed.get("profile_pic_url")  # 320 via the API, else 150
             if not web_url:
                 return {"ok": False, "path": None, "error": "No profile picture available"}
             hd_url = None  # what we deliver below is the web fallback, not HD
@@ -4635,6 +4651,7 @@ class MonitorService:
             "path": hashed.local_path,
             "sha256": hashed.sha256,
             "byte_size": hashed.byte_size,
+            "size": await asyncio.to_thread(image_size, hashed.local_path),
             "hd": bool(hd_url),
             "error": None,
         }

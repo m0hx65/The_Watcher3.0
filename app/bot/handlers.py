@@ -32,7 +32,7 @@ from app.database.session import get_session
 from app.monitor import home_fetch, page_tunnel
 from app.monitor.analytics import compute_rhythm, render_rhythm
 from app.monitor.health import fetch_health, render_health_lines
-from app.monitor.service import MonitorService
+from app.monitor.service import MonitorService, avatar_quality
 from app.utils.formatting import esc, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
 from app.utils.tasks import spawn
@@ -1236,14 +1236,10 @@ async def _send_profile_photo(
             reply_markup=keyboard,
         )
         return
-    quality = (
-        "HD" if result.get("hd")
-        else "standard (320px — anonymous max for this account)"
-    )
     caption = (
         f"<b>@{esc(username)}</b>\n"
         f"SHA256: <code>{esc(result['sha256'])}</code>\n"
-        f"Size: {result['byte_size'] // 1024} KB · {quality}"
+        f"Size: {result['byte_size'] // 1024} KB · {avatar_quality(result)}"
     )
     with open(result["path"], "rb") as f:
         await context.bot.send_document(

@@ -17,6 +17,13 @@ For @username it reports whether the logged-out profile page (the one the
 home fetcher already sends the bot) carries shortcodes and full-size
 renditions in its posts-grid block (polaris_ordered_timeline_connection).
 
+    python scripts/probe_full_res.py threads:@username
+
+checks whether the logged-out Threads profile of the same person carries
+bigger avatars (hd_profile_pic_versions, 320/640px per third-party scrapers)
+than the 150px every logged-out Instagram route gives a private account.
+Only works for people who have a Threads profile.
+
 Needs a residential IP: Render's and Cloudflare's get the login page.
 """
 
@@ -245,12 +252,43 @@ async def probe_grid(session: AsyncSession, username: str) -> None:
         )
 
 
+async def probe_threads_avatar(session: AsyncSession, username: str) -> None:
+    print(f"\n== logged-out Threads profile of @{username}: avatar sizes ==")
+    page = await session.get(f"https://www.threads.com/@{username}")
+    print(
+        f"  HTTP {page.status_code}, {len(page.content) // 1024} KB,"
+        f" landed on {urlparse(str(page.url)).path}"
+    )
+    versions = [
+        v for found in _objects_after(page.text, '"hd_profile_pic_versions":')
+        if isinstance(found, list) for v in found
+        if isinstance(v, dict) and v.get("url")
+    ]
+    plain = next(
+        (u for u in _objects_after(page.text, '"profile_pic_url":') if isinstance(u, str)),
+        None,
+    )
+    if plain:
+        print(f"  profile_pic_url  ->  {await measure(session, plain)}")
+    if not versions:
+        print("  no hd_profile_pic_versions on this page")
+        return
+    for version in sorted(versions, key=_area, reverse=True)[:3]:
+        print(
+            f"  hd {version.get('width')}×{version.get('height')}"
+            f"  ->  {await measure(session, version['url'])}"
+        )
+
+
 async def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
     arg = sys.argv[1].strip()
     async with AsyncSession(impersonate="chrome120", timeout=30) as session:
+        if arg.startswith("threads:@"):
+            await probe_threads_avatar(session, arg[len("threads:@"):])
+            return 0
         if arg.startswith("@"):
             await probe_grid(session, arg[1:])
             return 0
