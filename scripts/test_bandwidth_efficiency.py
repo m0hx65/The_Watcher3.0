@@ -85,8 +85,9 @@ def expect(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def _fp(dhash: int = 0, ahash: int = 0, mean: int = 0x80) -> str:
-    return f"{PHASH_PREFIX}{dhash:064x}:{ahash:064x}:{mean:02x}"
+def _fp(shift: int = 0) -> str:
+    """A v3 fingerprint every pixel of which is `shift` gray levels off _fp()'s."""
+    return PHASH_PREFIX + bytes([128 + shift] * 256).hex()
 
 
 class CountingHasher:
@@ -216,7 +217,7 @@ async def test_new_upload_still_downloads(tmp: Path) -> None:
         session.add(MonitoredAccount(username="swapper", active=True))
 
     parsed = _parsed("swapper", "3002", URL_A)
-    changed = _fp(dhash=(1 << 200) - 1, ahash=(1 << 200) - 1, mean=0x10)
+    changed = _fp(shift=-100)
     hasher = CountingHasher([_fp(), changed, changed], tmp / "p.jpg")
     service = _service(FakeInstagram(parsed), hasher)
 
@@ -270,6 +271,67 @@ async def test_non_cdn_url_always_downloads(tmp: Path) -> None:
     await service.check_username("odd")
     expect("an unparseable avatar URL disables the skip", hasher.calls == 2,
            f"calls={hasher.calls}")
+
+
+async def _two_door_history(username: str, ig_id: str, *, api_hash, page_hash,
+                            pic_url: str) -> None:
+    """An older API-door reading and a NEWER page-door one, as a sweep finds
+    them when the page answered last."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.database.models import AccountSnapshot
+
+    now = datetime.now(timezone.utc)
+    async with get_session() as session:
+        account = MonitoredAccount(username=username, active=True, instagram_id=ig_id)
+        session.add(account)
+        await session.flush()
+        for age_hours, pic_hash, raw in ((48, api_hash, None),
+                                         (1, page_hash, {"source": "public_page"})):
+            session.add(AccountSnapshot(
+                account_id=account.id, username=username, http_status=200,
+                followers_count=10, following_count=5, posts_count=0,
+                is_private=True, profile_pic_url=pic_url,
+                profile_pic_hash=pic_hash, raw_response=raw,
+                created_at=now - timedelta(hours=age_hours),
+            ))
+
+
+async def test_upgrade_does_not_redownload_every_sweep(tmp: Path) -> None:
+    # Both doors' rows hold an old-format fingerprint, the page's being the
+    # newest. The API door's first sweep re-fingerprints (silently); the
+    # second must skip — the any-door baseline it reads is the page's row, and
+    # leaving that row's fingerprint old made every API sweep download again.
+    old_format = "p2:" + "0" * 64 + ":" + "0" * 64 + ":80"
+    await _two_door_history("upgrader", "3005", api_hash=old_format,
+                            page_hash=old_format, pic_url=URL_A)
+    parsed = _parsed("upgrader", "3005", URL_A_ROTATED)
+    hasher = CountingHasher([_fp()], tmp / "p.jpg")
+    service = _service(FakeInstagram(parsed), hasher)
+
+    r1 = await service.check_username("upgrader")
+    expect("the upgrade re-fingerprints once", hasher.calls == 1, f"calls={hasher.calls}")
+    expect("silently", r1.get("changed") is False, repr(r1))
+    await service.check_username("upgrader")
+    expect("and then skips again, whichever door's row is newest",
+           hasher.calls == 1, f"calls={hasher.calls}")
+
+
+async def test_a_picture_another_door_announced_is_not_announced_again(tmp: Path) -> None:
+    # The page door saw the change A -> B and alerted. The API door's own last
+    # reading still holds A. Its next sweep sees B: the chat already has B.
+    await _two_door_history("announced", "3006", api_hash=_fp(),
+                            page_hash=_fp(shift=-100),
+                            pic_url="http://example.test/b.jpg")
+    parsed = _parsed("announced", "3006", "http://example.test/b.jpg")
+    hasher = CountingHasher([_fp(shift=-100)], tmp / "p.jpg")
+    service = _service(FakeInstagram(parsed), hasher)
+
+    r = await service.check_username("announced")
+    expect("the picture is not reported again", r.get("changed") is False, repr(r))
+    expect("and no photo goes out",
+           service.notifier.send_document.call_count
+           + service.notifier.send_photo.call_count == 0)
 
 
 # ---------- 2. The story media listing ----------
@@ -411,6 +473,8 @@ async def main() -> int:
     await test_new_upload_still_downloads(tmp)
     await test_skip_needs_a_v2_baseline(tmp)
     await test_non_cdn_url_always_downloads(tmp)
+    await test_upgrade_does_not_redownload_every_sweep(tmp)
+    await test_a_picture_another_door_announced_is_not_announced_again(tmp)
     await test_story_listing_follows_the_live_flag()
     await test_highlight_scan_cadence()
     await test_story_phase_applies_the_cadence()

@@ -13,32 +13,41 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
-from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.config import settings
 from app.utils.logger import logger
 
 CHROME_IMPERSONATE = "chrome120"
 
-# Prefix marking a v2 perceptual fingerprint, so change detection can tell it
-# apart from a legacy raw-SHA256 hash OR the old 64-bit "p:" dHash and treat the
-# format switch as a silent baseline rather than a spurious "changed".
+# Prefix marking a v3 fingerprint, so change detection can tell it apart from
+# every older format (raw SHA256, the 64-bit "p:" dHash, the "p2:" dHash+aHash)
+# and treat the switch as a silent baseline rather than a spurious "changed".
 #
-# The v2 fingerprint is "p2:<dhash>:<ahash>:<mean>" — two independent 256-bit
-# perceptual hashes plus the brightness mean of the SAME normalized image (see
-# perceptual_hash). Change detection weighs all three complementary signals so a
-# single noisy one can never raise a false alarm (see change_detector).
-PHASH_PREFIX = "p2:"
+# The v3 fingerprint is "p3:<hex>": the picture itself, as a 16×16 grayscale
+# thumbnail (256 bytes). Change detection compares the two thumbnails pixel by
+# pixel (see change_detector.pic_difference).
+#
+# Why not the bit hashes any more: a dHash/aHash bit is the SIGN of a tiny
+# difference, and in a dark or low-contrast picture those differences are one
+# or two gray levels, which JPEG noise flips. Measured 2026-10-22 on 21 real
+# photos, each as Instagram serves an avatar (1440/1080/320/150/96px at JPEG
+# quality 25-92) and as-is, darkened and flattened: p2 called the SAME picture
+# changed in 61 of 1,323 version pairs (dHash up to 63 bits, aHash up to 60,
+# against a 40-bit floor), nearly all dark or flat ones, i.e. a typical selfie
+# avatar. Averaging pixels instead of thresholding them cancels that noise:
+# the same pairs differ by at most 1.62 gray levels RMS (median 0.84), while
+# distinct photos differ by 10.5 or more, and no distinct pair came closer than
+# 2.8 (two washed-out textures).
+PHASH_PREFIX = "p3:"
 
-# Side of the perceptual-hash grid. 16 → 16*16 = 256 bits per hash. Much finer
-# than the old 8 (64 bits): genuinely different avatars separate cleanly so real
-# swaps are never missed, while the normalization below keeps re-encodes at ~0.
-_HASH_SIZE = 16
-# Canonical grayscale working resolution. Both a 1440px HD avatar and a 150px
-# thumbnail of the SAME picture collapse to this identical intermediate, so it no
-# longer matters which CDN variant we happened to download — the fingerprint is
-# the same either way. This is the single biggest fix for the "said it changed
-# when it didn't" flapping.
+# Side of the stored thumbnail. Measured at 8, 12, 16, 24 and 32: the margin
+# between same-picture noise and distinct pictures was ~1.6-1.7× at every size,
+# so the smallest that still keeps a face's layout (eyes, hair, background) wins.
+_THUMB_SIZE = 16
+# Intermediate resolution every source is first reduced to, so a 1440px HD
+# avatar and a 150px thumbnail of one picture take the same path to the
+# thumbnail.
 _WORK_SIZE = 64
 
 
@@ -49,7 +58,7 @@ class HashedMedia:
     content_type: Optional[str]
     local_path: Path
     source_url: str
-    # Perceptual (difference) hash of the decoded image. Profile-picture change
+    # Perceptual fingerprint of the decoded image. Profile-picture change
     # detection compares THIS, not sha256: Instagram's CDN re-encodes the same
     # avatar at different sizes/qualities per signed URL, so the raw bytes (and
     # thus sha256) differ on every fetch even when the picture is unchanged.
@@ -135,79 +144,36 @@ def _strip_cdn_size(url: str) -> Optional[str]:
     return url if modified else None
 
 
-def _normalized_gray(data: bytes) -> Image.Image:
-    """Decode image bytes into a canonical grayscale image for hashing.
+def _thumbnail(data: bytes) -> Image.Image:
+    """Decode image bytes into the canonical grayscale thumbnail.
 
-    Every step here exists to make the SAME avatar produce the SAME hash no
-    matter which CDN re-encode we fetched:
-      * exif_transpose — honor any rotation flag so orientation can't differ.
-      * convert("L")   — drop color; we compare structure, not exact RGB.
-      * resize to a fixed working size — collapse 1440px / 320px / 150px
-        variants of one picture into one identical intermediate.
-      * GaussianBlur   — smooth away JPEG 8×8 block noise, the thing that used
-        to flip near-zero gradient bits and fake a "change".
+      * exif_transpose: honor any rotation flag so orientation can't differ.
+      * convert("L"): drop color; a recolor that keeps the light/dark layout is
+        not what "changed their picture" means.
+      * LANCZOS to the working size, then a BOX average to the thumbnail: every
+        thumbnail pixel is the mean of a block of the picture, which is what
+        cancels JPEG noise.
     """
     img = Image.open(io.BytesIO(data))
     img = ImageOps.exif_transpose(img) or img
-    img = img.convert("L").resize((_WORK_SIZE, _WORK_SIZE), Image.LANCZOS)
-    return img.filter(ImageFilter.GaussianBlur(radius=1))
+    gray = img.convert("L").resize((_WORK_SIZE, _WORK_SIZE), Image.LANCZOS)
+    return gray.resize((_THUMB_SIZE, _THUMB_SIZE), Image.BOX)
 
 
-def _dhash_bits(gray: Image.Image, size: int) -> int:
-    """Difference hash: sign of each left→right gradient. Robust to brightness."""
-    small = gray.resize((size + 1, size), Image.LANCZOS)
-    px = list(small.getdata())
-    bits = 0
-    for row in range(size):
-        base = row * (size + 1)
-        for col in range(size):
-            bits = (bits << 1) | int(px[base + col] > px[base + col + 1])
-    return bits
+def perceptual_hash(data: bytes) -> Optional[str]:
+    """The picture's fingerprint, as ``p3:<hex of a 16×16 grayscale thumbnail>``.
 
-
-def _ahash_bits(gray: Image.Image, size: int) -> int:
-    """Average hash: each pixel above the image mean. Captures overall layout."""
-    small = gray.resize((size, size), Image.LANCZOS)
-    px = list(small.getdata())
-    avg = sum(px) / len(px)
-    bits = 0
-    for p in px:
-        bits = (bits << 1) | int(p > avg)
-    return bits
-
-
-def perceptual_hash(data: bytes, *, size: int = _HASH_SIZE) -> Optional[str]:
-    """Combined perceptual fingerprint of an image, as ``p2:<dhash>:<ahash>:<mean>``.
-
-    Computes, over one normalized image (see _normalized_gray), THREE
-    complementary signals:
-      * dhash — a 256-bit difference hash (gradient structure),
-      * ahash — a 256-bit average hash (overall light/dark layout), and
-      * mean  — the overall grayscale brightness (0–255, two hex digits).
-    They capture different aspects of the picture, so change detection can demand
-    strong agreement before declaring a change — a single noisy signal can never
-    raise a false alarm. The mean is what lets a flat solid-color avatar (whose
-    gradient/layout hashes are uninformatively all-zero) still register a swap to
-    a different solid color.
-
-    The aggressive normalization keeps two CDN re-encodes of one avatar within a
-    couple of bits on both hashes and ~3 levels of brightness, while genuinely
-    different pictures sit far apart — so every threshold lives in a wide
-    no-man's-land (see change_detector). Returns None for non-image payloads
-    (e.g. a CDN error page), which the caller treats as "no new fingerprint",
-    never a change.
+    Stable across every size and JPEG quality Instagram serves one avatar at,
+    dark and low-contrast pictures included (see PHASH_PREFIX for the
+    measurement). Returns None for non-image payloads (e.g. a CDN error page),
+    which the caller treats as "no new fingerprint", never a change.
     """
     try:
-        gray = _normalized_gray(data)
+        thumb = _thumbnail(data)
     except (UnidentifiedImageError, OSError, ValueError, TypeError) as exc:
-        logger.warning("Could not perceptually hash image ({} bytes): {}", len(data), exc)
+        logger.warning("Could not fingerprint image ({} bytes): {}", len(data), exc)
         return None
-    width = (size * size + 3) // 4  # hex digits needed for size*size bits
-    dhash = _dhash_bits(gray, size)
-    ahash = _ahash_bits(gray, size)
-    pixels = list(gray.getdata())
-    mean = round(sum(pixels) / len(pixels)) & 0xFF
-    return f"{PHASH_PREFIX}{dhash:0{width}x}:{ahash:0{width}x}:{mean:02x}"
+    return PHASH_PREFIX + thumb.tobytes().hex()
 
 
 def image_size(path: Path) -> Optional[tuple[int, int]]:

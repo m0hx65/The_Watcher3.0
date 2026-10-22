@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -10,60 +11,29 @@ from app.monitor.media_hasher import PHASH_PREFIX, pic_asset_id
 from app.monitor.public_page import strip_bidi
 from app.utils.logger import logger
 
-# A v2 fingerprint is "p2:<dhash>:<ahash>:<mean>" — two independent 256-bit
-# perceptual hashes plus the brightness mean of one normalized image. They have
-# complementary strengths, measured across a spread of avatars × CDN re-encodes:
-#   * aHash (overall light/dark layout) is rock-solid stable across re-encodes
-#     (same avatar ≤ ~2 bits) but a softer discriminator (distinct avatars ≥ ~10).
-#   * dHash (gradient structure) separates distinct avatars strongly (≥ ~45) but
-#     is noisier on flat re-encodes (same avatar up to ~24 bits).
-#   * mean (brightness) barely moves across re-encodes (≤3 levels) and is the
-#     only signal that sees a flat solid-color swap (where both hashes are 0).
+# A v3 fingerprint is the picture as a 16×16 grayscale thumbnail (see
+# media_hasher.PHASH_PREFIX). Two fingerprints are compared by the RMS of their
+# pixel differences, in gray levels (0-255), with three rules in order:
 #
-# The decision below plays each to its strength so the result is bulletproof in
-# both directions:
-#   changed = (dHash ≥ DHASH_CHANGE_MIN  AND  aHash ≥ AHASH_CHANGE_MIN)
-#             OR dHash ≥ DHASH_CHANGE_STRONG
-#             OR |Δmean| ≥ BRIGHTNESS_CHANGE_MIN
-# The AND branch needs the STABLE aHash to also move, so dHash's flat-region
-# noise can never raise a false "changed" on a re-encode (the aHash vetoes it).
-# The OR branches catch a structurally very different picture even when its
-# layout happens to be similar, and a solid-color swap the hashes can't see.
-# Every floor sits in the wide no-man's-land between the two distributions
-# (verified, with margin, by scripts/test_profile_pic_change.py).
+#   1. Same asset id on both avatar URLs: the same upload, so never a change,
+#      whatever the pixels say. Instagram assigns a new id when, and only when,
+#      a new picture is set (see media_hasher.pic_asset_id). The pixels of two
+#      versions of one upload (150px id route, 320px API, up to 1080px from
+#      saveinsta) are not evidence against that.
+#   2. Difference ≥ PIC_CHANGE_MIN: a change.
+#   3. A NEW asset id and difference ≥ PIC_URL_CHANGE_MIN: a change. A new id
+#      already says "they uploaded something", so the pixels only have to rule
+#      out the same picture uploaded again.
 #
-# On top of the pure-perceptual decision there is a URL-identity branch: when
-# the avatar URL's numeric asset id changed (Instagram only assigns a new one
-# on an actual upload — see media_hasher.pic_asset_id), the reduced
-# *_URL_CHANGE_MIN floors below apply, catching subtle real swaps the strong
-# floors deliberately ignore.
-PHASH_BITS = 256
-DHASH_CHANGE_MIN = 32     # AND-branch dHash floor (re-encode ≤24, distinct ≥45)
-AHASH_CHANGE_MIN = 6      # AND-branch aHash floor (re-encode ≤2,  distinct ≥10)
-DHASH_CHANGE_STRONG = 40  # OR-branch: structural change strong enough on its own
-# OR-branch on overall brightness. Re-encodes jitter ≤3 grayscale levels; a swap
-# between two different solid-color avatars (whose structural hashes are an
-# uninformative all-zero) shifts the mean far more. The floor sits well above
-# re-encode jitter so it never false-positives, yet catches the flat-image swap
-# the two bit-hashes are blind to.
-BRIGHTNESS_CHANGE_MIN = 12
-
-# Reduced floors, used ONLY when the avatar URL's asset id changed (see
-# media_hasher.pic_asset_id): Instagram assigns a new numeric id when — and
-# only when — a new picture is uploaded, so the prior probability of a real
-# change is high and the perceptual gate only has to rule out "same picture
-# re-uploaded / migrated". Each floor still clears the measured same-image
-# re-encode noise (dHash ≤24, aHash ≤2, brightness ≤3), so a rotating id with
-# an unchanged picture can never false-alarm — but a genuinely different photo
-# that was too subtle for the strong floors above (similar composition, same
-# person) now gets caught instead of being silently absorbed forever.
-DHASH_URL_CHANGE_MIN = 28
-AHASH_URL_CHANGE_MIN = 4
-BRIGHTNESS_URL_CHANGE_MIN = 6
-
-# Back-compat alias: the old single-threshold name a couple of call sites/tests
-# referenced. The v2 decision uses the floors above instead.
-PHASH_HAMMING_THRESHOLD = DHASH_CHANGE_MIN
+# Measured 2026-10-22 (21 real photos × as-is/dark/flat × 7 CDN versions): the
+# same picture differs by ≤1.62 (median 0.84); distinct photos by ≥10.5, and the
+# closest distinct pair of all, two washed-out textures, by 2.8. Hard-edged
+# graphics at JPEG quality 20, harsher than anything Instagram serves, reach
+# 2.96: the floor sits above that, so even that never reads as a change. The
+# pathological near-blank pairs below it are still caught when they arrive
+# with a new asset id, as a real upload does.
+PIC_CHANGE_MIN = 3.5
+PIC_URL_CHANGE_MIN = 2.0
 
 
 @dataclass
@@ -135,6 +105,7 @@ def detect_changes(
     *,
     new_pic_hash: Optional[str] = None,
     observed_fields: Optional[set[str]] = None,
+    pic_baseline: Optional[tuple[Optional[str], Optional[str]]] = None,
 ) -> ChangeSet:
     """Build a structured changeset between two snapshots.
 
@@ -153,12 +124,38 @@ def detect_changes(
     Carrying a value forward is a statement about storage, not an observation.
     Only what this reading actually saw can be a change; everything else is
     unknown and stays silent.
+
+    `pic_baseline` is the (fingerprint, avatar URL) the picture is compared
+    against; without it, `previous`'s are used.
     """
     changeset = ChangeSet(username=current.username)
 
-    if previous is None:
-        # First successful observation — record baseline hash, no change events.
+    # The picture is the same whichever door saw it, so it is compared against
+    # the newest fingerprint from ANY door (`pic_baseline`, the one the
+    # service's confirmation pass already checked), not this door's own last
+    # reading. Diffing it per door re-announced a change another door had
+    # already reported: the page's weeks-old picture A against today's B, which
+    # the chat had been shown the day it happened.
+    if pic_baseline is not None:
+        old_hash, old_url = pic_baseline
+    elif previous is not None:
+        old_hash, old_url = previous.profile_pic_hash, previous.profile_pic_url
+    else:
+        old_hash, old_url = None, None
+    if new_pic_hash and old_hash and _pic_changed(
+        old_hash, new_pic_hash, old_url=old_url, new_url=current.profile_pic_url
+    ):
+        changeset.profile_pic_changed = True
+        changeset.old_pic_hash = old_hash
         changeset.new_pic_hash = new_pic_hash
+    elif new_pic_hash and not old_hash:
+        # We didn't have a hash before; record baseline silently.
+        changeset.new_pic_hash = new_pic_hash
+
+    if previous is None:
+        # First successful observation from this door: no field changes.
+        if not changeset.profile_pic_changed:
+            changeset.new_pic_hash = new_pic_hash
         return changeset
 
     for field_name, label in FIELD_LABELS.items():
@@ -171,43 +168,34 @@ def detect_changes(
                 Change(field=field_name, old=old_val, new=new_val, label=label)
             )
 
-    # Profile picture: compare perceptual hashes plus the URL's asset id — not
-    # raw URLs (signed params rotate) or raw bytes (the CDN re-encodes the same
-    # avatar per signed URL — see HashedMedia).
-    old_hash = previous.profile_pic_hash
-    if new_pic_hash and old_hash and _pic_changed(
-        old_hash,
-        new_pic_hash,
-        old_url=previous.profile_pic_url,
-        new_url=current.profile_pic_url,
-    ):
-        changeset.profile_pic_changed = True
-        changeset.old_pic_hash = old_hash
-        changeset.new_pic_hash = new_pic_hash
-    elif new_pic_hash and not old_hash:
-        # We didn't have a hash before; record baseline silently.
-        changeset.new_pic_hash = new_pic_hash
-
     return changeset
 
 
-def _parse_fingerprint(value: str) -> Optional[tuple[int, int, int]]:
-    """Parse "p2:<dhash>:<ahash>:<mean>" into (dhash_bits, ahash_bits, mean).
+def _parse_fingerprint(value: Optional[str]) -> Optional[bytes]:
+    """The thumbnail inside a "p3:" fingerprint, or None.
 
-    Returns None for anything that isn't a v2 fingerprint — a legacy raw-SHA256
-    baseline, the old 64-bit "p:" dHash, or a malformed value. Callers treat a
-    None on either side as a silent baseline so the one-time format upgrade never
-    fires a spurious "changed" on the first post-deploy sweep.
+    None for anything else: a raw-SHA256, "p:" or "p2:" baseline from before
+    the upgrade, or a malformed value. Callers treat a None on either side as a
+    silent baseline, so the format upgrade never fires a spurious "changed" on
+    the first sweep after it.
     """
-    if not value.startswith(PHASH_PREFIX):
-        return None
-    parts = value[len(PHASH_PREFIX):].split(":")
-    if len(parts) != 3:
+    if not value or not value.startswith(PHASH_PREFIX):
         return None
     try:
-        return int(parts[0], 16), int(parts[1], 16), int(parts[2], 16)
+        thumb = bytes.fromhex(value[len(PHASH_PREFIX):])
     except ValueError:
         return None
+    return thumb or None
+
+
+def pic_difference(old_hash: Optional[str], new_hash: Optional[str]) -> Optional[float]:
+    """RMS pixel difference of two fingerprints, in gray levels; None when
+    either is not a comparable v3 fingerprint."""
+    old = _parse_fingerprint(old_hash)
+    new = _parse_fingerprint(new_hash)
+    if old is None or new is None or len(old) != len(new):
+        return None
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(old, new)) / len(old))
 
 
 def pic_fingerprints_differ(
@@ -230,58 +218,39 @@ def _pic_changed(
     old_url: Optional[str] = None,
     new_url: Optional[str] = None,
 ) -> bool:
-    """True only when two profile-picture fingerprints are a real, visible change.
+    """True only when two profile-picture fingerprints are a real change.
 
-    Each fingerprint carries a dHash (gradient structure), an aHash (light/dark
-    layout), and a brightness mean. A change is reported when the structural
-    evidence is strong on both bit-hashes, OR overwhelming on the dHash alone, OR
-    the overall brightness shifts well past CDN re-encode jitter (the flat
-    solid-color swap the bit-hashes can't see). A single noisy signal can never
-    raise a false alarm, while a real swap clears one of these comfortably.
-
-    Additionally, when both avatar URLs carry a parseable asset id and the ids
-    DIFFER — Instagram registered a new upload — the reduced *_URL_CHANGE_MIN
-    floors apply, so a subtle real swap (similar composition, same person) that
-    the strong floors would miss is still caught. The perceptual gate stays in
-    the loop so an id that rotated without a visible change (re-upload of the
-    same picture, CDN migration) is treated as a silent baseline.
-
-    Any non-v2 value on either side (legacy hash, format upgrade, unhashable
+    See PIC_CHANGE_MIN for the rules and the measurement behind them. Any
+    non-v3 value on either side (legacy hash, format upgrade, unhashable
     payload) is a silent baseline: recorded, but not reported as a change.
     """
-    old = _parse_fingerprint(old_hash)
-    new = _parse_fingerprint(new_hash)
-    if old is None or new is None:
+    difference = pic_difference(old_hash, new_hash)
+    if difference is None:
         return False
-    dhash_dist = bin(old[0] ^ new[0]).count("1")
-    ahash_dist = bin(old[1] ^ new[1]).count("1")
-    brightness_dist = abs(old[2] - new[2])
-    if (
-        (dhash_dist >= DHASH_CHANGE_MIN and ahash_dist >= AHASH_CHANGE_MIN)
-        or dhash_dist >= DHASH_CHANGE_STRONG
-        or brightness_dist >= BRIGHTNESS_CHANGE_MIN
-    ):
-        return True
-
     old_id = pic_asset_id(old_url)
     new_id = pic_asset_id(new_url)
-    if old_id and new_id and old_id != new_id:
-        if (
-            dhash_dist >= DHASH_URL_CHANGE_MIN
-            or ahash_dist >= AHASH_URL_CHANGE_MIN
-            or brightness_dist >= BRIGHTNESS_URL_CHANGE_MIN
-        ):
+    if old_id and new_id and old_id == new_id:
+        if difference >= PIC_CHANGE_MIN:
+            logger.info(
+                "Avatar pixels differ by {:.1f} but the asset id ({}) is the same "
+                "upload — two versions of one picture, not a change",
+                difference, old_id,
+            )
+        return False
+    if difference >= PIC_CHANGE_MIN:
+        return True
+    if old_id and new_id:
+        if difference >= PIC_URL_CHANGE_MIN:
             logger.info(
                 "Profile-pic change detected via asset id ({} -> {}) with "
-                "subtle perceptual evidence (dhash={}, ahash={}, brightness={})",
-                old_id, new_id, dhash_dist, ahash_dist, brightness_dist,
+                "subtle pixel evidence (difference {:.1f})",
+                old_id, new_id, difference,
             )
             return True
         logger.info(
-            "Avatar asset id changed ({} -> {}) but the images read identical "
-            "(dhash={}, ahash={}, brightness={}) — treating as a re-upload/"
-            "migration of the same picture, not a change",
-            old_id, new_id, dhash_dist, ahash_dist, brightness_dist,
+            "Avatar asset id changed ({} -> {}) but the pictures read identical "
+            "(difference {:.1f}) — a re-upload of the same picture, not a change",
+            old_id, new_id, difference,
         )
     return False
 

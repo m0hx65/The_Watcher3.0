@@ -27,6 +27,7 @@ from app.monitor.analytics import classify_follower_change, render_follower_anom
 from app.monitor.change_detector import (
     ChangeSet,
     detect_changes,
+    pic_difference,
     pic_fingerprints_differ,
 )
 from app.monitor import home_fetch, page_tunnel
@@ -2657,6 +2658,12 @@ class MonitorService:
                 snapshot,
                 new_pic_hash=new_pic_hash,
                 observed_fields=set(parsed) if fetch.partial else None,
+                # The newest fingerprint from any door: the same row the
+                # confirmation pass above compared against.
+                pic_baseline=(
+                    (last_known.profile_pic_hash, last_known.profile_pic_url)
+                    if last_known is not None else None
+                ),
             )
             # The rename (if any) was announced by _apply_rename above; drop
             # the diff's own copy so one rename is one message whichever
@@ -2680,6 +2687,14 @@ class MonitorService:
                 previous.profile_pic_url = stored_pic_url
                 previous.profile_pic_hash = stored_pic_hash
                 previous.error = None
+                # The picture's baseline is the newest row from ANY door (see
+                # detect_changes' pic_baseline), which may be another door's.
+                # Left behind, it kept an old-format fingerprint after the
+                # upgrade and every sweep from this door re-downloaded the
+                # avatar to compare against it.
+                if last_known is not None and last_known is not previous:
+                    last_known.profile_pic_url = stored_pic_url
+                    last_known.profile_pic_hash = stored_pic_hash
                 logger.debug(
                     "@{} - no changes detected; refreshed latest 200 response",
                     username,
@@ -2723,7 +2738,9 @@ class MonitorService:
             account_id,
             username,
             changeset,
-            previous_snapshot_id=previous.id if previous else None,
+            # "Baseline recorded" means no reading at all, from any door: a
+            # door's first reading can still report a picture change.
+            previous_snapshot_id=last_known.id if last_known else None,
             new_pic_path=hashed.local_path if hashed else None,
             notify_unchanged=notify_unchanged,
         )
@@ -2849,11 +2866,12 @@ class MonitorService:
 
         # Profile picture sent as a document to preserve full quality
         if changeset.profile_pic_changed and new_pic_path is not None:
-            caption = (
-                f"<b>@{username}</b> changed profile picture\n"
-                f"Old fingerprint: <code>{changeset.old_pic_hash}</code>\n"
-                f"New fingerprint: <code>{changeset.new_pic_hash}</code>"
-            )
+            difference = pic_difference(changeset.old_pic_hash, changeset.new_pic_hash)
+            caption = f"<b>@{username}</b> changed profile picture"
+            if difference is not None:
+                # One version of one picture stays under 2 gray levels; a
+                # different picture is typically 10+.
+                caption += f"\nDifference from the last one: {difference:.1f}"
             ok = await self.notifier.send_document(
                 new_pic_path, caption=caption, message_thread_id=thread_id
             )

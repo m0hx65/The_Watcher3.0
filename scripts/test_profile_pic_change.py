@@ -54,12 +54,10 @@ from app.database.models import (  # noqa: E402
 )
 from app.database.session import engine, get_session  # noqa: E402
 from app.monitor.change_detector import (  # noqa: E402
-    AHASH_CHANGE_MIN,
-    DHASH_CHANGE_MIN,
-    DHASH_CHANGE_STRONG,
-    _parse_fingerprint,
+    PIC_CHANGE_MIN,
     _pic_changed,
     detect_changes,
+    pic_difference,
 )
 from app.monitor.instagram import IdProbe, ProfileFetchResult  # noqa: E402
 from app.monitor.media_hasher import (  # noqa: E402
@@ -82,11 +80,6 @@ def expect(name: str, condition: bool, detail: str = "") -> None:
     print(line)
     if not condition:
         FAILURES.append(name)
-
-
-def _dist(a: str, b: str) -> tuple[int, int]:
-    pa, pb = _parse_fingerprint(a), _parse_fingerprint(b)
-    return bin(pa[0] ^ pb[0]).count("1"), bin(pa[1] ^ pb[1]).count("1")
 
 
 def _encode(img: Image.Image, *, size: int, quality: int) -> bytes:
@@ -138,6 +131,39 @@ def _make_avatars() -> list[Image.Image]:
     return out
 
 
+def _make_photo_like() -> list[Image.Image]:
+    """Avatars that look like PHOTOS: sensor grain under a face, as-is, dark
+    (a night or mirror selfie) and washed out. The clean shapes above never
+    fooled the old dHash/aHash fingerprint; these did, because in a dark or
+    flat picture a pixel's neighbours differ by a gray level or two and the
+    JPEG noise of a 150px copy flips the sign. (Measured on real photos the
+    same way, 2026-10-22: 61 false "changed" in 1,323 version pairs.)
+    """
+    import random
+
+    from PIL import ImageEnhance, ImageFilter
+
+    out: list[Image.Image] = []
+    # Two different people: face placement, skin and hair all differ.
+    faces = (
+        (7, [110, 100, 330, 420], (200, 170, 150), (50, 35, 30)),
+        (11, [210, 170, 440, 480], (140, 100, 80), (190, 160, 90)),
+    )
+    for seed, box, skin, hair in faces:
+        grain = Image.frombytes(
+            "L", (512, 512), random.Random(seed).randbytes(512 * 512)
+        ).filter(ImageFilter.GaussianBlur(1.5))
+        img = Image.merge("RGB", (grain, grain, grain))
+        d = ImageDraw.Draw(img)
+        d.ellipse(box, fill=skin)
+        d.chord([box[0], box[1] - 30, box[2], box[1] + 200], 180, 360, fill=hair)
+        img = Image.blend(img, Image.merge("RGB", (grain, grain, grain)), 0.35)
+        out.append(img)
+        out.append(ImageEnhance.Brightness(img).enhance(0.35))
+        out.append(ImageEnhance.Contrast(img).enhance(0.25))
+    return out
+
+
 def _reencodes(img: Image.Image) -> list[bytes]:
     """Same picture as the CDN serves it: many sizes × JPEG qualities."""
     out: list[bytes] = []
@@ -150,59 +176,55 @@ def _reencodes(img: Image.Image) -> list[bytes]:
 # ---------- Part A: the fingerprint + decision are bulletproof both ways ------
 
 def test_perceptual_hash() -> None:
-    avatars = _make_avatars()
+    avatars = _make_avatars() + _make_photo_like()
     groups = [[perceptual_hash(b) for b in _reencodes(im)] for im in avatars]
 
     expect("every re-encode hashes to a fingerprint",
            all(all(g) for g in groups))
-    expect("fingerprint carries the p2: marker",
-           groups[0][0].startswith(PHASH_PREFIX), repr(groups[0][0]))
+    expect("fingerprint carries the p3: marker",
+           groups[0][0].startswith(PHASH_PREFIX), repr(groups[0][0][:8]))
     expect("non-image payload yields None", perceptual_hash(b"not an image") is None)
 
     # The decisive checks: run the ACTUAL decision over every pair.
-    # 1) No re-encode pair of the SAME avatar may read as a change (false pos).
-    worst_same = (0, 0)
+    # 1) No version pair of the SAME avatar may read as a change (false pos).
+    worst_same = 0.0
     fp = 0
     for g in groups:
         for i in range(len(g)):
             for j in range(i + 1, len(g)):
-                dd, ad = _dist(g[i], g[j])
-                worst_same = (max(worst_same[0], dd), max(worst_same[1], ad))
+                worst_same = max(worst_same, pic_difference(g[i], g[j]))
                 if _pic_changed(g[i], g[j]):
                     fp += 1
     expect("ZERO false positives across all re-encode pairs", fp == 0, f"{fp} flagged")
 
-    # 2) Every distinct-avatar pair MUST read as a change (false neg).
-    best_diff = (10**9, 10**9)
+    # 2) Every distinct-avatar pair MUST read as a change (false neg) — the
+    #    smallest version of one against the largest of the other, the way
+    #    a 150px id-route baseline meets a saveinsta HD fallback.
+    best_diff = float("inf")
     fn = 0
     for i in range(len(groups)):
-        for j in range(i + 1, len(groups)):
-            dd, ad = _dist(groups[i][0], groups[j][0])
-            best_diff = (min(best_diff[0], dd), min(best_diff[1], ad))
-            if not _pic_changed(groups[i][0], groups[j][0]):
+        for j in range(len(groups)):
+            if i == j:
+                continue
+            small, big = groups[i][-1], groups[j][0]
+            best_diff = min(best_diff, pic_difference(small, big))
+            if not _pic_changed(small, big):
                 fn += 1
     expect("ZERO false negatives across all distinct pairs", fn == 0, f"{fn} missed")
-
-    # Margin report — the floors must sit clear of both distributions.
-    print(f"   margins: same(dd<={worst_same[0]}, ad<={worst_same[1]}) "
-          f"diff(dd>={best_diff[0]}, ad>={best_diff[1]}) "
-          f"floors(dd_min={DHASH_CHANGE_MIN}, ad_min={AHASH_CHANGE_MIN}, "
-          f"dd_strong={DHASH_CHANGE_STRONG})")
-    expect("same-image dHash noise stays under the floor",
-           worst_same[0] < DHASH_CHANGE_MIN, f"worst same dd={worst_same[0]}")
-    expect("same-image aHash noise stays under the floor",
-           worst_same[1] < AHASH_CHANGE_MIN, f"worst same ad={worst_same[1]}")
+    print(f"   margins: same<={worst_same:.2f} diff>={best_diff:.2f} "
+          f"floor={PIC_CHANGE_MIN}")
+    expect("same-image noise stays under the floor",
+           worst_same < PIC_CHANGE_MIN, f"worst same={worst_same:.2f}")
 
     # The HD-vs-thumbnail flip (1440px stripped URL one sweep, 320px the next)
     # was the live flapping source — it must read identical now.
     big = perceptual_hash(_encode(avatars[0], size=1440, quality=85))
     thumb = perceptual_hash(_encode(avatars[0], size=320, quality=60))
     expect("HD vs 320px of one avatar is NOT a change",
-           not _pic_changed(big, thumb), f"dist={_dist(big, thumb)}")
+           not _pic_changed(big, thumb), f"diff={pic_difference(big, thumb):.2f}")
 
-    # Flat solid-color avatars: the gradient/layout hashes are an uninformative
-    # all-zero, so the brightness signal has to carry the decision. Same color
-    # across re-encodes is NOT a change; a swap to a different solid color IS.
+    # Flat solid-color avatars: same color across re-encodes is NOT a change;
+    # a swap to a different solid color IS.
     red1 = perceptual_hash(_encode(Image.new("RGB", (512, 512), (200, 40, 40)),
                                    size=320, quality=80))
     red2 = perceptual_hash(_encode(Image.new("RGB", (512, 512), (200, 40, 40)),
@@ -210,9 +232,9 @@ def test_perceptual_hash() -> None:
     blue = perceptual_hash(_encode(Image.new("RGB", (512, 512), (40, 40, 200)),
                                    size=320, quality=80))
     expect("same solid color across re-encodes is NOT a change",
-           not _pic_changed(red1, red2), f"dist={_dist(red1, red2)}")
+           not _pic_changed(red1, red2), f"diff={pic_difference(red1, red2):.2f}")
     expect("solid-color swap IS a change",
-           _pic_changed(red1, blue), f"dist={_dist(red1, blue)}")
+           _pic_changed(red1, blue), f"diff={pic_difference(red1, blue):.2f}")
 
 
 # ---------- Part A1b: the URL asset-id signal ----------
@@ -240,9 +262,11 @@ URL_B = (
 )
 
 
-def _fp(dhash: int = 0, ahash: int = 0, mean: int = 0x80) -> str:
-    """Craft a v2 fingerprint with exact bit distances from _fp() (all-zero)."""
-    return f"{PHASH_PREFIX}{dhash:064x}:{ahash:064x}:{mean:02x}"
+def _fp(shift: int = 0, pixels: int = 256) -> str:
+    """Craft a v3 fingerprint `shift` gray levels off _fp() on `pixels` of its
+    256: its difference from _fp() is shift * sqrt(pixels / 256) exactly."""
+    thumb = bytes([128 + shift] * pixels + [128] * (256 - pixels))
+    return PHASH_PREFIX + thumb.hex()
 
 
 def test_url_asset_id() -> None:
@@ -259,15 +283,15 @@ def test_url_asset_id() -> None:
     expect("CDN URL without a numeric basename yields None",
            pic_asset_id("https://scontent.cdninstagram.com/v/t51/avatar.jpg") is None)
 
-    # dd=30/ad=5/Δmean=2: real-but-subtle territory — under every strong floor,
-    # over the reduced dHash floor.
+    # 2.25: under the floor, over the reduced floor a new asset id gets.
     base = _fp()
-    subtle = _fp(dhash=(1 << 30) - 1, ahash=(1 << 5) - 1, mean=0x82)
-    # dd=20/ad=2/Δmean=3: same-picture re-encode territory — under the reduced
-    # floors too (a re-upload/migration of the SAME picture must stay quiet).
-    reupload = _fp(dhash=(1 << 20) - 1, ahash=(1 << 2) - 1, mean=0x83)
-    # Only the brightness moved past re-encode jitter.
-    dimmed = _fp(mean=0x88)
+    subtle = _fp(shift=9, pixels=16)
+    # 1.5: same-picture territory, under the reduced floor too (a re-upload of
+    # the SAME picture must stay quiet).
+    reupload = _fp(shift=6, pixels=16)
+    # Two versions of one upload can differ by much more than re-encode noise
+    # when one is a 150px thumbnail and the other the HD original.
+    versions = _fp(shift=8)
 
     expect("subtle diff WITHOUT url evidence is NOT a change",
            not _pic_changed(base, subtle))
@@ -277,10 +301,10 @@ def test_url_asset_id() -> None:
            _pic_changed(base, subtle, old_url=URL_A, new_url=URL_B))
     expect("new asset id but identical-reading image is NOT a change",
            not _pic_changed(base, reupload, old_url=URL_A, new_url=URL_B))
-    expect("new asset id + subtle brightness shift IS a change",
-           _pic_changed(base, dimmed, old_url=URL_A, new_url=URL_B))
-    expect("subtle brightness shift alone is NOT a change",
-           not _pic_changed(base, dimmed))
+    expect("a big pixel difference with no url evidence IS a change",
+           _pic_changed(base, versions))
+    expect("the SAME asset id is never a change, however far the pixels are",
+           not _pic_changed(base, versions, old_url=URL_A, new_url=URL_A_ROTATED))
 
 
 # ---------- Part A2: detect_changes uses the perceptual comparison ----------
@@ -324,7 +348,7 @@ def test_detect_changes() -> None:
 
     # The URL asset-id signal flows through detect_changes via the snapshots.
     base = _fp()
-    subtle = _fp(dhash=(1 << 30) - 1, ahash=(1 << 5) - 1, mean=0x82)
+    subtle = _fp(shift=9, pixels=16)
     cs = detect_changes(
         _snap(base, URL_A), _snap(subtle, URL_B), new_pic_hash=subtle
     )
@@ -335,6 +359,23 @@ def test_detect_changes() -> None:
     )
     expect("same subtle diff with a rotated-only URL is NOT a change",
            cs.profile_pic_changed is False)
+
+    # The door bug: the page last saw picture A weeks ago; the id route saw
+    # the change to B and alerted. When the page answers again with B, B is
+    # compared with the newest fingerprint from ANY door, B, not the page's A.
+    stale_page = _snap(a)
+    cs = detect_changes(stale_page, _snap(different), new_pic_hash=different,
+                        pic_baseline=(different, None))
+    expect("a picture already announced by another door is NOT a change again",
+           cs.profile_pic_changed is False)
+    cs = detect_changes(stale_page, _snap(different), new_pic_hash=different,
+                        pic_baseline=(a, None))
+    expect("a real change is still a change against the any-door baseline",
+           cs.profile_pic_changed is True and cs.old_pic_hash == a)
+    cs = detect_changes(None, _snap(different), new_pic_hash=different,
+                        pic_baseline=(a, None))
+    expect("a door's first reading still reports a real picture change",
+           cs.profile_pic_changed is True)
 
 
 # ---------- Part B: notifier media senders survive the await ----------
@@ -614,8 +655,8 @@ async def test_url_signal_sweep() -> None:
         pic.write_bytes(b"\xff\xd8\xfffake")
 
         base = _fp()
-        # Subtle real swap: under every strong floor, over the reduced floors.
-        subtle = _fp(dhash=(1 << 30) - 1, ahash=(1 << 5) - 1, mean=0x82)
+        # Subtle real swap: under the floor, over the reduced floor.
+        subtle = _fp(shift=9, pixels=16)
         # sweep1: baseline. sweep2: download FAILS while IG already serves the
         # new URL. sweep3: fingerprint lands (tentative + confirmation).
         hasher = SeqHasher([base, None, subtle, subtle], pic)
