@@ -267,10 +267,11 @@ class Settings(BaseSettings):
     # request, and the next tap then waits about a minute for it to boot (the
     # sweeps stop while it sleeps, too). Render's own health checks do not
     # count; a request through its public edge does. So the app asks its own
-    # public /health this often. Render sets RENDER_EXTERNAL_URL itself; with
-    # no URL, or 0 here, nothing is pinged. Always-on fits the free plan's
-    # 750 instance hours a month for one service.
-    keep_awake_seconds: int = Field(default=600, alias="KEEP_AWAKE_SECONDS")
+    # public /health this often: every 5 minutes, so even a ping that fails
+    # leaves the next one inside the 15. Render sets RENDER_EXTERNAL_URL
+    # itself; with no URL, or 0 here, nothing is pinged. Always-on fits the
+    # free plan's 750 instance hours a month for one service.
+    keep_awake_seconds: int = Field(default=300, alias="KEEP_AWAKE_SECONDS")
     render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
 
     # Optional proxy (single URL applied to both http and https)

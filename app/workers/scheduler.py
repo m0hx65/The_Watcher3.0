@@ -197,6 +197,10 @@ class WatcherScheduler:
                 id=KEEP_AWAKE_JOB_ID,
                 max_instances=1,
                 coalesce=True,
+                # APScheduler's default grace is 1 s: a tick that comes due
+                # while a sweep holds the loop a moment longer is DROPPED, and
+                # one lost ping is long enough for Render to sleep.
+                misfire_grace_time=settings.keep_awake_seconds,
             )
         self.scheduler.start()
         logger.info(
@@ -470,11 +474,14 @@ class WatcherScheduler:
         traffic and never puts the bot to sleep (see keep_awake_seconds)."""
         url = settings.render_external_url.rstrip("/") + "/health"
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            # trust_env=False: HTTP(S)_PROXY is the Instagram proxy. Our own
+            # URL must not go through it, and a socks5:// one makes httpx
+            # raise ImportError (no socksio) before any request is made.
+            async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
                 response = await client.get(url)
             if response.status_code != 200:
                 logger.warning("Keep-awake ping {} answered HTTP {}", url, response.status_code)
-        except httpx.HTTPError as exc:
+        except Exception as exc:
             logger.warning("Keep-awake ping {} failed: {}", url, exc)
 
     async def _cleanup_wrapper(self) -> None:

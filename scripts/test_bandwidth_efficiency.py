@@ -334,6 +334,59 @@ async def test_a_picture_another_door_announced_is_not_announced_again(tmp: Path
            + service.notifier.send_photo.call_count == 0)
 
 
+class UrlHasher:
+    """The picture behind each upload: what the CDN serves for that asset id."""
+
+    def __init__(self, by_asset: dict, path: Path) -> None:
+        self.by_asset = by_asset
+        self.path = path
+        self.calls = 0
+
+    async def hash_url(self, url: str, username: str):
+        from app.monitor.media_hasher import pic_asset_id
+
+        self.calls += 1
+        return HashedMedia(
+            sha256=f"{self.calls:064x}", byte_size=100, content_type="image/jpeg",
+            local_path=self.path, source_url=url,
+            phash=self.by_asset[pic_asset_id(url)],
+        )
+
+
+async def test_a_stale_reading_of_the_old_picture_is_not_a_change(tmp: Path) -> None:
+    # A -> B is announced once. Then a door answers from a cache with A's URL
+    # (an earlier upload than the stored B): it must not be announced as a
+    # change, nor stored, or the next fresh reading of B is announced again.
+    from app.monitor.media_hasher import pic_asset_id
+
+    async with get_session() as session:
+        session.add(MonitoredAccount(username="cached", active=True))
+    parsed = _parsed("cached", "3007", URL_A)
+    hasher = UrlHasher({pic_asset_id(URL_A): _fp(),
+                        pic_asset_id(URL_B): _fp(shift=-100)}, tmp / "p.jpg")
+    service = _service(FakeInstagram(parsed), hasher)
+
+    await service.check_username("cached")                    # baseline A
+    parsed["profile_pic_url"] = URL_B
+    r = await service.check_username("cached")                # the real change
+    expect("the real change is announced", r.get("changed") is True, repr(r))
+    downloads = hasher.calls
+
+    parsed["profile_pic_url"] = URL_A_ROTATED                  # a stale answer
+    r = await service.check_username("cached")
+    expect("a stale reading of the old upload is not a change",
+           r.get("changed") is False, repr(r))
+    expect("and is not downloaded", hasher.calls == downloads,
+           f"calls={hasher.calls}")
+    parsed["profile_pic_url"] = URL_B                          # fresh again
+    r = await service.check_username("cached")
+    expect("the current picture is not announced a second time",
+           r.get("changed") is False, repr(r))
+    expect("one change, one photo",
+           service.notifier.send_document.call_count
+           + service.notifier.send_photo.call_count == 1)
+
+
 # ---------- 2. The story media listing ----------
 
 async def _story_phase(service, account_id, username, reel_data) -> None:
@@ -475,6 +528,7 @@ async def main() -> int:
     await test_non_cdn_url_always_downloads(tmp)
     await test_upgrade_does_not_redownload_every_sweep(tmp)
     await test_a_picture_another_door_announced_is_not_announced_again(tmp)
+    await test_a_stale_reading_of_the_old_picture_is_not_a_change(tmp)
     await test_story_listing_follows_the_live_flag()
     await test_highlight_scan_cadence()
     await test_story_phase_applies_the_cadence()

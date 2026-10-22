@@ -306,6 +306,17 @@ def test_url_asset_id() -> None:
     expect("the SAME asset id is never a change, however far the pixels are",
            not _pic_changed(base, versions, old_url=URL_A, new_url=URL_A_ROTATED))
 
+    # Across the fingerprint upgrade: an old-format baseline can't be compared
+    # by pixels, so it re-baselines silently — but a new asset id is a new
+    # upload by itself, and must not be absorbed.
+    legacy = "p2:" + "0" * 64 + ":" + "0" * 64 + ":80"
+    expect("old-format baseline + a NEW asset id IS a change",
+           _pic_changed(legacy, base, old_url=URL_A, new_url=URL_B))
+    expect("old-format baseline + the same upload re-baselines silently",
+           not _pic_changed(legacy, base, old_url=URL_A, new_url=URL_A_ROTATED))
+    expect("old-format baseline with no url evidence re-baselines silently",
+           not _pic_changed(legacy, base))
+
 
 # ---------- Part A2: detect_changes uses the perceptual comparison ----------
 

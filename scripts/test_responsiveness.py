@@ -177,9 +177,10 @@ async def test_an_unmonitored_account_is_reported() -> None:
 
 class _FakeClient:
     calls: list[str] = []
+    kwargs: dict = {}
 
     def __init__(self, *a, **k) -> None:
-        pass
+        _FakeClient.kwargs = k
 
     async def __aenter__(self):
         return self
@@ -213,9 +214,13 @@ async def test_keep_awake() -> None:
         job = sched.scheduler.get_job(scheduler_module.KEEP_AWAKE_JOB_ID)
         expect("on Render the keep-awake job runs",
                job is not None, repr(job))
-        expect("well inside Render's 15-minute idle limit",
-               job is not None and job.trigger.interval.total_seconds() < 900,
-               repr(job and job.trigger))
+        interval = job.trigger.interval.total_seconds() if job else 0
+        expect("often enough that one failed ping still leaves the next inside "
+               "Render's 15-minute idle limit", 0 < 2 * interval < 900, repr(interval))
+        expect("a tick delayed by a busy sweep still runs (APScheduler's default "
+               "1 s grace would drop it)",
+               job is not None and (job.misfire_grace_time or 0) >= interval,
+               repr(job and job.misfire_grace_time))
 
         real_client = scheduler_module.httpx.AsyncClient
         scheduler_module.httpx.AsyncClient = _FakeClient
@@ -226,6 +231,21 @@ async def test_keep_awake() -> None:
         expect("it asks the bot's own public /health",
                _FakeClient.calls == ["https://the-watcher.onrender.com/health"],
                repr(_FakeClient.calls))
+        expect("never through the Instagram proxy in HTTP(S)_PROXY",
+               _FakeClient.kwargs.get("trust_env") is False, repr(_FakeClient.kwargs))
+
+        def _socks_client(*a, **k):
+            raise ImportError("Using SOCKS proxy, but the 'socksio' package is not installed.")
+
+        scheduler_module.httpx.AsyncClient = _socks_client
+        try:
+            await sched._keep_awake()
+            survived = True
+        except Exception:
+            survived = False
+        finally:
+            scheduler_module.httpx.AsyncClient = real_client
+        expect("a ping that fails in any way is logged, never raised", survived)
         await sched.shutdown()
     finally:
         settings.render_external_url = old_url

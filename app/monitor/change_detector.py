@@ -225,10 +225,27 @@ def _pic_changed(
     payload) is a silent baseline: recorded, but not reported as a change.
     """
     difference = pic_difference(old_hash, new_hash)
-    if difference is None:
-        return False
     old_id = pic_asset_id(old_url)
     new_id = pic_asset_id(new_url)
+    if difference is None:
+        # A baseline from before the p3 format can't be compared pixel by
+        # pixel, so the upgrade re-baselines silently — unless the asset id
+        # says a new picture was uploaded meanwhile, which needs no pixels.
+        # Without this, a change made between the last old-format reading and
+        # the first new one was absorbed into the baseline and never reported.
+        legacy_baseline = bool(old_hash) and not old_hash.startswith(PHASH_PREFIX)
+        if (
+            legacy_baseline
+            and _parse_fingerprint(new_hash) is not None
+            and old_id and new_id and old_id != new_id
+        ):
+            logger.info(
+                "Profile-pic change detected via asset id ({} -> {}) across the "
+                "fingerprint upgrade (the old one can't be compared by pixels)",
+                old_id, new_id,
+            )
+            return True
+        return False
     if old_id and new_id and old_id == new_id:
         if difference >= PIC_CHANGE_MIN:
             logger.info(

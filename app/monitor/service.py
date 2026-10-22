@@ -2386,16 +2386,35 @@ class MonitorService:
                     session, account_id
                 )
         current_asset = pic_asset_id(pic_url)
+        baseline_asset = pic_asset_id(baseline_url)
         pic_unchanged = bool(
             pic_url
             and current_asset
             and baseline_hash
             and baseline_hash.startswith(PHASH_PREFIX)
-            and current_asset == pic_asset_id(baseline_url)
+            and current_asset == baseline_asset
         )
+        # A reading can also be OLDER than the baseline: a door answering from
+        # a cache (the phone's results live 15 minutes) after a fresh reading
+        # saw the new picture. Every upload gets a new asset id, so an id the
+        # account had BEFORE its current one is a stale answer, not a change.
+        # Downloading it compared the old picture with the new baseline and
+        # announced the old photo as a change — then the next fresh reading
+        # announced the new one again.
+        pic_stale = False
+        if pic_url and current_asset and baseline_asset and current_asset != baseline_asset:
+            async with get_session() as session:
+                earlier = await crud.get_earlier_pic_urls(session, account_id)
+            pic_stale = current_asset in {pic_asset_id(u) for u in earlier}
+            if pic_stale:
+                logger.info(
+                    "Avatar for @{} is an earlier upload ({}) than the stored one "
+                    "({}) — a stale reading, not a change",
+                    username, current_asset, baseline_asset,
+                )
 
         hashed: Optional[HashedMedia] = None
-        if pic_url and not pic_unchanged:
+        if pic_url and not pic_unchanged and not pic_stale:
             hashed = await self.hasher.hash_url(pic_url, username)
         elif pic_unchanged:
             logger.debug(
@@ -2412,6 +2431,7 @@ class MonitorService:
         # above already has its fingerprint and must not trigger the fallback.
         if (
             not pic_unchanged
+            and not pic_stale
             and (hashed is None or hashed.phash is None)
             and pic_url
             and self.stories is not None
