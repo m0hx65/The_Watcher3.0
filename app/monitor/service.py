@@ -40,6 +40,7 @@ from app.monitor.media_hasher import (
     PHASH_PREFIX,
     HashedMedia,
     MediaHasher,
+    image_size,
     pic_asset_id,
 )
 from app.monitor.stories import StoriesClient
@@ -3605,6 +3606,10 @@ class MonitorService:
                 caption = f"🖼 <b>@{esc(username)}</b> — new post"
             else:
                 caption = f"📖 <b>@{esc(username)}</b> — new story"
+            if item.media_type != "video":
+                size = await asyncio.to_thread(image_size, path)
+                if size:
+                    caption += f" · {size[0]}×{size[1]}"
 
             if item.media_type == "video":
                 ok = await self.notifier.send_video(

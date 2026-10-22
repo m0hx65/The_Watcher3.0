@@ -27,6 +27,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 from telegram.error import RetryAfter, TimedOut  # noqa: E402
 
 from app.bot.notifications import _UPLOAD_TIMEOUTS, NotificationDispatcher  # noqa: E402
+from app.config import settings  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -54,18 +55,26 @@ def make_dispatcher() -> NotificationDispatcher:
 
 
 async def test_upload_timeout_sends_once_no_retry() -> None:
-    d = make_dispatcher()
-    d.bot.send_photo = AsyncMock(side_effect=TimedOut("Timed out"))
-    ok = await d.send_photo(MEDIA, caption="c")
-    expect(
-        "photo upload that times out is reported delivered (no false failure)",
-        ok is True,
-    )
-    expect(
-        "photo upload is attempted exactly once on timeout (no duplicate resend)",
-        d.bot.send_photo.await_count == 1,
-        f"await_count={d.bot.send_photo.await_count}",
-    )
+    # A photo leaves as a file or as a photo (PHOTOS_AS_FILES); the duplicate
+    # guard has to hold on whichever Telegram method carries it.
+    for as_file, method in ((True, "send_document"), (False, "send_photo")):
+        settings.photos_as_files = as_file
+        d = make_dispatcher()
+        setattr(d.bot, method, AsyncMock(side_effect=TimedOut("Timed out")))
+        ok = await d.send_photo(MEDIA, caption="c")
+        sent = getattr(d.bot, method)
+        expect(
+            f"photo upload ({method}) that times out is reported delivered "
+            "(no false failure)",
+            ok is True,
+        )
+        expect(
+            f"photo upload ({method}) is attempted exactly once on timeout "
+            "(no duplicate resend)",
+            sent.await_count == 1,
+            f"await_count={sent.await_count}",
+        )
+    settings.photos_as_files = True
 
 
 async def test_video_timeout_sends_once() -> None:
@@ -87,9 +96,9 @@ async def test_document_timeout_sends_once() -> None:
 
 async def test_upload_passes_generous_timeouts() -> None:
     d = make_dispatcher()
-    d.bot.send_photo = AsyncMock(return_value=None)
+    d.bot.send_document = AsyncMock(return_value=None)
     await d.send_photo(MEDIA, caption="c")
-    kwargs = d.bot.send_photo.call_args.kwargs
+    kwargs = d.bot.send_document.call_args.kwargs
     expect(
         "upload passes the large write/read timeout kwargs",
         all(kwargs.get(k) == v for k, v in _UPLOAD_TIMEOUTS.items()),
@@ -139,7 +148,7 @@ async def test_retry_after_still_respected_for_uploads() -> None:
             raise RetryAfter(0)  # 0s so the test doesn't actually sleep long
         return None
 
-    d.bot.send_photo = AsyncMock(side_effect=flaky)
+    d.bot.send_document = AsyncMock(side_effect=flaky)
     ok = await d.send_photo(MEDIA)
     expect(
         "upload retries after a RetryAfter and then succeeds",

@@ -172,6 +172,14 @@ class Settings(BaseSettings):
     # to false to keep the old baseline-only behavior.
     auto_grab_on_public: bool = Field(default=True, alias="AUTO_GRAB_ON_PUBLIC")
 
+    # Deliver story/post/highlight PHOTOS as files (sendDocument) rather than
+    # Telegram photos. Telegram re-encodes everything sent as a photo, so the
+    # inline picture in the chat is Telegram's lossy JPEG of the download, not
+    # the download; a file arrives byte-for-byte, still with a preview, and
+    # opens in the same viewer. false = inline photos (recompressed). Videos
+    # and profile pictures are unaffected (the latter always go as files).
+    photos_as_files: bool = Field(default=True, alias="PHOTOS_AS_FILES")
+
     # How often to LIST a public account's grid when the post count is not
     # readable, so a new post is still found. The count is normally the cheap
     # trigger — it rises, and only then is the grid listed — but the profile

@@ -210,6 +210,20 @@ def perceptual_hash(data: bytes, *, size: int = _HASH_SIZE) -> Optional[str]:
     return f"{PHASH_PREFIX}{dhash:0{width}x}:{ahash:0{width}x}:{mean:02x}"
 
 
+def image_size(path: Path) -> Optional[tuple[int, int]]:
+    """(width, height) of an image file, read from its header only.
+
+    What a source CALLS full resolution and what it serves are different
+    claims; this is the measured one. None for anything that isn't a
+    decodable image.
+    """
+    try:
+        with Image.open(path) as img:
+            return img.size
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+
 class MediaHasher:
     """Downloads images, computes SHA256, and stores them on disk."""
 

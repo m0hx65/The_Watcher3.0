@@ -22,6 +22,7 @@ os.environ.setdefault("TELEGRAM_CHAT_ID", "1")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from app.bot.notifications import NotificationDispatcher  # noqa: E402
+from app.config import settings  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -66,13 +67,20 @@ async def main() -> int:
     expect("mirror is flat (no thread)", (MIRROR, None) in c, str(c))
     expect("returns primary delivery", ok is True)
 
-    # --- Media mirrors too ---
-    d.bot.send_photo = AsyncMock()
-    await d.send_photo(MEDIA, caption="x", message_thread_id=42)
-    cp = calls(d.bot.send_photo)
-    expect("photo goes to both chats", len(cp) == 2, str(cp))
-    expect("photo primary keeps thread", (PRIMARY, 42) in cp, str(cp))
-    expect("photo mirror flat", (MIRROR, None) in cp, str(cp))
+    # --- Media mirrors too, whichever Telegram method carries the photo ---
+    for as_file, method in ((True, "send_document"), (False, "send_photo")):
+        settings.photos_as_files = as_file
+        d.bot.send_photo = AsyncMock()
+        d.bot.send_document = AsyncMock()
+        await d.send_photo(MEDIA, caption="x", message_thread_id=42)
+        cp = calls(getattr(d.bot, method))
+        other = "send_photo" if as_file else "send_document"
+        expect(f"photo ({method}) goes to both chats", len(cp) == 2, str(cp))
+        expect(f"photo ({method}) primary keeps thread", (PRIMARY, 42) in cp, str(cp))
+        expect(f"photo ({method}) mirror flat", (MIRROR, None) in cp, str(cp))
+        expect(f"photo ({method}) never also goes via {other}",
+               getattr(d.bot, other).await_count == 0)
+    settings.photos_as_files = True
 
     # --- Multiple mirrors ---
     d2 = NotificationDispatcher(AsyncMock(), chat_id=PRIMARY, mirror_chat_ids=[MIRROR, 555])

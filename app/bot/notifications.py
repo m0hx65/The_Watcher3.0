@@ -138,11 +138,28 @@ class NotificationDispatcher:
         *,
         message_thread_id: Optional[int] = None,
     ) -> bool:
+        """Deliver a still image — as a file when PHOTOS_AS_FILES is on.
+
+        Telegram re-encodes anything sent with sendPhoto, so a "photo" is
+        Telegram's lossy copy of what was downloaded. sendDocument stores the
+        bytes untouched; it is the only Bot API path to the original quality.
+        """
         media = await self._load_media(path)
         if media is None:
             return False
 
+        as_file = settings.photos_as_files
+
         def _send(chat, thread):
+            if as_file:
+                return self.bot.send_document(
+                    chat_id=chat,
+                    document=media,
+                    caption=caption or "",
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=thread,
+                    **_UPLOAD_TIMEOUTS,
+                )
             return self.bot.send_photo(
                 chat_id=chat,
                 photo=media,
