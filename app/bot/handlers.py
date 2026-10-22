@@ -533,8 +533,122 @@ async def _reply_or_edit(
 
 # ---------- View renderers ----------
 
+STORY_CHECKING = "⏳ checking…"
+_STORY_UNAVAILABLE = "⚠️ unavailable (live check didn't answer)"
+# The card's live story check runs AFTER the card is on screen; past this it
+# says it didn't answer rather than leave "checking…" up. The chain behind it
+# (Worker, direct, then saveinsta's three round trips) can otherwise take
+# minutes on a bad day.
+_CARD_LIVE_TIMEOUT = 15.0
+
+
+async def _live_story_state(
+    service: Optional[MonitorService],
+    instagram_id: Optional[str],
+    username: str,
+) -> str:
+    """The card's Story line, from a live check. Never "no" for "couldn't
+    find out"."""
+    has_story: Optional[bool] = None
+    is_live = False
+    live = None
+    if service is not None and instagram_id:
+        try:
+            live = await service.instagram.fetch_reel_user(str(instagram_id))
+        except Exception:  # pragma: no cover - network failure path
+            live = None
+    if live is not None:
+        has_story = bool(live.get("has_public_story"))
+        is_live = bool(live.get("is_live"))
+    elif service is not None and service.stories:
+        # Instagram's graphql reel query is 401-blocked from datacenter IPs
+        # (e.g. Render), so `live` is often None in production. saveinsta is a
+        # third-party host and isn't IP-blocked, so it's the live story oracle
+        # when graphql is unavailable: any items back means an active story.
+        try:
+            has_story = bool(await service.stories.fetch_stories(username))
+        except Exception:  # pragma: no cover - network failure path
+            has_story = None
+    if is_live:
+        return "🔴 live now"
+    if has_story is None:
+        return _STORY_UNAVAILABLE
+    return "🎬 has an active story" if has_story else "⭕ no active story"
+
+
+async def _show_account_card(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    *,
+    suffix: str = "",
+) -> bool:
+    """Draw the account card NOW and fill its Story line in when it answers.
+
+    The card used to wait for the live story check before drawing anything,
+    and that check is a chain of network calls (the Worker, the direct route,
+    then saveinsta), so every open, recheck, pause and resume sat on
+    "⏳ Opening…" for seconds, on a bad day minutes. Everything else on the
+    card is a database read. False when the account isn't monitored.
+    """
+    service: MonitorService = context.application.bot_data["monitor"]
+    text = await _render_account_card(username, service, story_state=STORY_CHECKING)
+    if text is None:
+        return False
+    text += suffix
+    keyboard = await _actions_keyboard(username, context)
+    shown = await _safe_edit_text(query, text, reply_markup=keyboard)
+    placeholder = f"Story: {STORY_CHECKING}"
+    if shown is None or placeholder not in text:
+        return True  # private account: no Story line to fill
+
+    async with get_session() as session:
+        account = await crud.get_account(session, username)
+    if account is None:
+        return True
+
+    async def _fill() -> None:
+        try:
+            state = await asyncio.wait_for(
+                _live_story_state(service, account.instagram_id, account.username),
+                timeout=_CARD_LIVE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            state = _STORY_UNAVAILABLE
+        # Only a message that still shows THIS card is edited: the user may
+        # have moved on, and the panel may have been re-posted under a new id
+        # (panel_bump), which carries the same text.
+        target = next(
+            (mid for mid, (shown_text, _kb) in reversed(_LAST_RENDER.items())
+             if shown_text == text),
+            None,
+        )
+        if target is None:
+            return
+        filled = text.replace(placeholder, f"Story: {state}", 1)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=shown.chat_id,
+                message_id=target,
+                text=filled,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:
+            logger.debug("Card story line for @{} not filled: {}", username, exc)
+            return
+        remember_render(target, filled, keyboard)
+
+    spawn(_fill(), name=f"card-story:{username}")
+    return True
+
+
 async def _render_account_card(
-    username: str, service: Optional[MonitorService] = None
+    username: str,
+    service: Optional[MonitorService] = None,
+    *,
+    story_state: Optional[str] = None,
 ) -> Optional[str]:
     async with get_session() as session:
         account = await crud.get_account(session, username)
@@ -628,41 +742,13 @@ async def _render_account_card(
         # stored snapshot's reel_data is only as fresh as the last SUCCESSFUL
         # check — for an account Instagram is currently blocking that can be
         # days old, and seeding from it showed a story that expired long ago.
-        # None here means "couldn't find out", never "no".
+        # A caller that draws the card first passes STORY_CHECKING and fills
+        # the line in afterwards (see _show_account_card).
         if not snapshot.is_private:
-            has_story: Optional[bool] = None
-            is_live = False
-            live = None
-            if service is not None and account.instagram_id:
-                try:
-                    live = await service.instagram.fetch_reel_user(
-                        str(account.instagram_id)
-                    )
-                except Exception:  # pragma: no cover - network failure path
-                    live = None
-            if live is not None:
-                has_story = bool(live.get("has_public_story"))
-                is_live = bool(live.get("is_live"))
-            elif service is not None and service.stories:
-                # Instagram's graphql reel query is 401-blocked from datacenter
-                # IPs (e.g. Render), so `live` is often None in production.
-                # saveinsta is a third-party host and isn't IP-blocked, so it's
-                # the live story oracle when graphql is unavailable: any items
-                # back means an active story.
-                try:
-                    has_story = bool(
-                        await service.stories.fetch_stories(account.username)
-                    )
-                except Exception:  # pragma: no cover - network failure path
-                    has_story = None
-            if is_live:
-                story_state = "🔴 live now"
-            elif has_story is None:
-                story_state = "⚠️ unavailable (live check didn't answer)"
-            elif has_story:
-                story_state = "🎬 has an active story"
-            else:
-                story_state = "⭕ no active story"
+            if story_state is None:
+                story_state = await _live_story_state(
+                    service, account.instagram_id, account.username
+                )
             lines.append(f"Story: {story_state}")
 
     if highlight_catalog:
@@ -3422,10 +3508,7 @@ async def _handle_account(
 
     if action == "open":
         await _safe_answer(query)
-        service: MonitorService = context.application.bot_data["monitor"]
-        await _safe_edit_text(query, f"⏳ Opening <b>@{esc(username)}</b>…")
-        text = await _render_account_card(username, service)
-        if text is None:
+        if not await _show_account_card(query, context, username):
             # Not monitored — still let the user grab its public story/highlights.
             await _safe_edit_text(
                 query,
@@ -3433,10 +3516,6 @@ async def _handle_account(
                 "its public story or highlights:",
                 reply_markup=keyboards.fetch_actions(username),
             )
-            return
-        await _safe_edit_text(
-            query, text, reply_markup=await _actions_keyboard(username, context)
-        )
         return
 
     if action == "rhythm":
@@ -3471,23 +3550,18 @@ async def _handle_account(
             )
             return
         username = result.get("username", username)
-        text = await _render_account_card(username, service)
         suffix = (
             "\n\n<i>Changes detected ✓</i>"
             if result.get("changed")
             else "\n\n<i>No changes.</i>"
         )
-        if text is None:
+        if not await _show_account_card(query, context, username, suffix=suffix):
             await _safe_edit_text(
                 query,
                 f"<b>@{esc(username)}</b> check done · status "
                 f"{result['status']}{suffix}",
                 reply_markup=keyboards.back_to_list(),
             )
-            return
-        await _safe_edit_text(
-            query, text + suffix, reply_markup=await _actions_keyboard(username, context)
-        )
         return
 
     if action == "history":
@@ -3506,13 +3580,12 @@ async def _handle_account(
             await _safe_answer(query, "Account not found.", show_alert=True)
             return
         await _safe_answer(query, "▶️ Resumed" if new_active else "⏸ Paused")
-        service: MonitorService = context.application.bot_data["monitor"]
-        text = await _render_account_card(username, service)
-        await _safe_edit_text(
-            query,
-            text or f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
-            reply_markup=await _actions_keyboard(username, context),
-        )
+        if not await _show_account_card(query, context, username):
+            await _safe_edit_text(
+                query,
+                f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
+                reply_markup=await _actions_keyboard(username, context),
+            )
         return
 
     if action == "photo":

@@ -263,6 +263,16 @@ class Settings(BaseSettings):
     # the question is whether the health checker is running at all.
     log_health_checks: bool = Field(default=False, alias="LOG_HEALTH_CHECKS")
 
+    # Render's free web service sleeps after 15 minutes without an inbound
+    # request, and the next tap then waits about a minute for it to boot (the
+    # sweeps stop while it sleeps, too). Render's own health checks do not
+    # count; a request through its public edge does. So the app asks its own
+    # public /health this often. Render sets RENDER_EXTERNAL_URL itself; with
+    # no URL, or 0 here, nothing is pinged. Always-on fits the free plan's
+    # 750 instance hours a month for one service.
+    keep_awake_seconds: int = Field(default=600, alias="KEEP_AWAKE_SECONDS")
+    render_external_url: Optional[str] = Field(default=None, alias="RENDER_EXTERNAL_URL")
+
     # Optional proxy (single URL applied to both http and https)
     proxy_url: Optional[str] = Field(default=None, alias="PROXY_URL")
     http_proxy: Optional[str] = Field(default=None, alias="HTTP_PROXY")
