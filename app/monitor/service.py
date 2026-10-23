@@ -3061,6 +3061,19 @@ class MonitorService:
                 logger.debug("Highlight item fetch failed for @{}: {}", username, r)
         return items
 
+    def _media_unavailable(self, since: float) -> str:
+        """The error for a download saveinsta sent nothing for, `since` being
+        when the download started. When saveinsta said why, pass its words on;
+        guessing at a rate limit hid that it had stopped serving highlights
+        ("Video is private." for every public account)."""
+        reason = self.stories.refusal_since(since) if self.stories else None
+        if reason is None:
+            return _DOWNLOAD_UNAVAILABLE_MSG
+        return (
+            f"saveinsta, the anonymous media source, refused it: “{reason}” "
+            "Highlight names and story status still work."
+        )
+
     @staticmethod
     def _diff_highlight_catalog(
         previous: dict[str, str], current: dict[str, str]
@@ -4220,6 +4233,7 @@ class MonitorService:
                 has_story = None
 
         # Anonymous media fetch (no login) via saveinsta.to.
+        since = time.monotonic()
         try:
             stories = await self.stories.fetch_stories(username)
         except Exception as exc:  # pragma: no cover - network failure path
@@ -4238,7 +4252,7 @@ class MonitorService:
             # Genuinely no active story right now.
             return {"ok": True, "count": 0, "error": None}
         # Either there IS a story we can't fetch anonymously, or status unknown.
-        return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+        return {"ok": False, "count": 0, "error": self._media_unavailable(since)}
 
     async def fetch_and_send_story_url(
         self, username: str, story_url: str, *, pk: Optional[str] = None
@@ -4260,6 +4274,7 @@ class MonitorService:
             account = await crud.get_account(session, username)
         account_id = account.id if account else None
 
+        since = time.monotonic()
         try:
             items = await self.stories.fetch_story_by_url(story_url)
         except Exception as exc:  # pragma: no cover - network failure path
@@ -4276,7 +4291,7 @@ class MonitorService:
                 items = matched
 
         if not items:
-            return {"ok": False, "count": 0, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+            return {"ok": False, "count": 0, "error": self._media_unavailable(since)}
 
         async with self.download_scope():
             sent = await self._deliver_story_items(
@@ -4359,6 +4374,7 @@ class MonitorService:
 
         highlight_id, title = items[index]
         # Anonymous media fetch (no login) via saveinsta.to.
+        since = time.monotonic()
         try:
             story_items = await self.stories.fetch_highlight_items(
                 username, highlight_id, title
@@ -4371,7 +4387,10 @@ class MonitorService:
             story_items = []
 
         if not story_items:
-            return {"ok": False, "count": 0, "title": title, "error": _DOWNLOAD_UNAVAILABLE_MSG}
+            return {
+                "ok": False, "count": 0, "title": title,
+                "error": self._media_unavailable(since),
+            }
 
         async with self.download_scope():
             sent = await self._deliver_story_items(
@@ -4403,13 +4422,14 @@ class MonitorService:
 
         catalog = {hid: title for hid, title in items}
         async with self.download_scope():
+            since = time.monotonic()
             story_items = await self._gather_highlight_items(
                 username, catalog, cancellable=True
             )
             if not story_items:
                 return {
                     "ok": False, "count": 0, "reels": len(items),
-                    "error": _DOWNLOAD_UNAVAILABLE_MSG,
+                    "error": self._media_unavailable(since),
                 }
             sent = await self._deliver_story_items(
                 account_id, username, story_items, set(),
@@ -4442,13 +4462,14 @@ class MonitorService:
         account_id = account.id if account else None
 
         async with self.download_scope():
+            since = time.monotonic()
             story_items = await self._gather_highlight_items(
                 username, catalog, cancellable=True
             )
             if not story_items:
                 return {
                     "ok": False, "count": 0, "reels": len(catalog),
-                    "error": _DOWNLOAD_UNAVAILABLE_MSG,
+                    "error": self._media_unavailable(since),
                 }
             sent = await self._deliver_story_items(
                 account_id, username, story_items, set(), cancellable=True

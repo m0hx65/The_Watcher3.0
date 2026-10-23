@@ -166,6 +166,9 @@ async def test_kill_during_gather() -> None:
             self.download_calls += 1
             return None
 
+        def refusal_since(self, since):
+            return None
+
     class PlainNotifier:
         async def send_photo(self, *a, **k):
             return True

@@ -26,6 +26,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import html
 import json
 import re
 import time
@@ -64,6 +65,10 @@ _MEDIA_ID_RE = re.compile(r"/(\d{6,})_\d{6,}_")
 # Instagram serves profile pictures from the t51.*-19 CDN namespace (feed media
 # is -15). Used to pick the avatar out of a profile's media listing.
 _PROFILE_PIC_RE = re.compile(r"t51\.\d+-19")
+_TAG_RE = re.compile(r"<[^>]+>")
+# A refusal reason is shown to the user, at times in a Telegram alert (200
+# characters in all), so only its first sentence is kept.
+_REASON_MAX = 100
 
 
 @dataclass
@@ -97,6 +102,9 @@ class StoriesClient:
         # account's highlight reels) fetches the token PAGE once instead of once
         # per reel — it is the largest single response in the whole flow.
         self._token_lock = asyncio.Lock()
+        # (monotonic time, reason) of the last request saveinsta refused, so a
+        # caller left with no media can say why — see refusal_since.
+        self._last_refusal: Optional[tuple[float, str]] = None
 
     async def close(self) -> None:
         await self._session.close()
@@ -224,6 +232,14 @@ class StoriesClient:
             )
             return None
 
+    def refusal_since(self, since: float) -> Optional[str]:
+        """saveinsta's reason for the last request it refused, when that came
+        at or after `since` (a time.monotonic() value); None when it refused
+        nothing since, or gave no reason."""
+        if self._last_refusal is not None and self._last_refusal[0] >= since:
+            return self._last_refusal[1]
+        return None
+
     async def resolve_user_id(self, username: str) -> Optional[str]:
         """Deprecated PK lookup. saveinsta works off URLs, not numeric ids, and
         the old storiesig PK API is gone, so this always returns None. The id
@@ -284,6 +300,12 @@ class StoriesClient:
                     "X-Requested-With": "XMLHttpRequest",
                 },
             )
+            if verify.status_code == 429:
+                # Without a token the search only answers "The authentication
+                # token is invalid", which hides that this is a rate limit.
+                self._refuse(target_url, "Too many requests (HTTP 429).")
+                fetch_health.record_status(SAVEINSTA, 429)
+                return ""
             cftoken = ""
             if verify.status_code == 200:
                 try:
@@ -311,6 +333,8 @@ class StoriesClient:
             if search.status_code != 200:
                 logger.debug("saveinsta ajaxSearch HTTP {}", search.status_code)
                 self._tokens = None  # tokens may be stale — force refresh next time
+                if search.status_code == 429:
+                    self._refuse(target_url, "Too many requests (HTTP 429).")
                 fetch_health.record_status(SAVEINSTA, search.status_code)
                 return ""
             payload = search.json()
@@ -319,11 +343,39 @@ class StoriesClient:
                 fetch_health.record(SAVEINSTA, "error")
                 return ""
             fetch_health.record(SAVEINSTA, "ok")
-            return payload.get("data", "") or ""
+            data = payload.get("data", "") or ""
+            if not data and payload.get("mess"):
+                # A request saveinsta won't serve still answers status "ok", with
+                # no media and its reason in "mess" — on 2026-10-23, "Error: Video
+                # is private." for every highlight of every public account tried.
+                self._refuse(target_url, self._clean_reason(str(payload["mess"])))
+            return data
         except Exception as exc:
             logger.warning("saveinsta fetch failed for {}: {}", target_url, exc)
             fetch_health.record(SAVEINSTA, "error")
             return ""
+
+    def _refuse(self, target_url: str, reason: str) -> None:
+        # Once per new reason: a sweep asks for every tracked highlight, and
+        # the same refusal for each of them would bury the log.
+        changed = self._last_refusal is None or self._last_refusal[1] != reason
+        self._last_refusal = (time.monotonic(), reason)
+        log = logger.info if changed else logger.debug
+        log("saveinsta refused {}: {}", target_url, reason)
+
+    @staticmethod
+    def _clean_reason(mess: str) -> str:
+        """saveinsta's "mess" as one plain sentence: "Error: Video is private.
+        Please use the tool <a …>…</a>." becomes "Video is private." (the tool
+        it points to needs an Instagram login, which this bot never uses)."""
+        text = html.unescape(_TAG_RE.sub("", mess)).strip()
+        text = re.sub(r"^error:\s*", "", text, flags=re.I)
+        first = re.match(r".*?[.!?](?=\s|$)", text)
+        if first:
+            text = first.group(0)
+        if len(text) > _REASON_MAX:
+            text = text[: _REASON_MAX - 1].rstrip() + "…"
+        return text
 
     def _parse_items(self, data: str, *, source: str) -> list[StoryItem]:
         """Parse the media HTML into StoryItems, de-duplicated by media id."""
