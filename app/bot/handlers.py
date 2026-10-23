@@ -601,14 +601,29 @@ async def _show_account_card(
     text += suffix
     keyboard = await _actions_keyboard(username, context)
     shown = await _safe_edit_text(query, text, reply_markup=keyboard)
+    await _fill_story_line(context, shown, username, text, keyboard)
+    return True
+
+
+async def _fill_story_line(
+    context: ContextTypes.DEFAULT_TYPE,
+    shown,
+    username: str,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    """Fill in, in the background, the Story line of a card drawn with
+    STORY_CHECKING. `shown` is the message now showing `text`, already
+    recorded with remember_render."""
     placeholder = f"Story: {STORY_CHECKING}"
     if shown is None or placeholder not in text:
-        return True  # private account: no Story line to fill
+        return  # private account: no Story line to fill
 
     async with get_session() as session:
         account = await crud.get_account(session, username)
     if account is None:
-        return True
+        return
+    service: MonitorService = context.application.bot_data["monitor"]
 
     async def _fill() -> None:
         try:
@@ -644,7 +659,6 @@ async def _show_account_card(
         remember_render(target, filled, keyboard)
 
     spawn(_fill(), name=f"card-story:{username}")
-    return True
 
 
 async def _render_account_card(
@@ -1192,14 +1206,20 @@ async def _do_add(
         result = await service.check_username(account.username, notify_unchanged=False)
         if result.get("ok"):
             username = result.get("username", account.username)
-            card = await _render_account_card(username, service)
+            card = await _render_account_card(
+                username, service, story_state=STORY_CHECKING
+            )
             if card is not None and status_msg is not None:
+                text = f"✅ <b>Now monitoring</b>\n\n{card}"
+                keyboard = await _actions_keyboard(username, context)
                 await status_msg.edit_text(
-                    f"✅ <b>Now monitoring</b>\n\n{card}",
+                    text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=await _actions_keyboard(username, context),
+                    reply_markup=keyboard,
                     disable_web_page_preview=True,
                 )
+                remember_render(status_msg.message_id, text, keyboard)
+                await _fill_story_line(context, status_msg, username, text, keyboard)
         elif chat_id is not None:
             await context.bot.send_message(
                 chat_id=chat_id,

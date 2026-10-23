@@ -48,7 +48,7 @@ def expect(name: str, condition: bool, detail: str = "") -> None:
 
 
 def make_update():
-    status_msg = SimpleNamespace(edit_text=AsyncMock(), message_id=2)
+    status_msg = SimpleNamespace(edit_text=AsyncMock(), message_id=2, chat_id=7)
     msg = SimpleNamespace(reply_text=AsyncMock(return_value=status_msg), message_id=1)
     update = SimpleNamespace(
         callback_query=None,
@@ -61,14 +61,14 @@ def make_update():
 
 def make_context(service) -> SimpleNamespace:
     return SimpleNamespace(
-        bot=SimpleNamespace(send_message=AsyncMock()),
+        bot=SimpleNamespace(send_message=AsyncMock(), edit_message_text=AsyncMock()),
         user_data={},
         args=[],
         application=SimpleNamespace(bot_data={"monitor": service}),
     )
 
 
-def make_service(result: dict) -> SimpleNamespace:
+def make_service(result: dict, *, is_private: bool = True) -> SimpleNamespace:
     async def check_username(username: str, *, notify_unchanged: bool = False):
         # Stand in for the real first check: it stores the baseline reading.
         if result.get("ok"):
@@ -77,13 +77,15 @@ def make_service(result: dict) -> SimpleNamespace:
                 session.add(AccountSnapshot(
                     account_id=account.id, username=username, http_status=200,
                     full_name="New Account", followers_count=1234,
-                    following_count=56, posts_count=7, is_private=True,
+                    following_count=56, posts_count=7, is_private=is_private,
                 ))
         return result
 
     return SimpleNamespace(
         check_username=AsyncMock(side_effect=check_username),
-        instagram=SimpleNamespace(fetch_reel_user=AsyncMock(return_value=None)),
+        instagram=SimpleNamespace(
+            fetch_reel_user=AsyncMock(return_value={"has_public_story": True})
+        ),
         stories=None,
     )
 
@@ -114,6 +116,32 @@ async def test_add_sends_the_account_card() -> None:
         f"buttons={buttons}",
     )
     expect("no separate message was sent", context.bot.send_message.await_count == 0)
+    expect("a private card has no Story line", "Story:" not in text, text)
+
+
+async def test_public_card_is_drawn_before_the_story_check() -> None:
+    service = make_service({"ok": True, "username": "openacct", "status": 200},
+                           is_private=False)
+    update, status_msg = make_update()
+    context = make_context(service)
+    await handlers._do_add(update, context, "openacct", instagram_id="4242")
+
+    text = status_msg.edit_text.call_args.args[0] if status_msg.edit_text.call_args else ""
+    expect(
+        "the card goes up with the Story line still checking",
+        f"Story: {handlers.STORY_CHECKING}" in text,
+        text,
+    )
+    await asyncio.sleep(0.05)  # let the background story check answer
+    filled = context.bot.edit_message_text.call_args.kwargs \
+        if context.bot.edit_message_text.call_args else {}
+    expect(
+        "the Story line is filled in on the same message",
+        filled.get("message_id") == status_msg.message_id
+        and "Story: 🎬 has an active story" in filled.get("text", "")
+        and "Now monitoring" in filled.get("text", ""),
+        f"filled={filled}",
+    )
 
 
 async def test_failed_first_check_reports_the_error() -> None:
@@ -133,6 +161,7 @@ async def main() -> int:
         await conn.run_sync(Base.metadata.create_all)
 
     await test_add_sends_the_account_card()
+    await test_public_card_is_drawn_before_the_story_check()
     await test_failed_first_check_reports_the_error()
 
     await dispose_engine()
