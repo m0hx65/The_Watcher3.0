@@ -513,17 +513,20 @@ async def _reply_or_edit(
     *,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: str = ParseMode.HTML,
-) -> None:
-    """Send text — edit the existing message for callback flows, reply for command flows."""
+):
+    """Send text — edit the existing message for callback flows, reply for command flows.
+
+    Returns the message now showing the text, so a caller can edit it again.
+    """
     if update.callback_query:
-        await _safe_edit_text(
+        return await _safe_edit_text(
             update.callback_query,
             text,
             reply_markup=reply_markup,
             parse_mode=parse_mode,
         )
     elif update.message:
-        await update.message.reply_text(
+        return await update.message.reply_text(
             text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
@@ -1175,7 +1178,7 @@ async def _do_add(
         )
         return
 
-    await _reply_or_edit(
+    status_msg = await _reply_or_edit(
         update,
         f"Now monitoring <b>@{esc(account.username)}</b>.\nRunning first check…",
         reply_markup=keyboards.open_account(account.username),
@@ -1183,8 +1186,21 @@ async def _do_add(
 
     service: MonitorService = context.application.bot_data["monitor"]
     try:
-        result = await service.check_username(account.username, notify_unchanged=True)
-        if not result.get("ok") and chat_id is not None:
+        # The first check only lays down the baseline — there is nothing to
+        # compare it against, so "No changes detected" would say nothing. Show
+        # what it read instead: the account card, in place of the note above.
+        result = await service.check_username(account.username, notify_unchanged=False)
+        if result.get("ok"):
+            username = result.get("username", account.username)
+            card = await _render_account_card(username, service)
+            if card is not None and status_msg is not None:
+                await status_msg.edit_text(
+                    f"✅ <b>Now monitoring</b>\n\n{card}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=await _actions_keyboard(username, context),
+                    disable_web_page_preview=True,
+                )
+        elif chat_id is not None:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
