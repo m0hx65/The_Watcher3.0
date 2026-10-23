@@ -59,6 +59,8 @@ HELP_TEXT = (
     "Tap any account in the list to open its card. From there: "
     "Recheck · History · Photo · Story · Highlights · Remove. "
     "✨ Highlights lists every highlight by name; story/live status shows on the card. "
+    "🎞 Media only keeps an account's alerts to its stories, posts and avatar "
+    "(📋 Track all turns the rest back on). "
     "🏠 Home always returns here.\n\n"
     "<b>Commands</b>\n"
     "<code>/add @user</code>, <code>/add https://instagram.com/user</code>, or <code>/add 1234567890</code> — start monitoring\n"
@@ -684,6 +686,7 @@ async def _render_account_card(
         untracked_highlights = await crud.get_untracked_highlight_ids(
             session, account.id
         )
+        media_only = await crud.is_media_only(session, account.id)
 
     marker = "🟢 active" if account.active else "⏸ paused"
     last = fmt_timestamp(account.last_checked_at) if account.last_checked_at else "never"
@@ -694,8 +697,10 @@ async def _render_account_card(
         f"<b>@{esc(account.username)}</b>",
         f"Instagram ID: <code>{esc(account.instagram_id or 'unknown')}</code>",
         f"State: {marker}",
-        f"Last check: <code>{last}</code> · {status}",
     ]
+    if media_only:
+        lines.append("Alerts: 🎞 media only (stories, posts &amp; avatar)")
+    lines.append(f"Last check: <code>{last}</code> · {status}")
     if fails:
         lines.append(f"Consecutive failures: <b>{fails}</b>")
 
@@ -1386,6 +1391,9 @@ async def _actions_keyboard(
     currently running on this account (🎯 start vs 🛑 stop)."""
     async with get_session() as session:
         account = await crud.get_account(session, username)
+        media_only = (
+            account is not None and await crud.is_media_only(session, account.id)
+        )
     if account is None:
         return keyboards.fetch_actions(username)
     stakeout_active = False
@@ -1393,7 +1401,9 @@ async def _actions_keyboard(
         sched = _scheduler(context)
         if sched is not None:
             stakeout_active = sched.stakeout_for(account.id) is not None
-    return keyboards.account_actions(username, account.active, stakeout_active)
+    return keyboards.account_actions(
+        username, account.active, stakeout_active, media_only
+    )
 
 
 async def _begin_stakeout(
@@ -3622,6 +3632,23 @@ async def _handle_account(
                 f"<b>@{esc(username)}</b> {'resumed' if new_active else 'paused'}.",
                 reply_markup=await _actions_keyboard(username, context),
             )
+        return
+
+    if action in ("mediaonly", "trackall"):
+        media_only = action == "mediaonly"
+        async with get_session() as session:
+            account = await crud.get_account(session, username)
+            if account is not None:
+                await crud.set_media_only(session, account.id, media_only)
+        if account is None:
+            await _safe_answer(query, "Account not found.", show_alert=True)
+            return
+        await _safe_answer(
+            query,
+            "🎞 Alerts: stories, posts & avatar only" if media_only
+            else "📋 Alerts: every profile change",
+        )
+        await _show_account_card(query, context, username)
         return
 
     if action == "photo":

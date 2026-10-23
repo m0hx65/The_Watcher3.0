@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import random
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -25,6 +26,7 @@ from app.database.models import AccountSnapshot, MonitoredAccount, ProfileMediaH
 from app.database.session import get_session
 from app.monitor.analytics import classify_follower_change, render_follower_anomaly
 from app.monitor.change_detector import (
+    MEDIA_ONLY_FIELDS,
     ChangeSet,
     detect_changes,
     pic_difference,
@@ -2872,10 +2874,28 @@ class MonitorService:
         notify_unchanged: bool,
     ) -> None:
         thread_id = await self.topic_for(account_id, username)
+        # A media-only account alerts on its posts and avatar alone here (its
+        # stories go out from the story phase as usual); the rest of the
+        # profile is still read and stored, just not sent or logged. A copy,
+        # not an edit: the caller still reads the full change set (went_public,
+        # the new-post count).
+        muted = 0
+        if changeset.changes:
+            async with get_session() as session:
+                media_only = await crud.is_media_only(session, account_id)
+            if media_only:
+                kept = [c for c in changeset.changes if c.field in MEDIA_ONLY_FIELDS]
+                muted = len(changeset.changes) - len(kept)
+                changeset = replace(changeset, changes=kept)
         if not changeset.has_changes:
             if notify_unchanged:
+                headline = (
+                    f"No changes to posts or avatar ({muted} profile "
+                    f"change{'' if muted == 1 else 's'} muted: media only)."
+                    if muted else "No changes detected."
+                )
                 await self.notifier.send_text(
-                    f"<b>@{username}</b>\nNo changes detected.\n"
+                    f"<b>@{username}</b>\n{headline}\n"
                     f"Checked at {fmt_timestamp(datetime.now(timezone.utc))}",
                     message_thread_id=thread_id,
                 )

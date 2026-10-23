@@ -98,6 +98,12 @@ BOOL_FIELDS = {"is_private", "is_verified", "is_business"}
 
 TEXT_FIELDS = {"username", "full_name", "biography", "external_url"}
 
+# The field changes a media-only account still alerts on, besides its profile
+# picture: new posts and reels (for a private account the count is the only
+# sign of a post), and the highlights count, since highlights are saved
+# stories. Followers, bio, name, link and the flags are read and stored, not sent.
+MEDIA_ONLY_FIELDS = {"posts_count", "reels_count", "story_count"}
+
 
 def detect_changes(
     previous: Optional[AccountSnapshot],

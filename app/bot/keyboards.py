@@ -27,6 +27,8 @@ Callback-data scheme (kept short — Telegram caps callback_data at 64 bytes):
   acc:remove_yes:<u>       — confirmed remove
   acc:pause:<username>     — pause monitoring (keep history)
   acc:resume:<username>    — resume monitoring
+  acc:mediaonly:<u>        — alert only on stories, posts & avatar
+  acc:trackall:<u>         — alert on every profile change again
   acc:rhythm:<username>    — show the account's posting-time rhythm
   acc:stakeout:<username>  — start a stakeout (default interval/duration)
   acc:unstakeout:<u>       — stop an active stakeout
@@ -313,7 +315,10 @@ def accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
 
 
 def account_actions(
-    username: str, active: bool = True, stakeout_active: bool = False
+    username: str,
+    active: bool = True,
+    stakeout_active: bool = False,
+    media_only: bool = False,
 ) -> InlineKeyboardMarkup:
     if active:
         toggle = InlineKeyboardButton(
@@ -322,6 +327,14 @@ def account_actions(
     else:
         toggle = InlineKeyboardButton(
             "▶️ Resume", callback_data=f"acc:resume:{username}"
+        )
+    if media_only:
+        alerts_btn = InlineKeyboardButton(
+            "📋 Track all", callback_data=f"acc:trackall:{username}"
+        )
+    else:
+        alerts_btn = InlineKeyboardButton(
+            "🎞 Media only", callback_data=f"acc:mediaonly:{username}"
         )
     if stakeout_active:
         stakeout_btn = InlineKeyboardButton(
@@ -363,7 +376,7 @@ def account_actions(
                 ),
                 stakeout_btn,
             ],
-            [toggle],
+            [toggle, alerts_btn],
             [
                 InlineKeyboardButton("◀️ List", callback_data="menu:list:0"),
                 InlineKeyboardButton("🏠 Home", callback_data="menu:main"),

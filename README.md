@@ -135,6 +135,7 @@ The Watcher runs as a single container. It connects to your Telegram bot, sweeps
 ### Target Management
 - Add targets by `@username`, full profile URL, or raw numeric Instagram ID
 - Pause/resume per target — paused accounts keep their entire history and resolved Instagram ID
+- 🎞 Media-only alerts per target — one tap on the card keeps its alerts to stories, posts/reels and the profile picture; followers, bio, name, link and privacy are still read and stored, just not sent (📋 Track all turns them back on)
 - Paginated account list with live 🟢 / ⏸ state markers
 - Per-target forced recheck, change history, and stored-photo retrieval
 

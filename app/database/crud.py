@@ -893,6 +893,26 @@ async def set_account_topic(
     await set_setting(session, _topic_key(account_id), str(thread_id))
 
 
+# ---------- Per-account media-only alerts (stored in app_settings) ----------
+
+def _media_only_key(account_id: int) -> str:
+    return f"media_only:{account_id}"
+
+
+async def is_media_only(session: AsyncSession, account_id: int) -> bool:
+    """True when the account alerts only on its stories, posts and avatar."""
+    return await get_setting(session, _media_only_key(account_id)) == "1"
+
+
+async def set_media_only(
+    session: AsyncSession, account_id: int, media_only: bool
+) -> None:
+    if media_only:
+        await set_setting(session, _media_only_key(account_id), "1")
+    else:
+        await delete_setting(session, _media_only_key(account_id))
+
+
 # ---------- Data retention ----------
 
 # Bulk id lists are chunked so a very old database cannot build a single
