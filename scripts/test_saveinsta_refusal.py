@@ -39,6 +39,7 @@ from app.database.session import dispose_engine, engine  # noqa: E402
 from app.monitor import service as service_mod  # noqa: E402
 from app.monitor.service import MonitorService  # noqa: E402
 from app.monitor.stories import StoriesClient  # noqa: E402
+from app.monitor.storynavigation import Reel  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -89,17 +90,18 @@ class FakeSession:
         pass
 
 
-class NoFreshStoryNav:
-    """storynavigation with no fresh copy — the case saveinsta is asked in."""
+class EmptyStoryNav:
+    """storynavigation with nothing for the reel (its fetch from Instagram
+    failed, and it stores the empty answer) — the case saveinsta is asked in."""
 
-    reason = "only had a stored copy, of unknown age"
+    reason = "sent nothing for this highlight"
 
     def __init__(self) -> None:
         self.failed_at: float | None = None
 
     async def highlight_media(self, session, highlight_id):
         self.failed_at = time.monotonic()
-        return []
+        return Reel()
 
     def failure_since(self, since: float):
         return self.reason if self.failed_at is not None and self.failed_at >= since else None
@@ -108,7 +110,7 @@ class NoFreshStoryNav:
 def make_client(verify: FakeResponse, search: FakeResponse) -> StoriesClient:
     client = StoriesClient()
     client._session = FakeSession(verify, search)  # type: ignore[assignment]
-    client._storynav = NoFreshStoryNav()  # type: ignore[assignment]
+    client._storynav = EmptyStoryNav()  # type: ignore[assignment]
     client._tokens = ("exp", "tok")  # skip the token page
     client._tokens_until = time.monotonic() + 600
     return client
@@ -200,7 +202,7 @@ async def test_download_says_why() -> None:
     expect("and passes saveinsta's reason on",
            "saveinsta" in error and "“Video is private.”" in error, error)
     expect("and storynavigation's, which was asked first",
-           f"storynavigation {NoFreshStoryNav.reason}" in error, error)
+           f"storynavigation {EmptyStoryNav.reason}" in error, error)
     expect("instead of guessing at a rate limit", "rate-" not in error, error)
     await refused.close()
 

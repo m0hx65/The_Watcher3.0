@@ -48,8 +48,13 @@ def discover(pattern: str | None, include_live: bool) -> list[Path]:
 
 def run_one(path: Path) -> tuple[bool, float, str]:
     start = time.monotonic()
+    # -X utf8: the suite must WRITE what this runner reads as UTF-8. Into a
+    # pipe on Windows a child's stdout is cp1252, and a suite that prints a
+    # name outside it (the Arabic digits test_interval_parse checks, the
+    # full-width host test_security refuses) died of UnicodeEncodeError on
+    # the print: two suites red on Windows that pass everywhere else.
     proc = subprocess.run(
-        [sys.executable, str(path)],
+        [sys.executable, "-X", "utf8", str(path)],
         cwd=str(ROOT),
         capture_output=True,
         text=True,

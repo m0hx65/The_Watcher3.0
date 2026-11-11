@@ -1648,25 +1648,50 @@ async def _show_highlights(
             reply_markup=await _actions_keyboard(username),
         )
         return
-    untracked = result.get("untracked", set())
-    monitored = result.get("monitored", False)
+    await _safe_edit_text(
+        query,
+        _highlights_text(username, result),
+        reply_markup=_highlights_keyboard(username, result),
+    )
+
+
+def _highlights_text(username: str, listing: dict) -> str:
+    """The highlight list as the chat shows it, from a `list_highlights`
+    result that has items."""
+    items = listing.get("items", [])
+    untracked = listing.get("untracked", set())
     lines = [f"<b>✨ Highlights for @{esc(username)}</b> ({len(items)})", ""]
     for i, (hid, title) in enumerate(items, start=1):
         mark = " 🔕" if hid in untracked else ""
         lines.append(f"{i}. {esc(title) or '(untitled)'}{mark}")
     lines.append("")
     lines.append("Tap a highlight below to download and send it.")
-    if monitored:
+    if listing.get("monitored", False):
         lines.append(
             "🔕 Mute skips a highlight in the sweep auto-download; "
             "manual downloads still work."
         )
-    await _safe_edit_text(
-        query,
-        "\n".join(lines),
-        reply_markup=keyboards.highlights_view(
-            username, items, untracked=untracked, monitored=monitored
-        ),
+    return "\n".join(lines)
+
+
+def _highlights_keyboard(username: str, listing: dict) -> InlineKeyboardMarkup:
+    return keyboards.highlights_view(
+        username,
+        listing.get("items", []),
+        untracked=listing.get("untracked", set()),
+        monitored=listing.get("monitored", False),
+    )
+
+
+def _copy_note_line(note: Optional[str]) -> str:
+    """The line that says which copy of a highlight was just sent, when it is
+    not this minute's ("" otherwise). storynavigation fetches a highlight
+    once and serves that copy for about a day."""
+    if not note:
+        return ""
+    return (
+        f"\n<i>Source: {esc(note)}. It re-reads a highlight about once a day, "
+        "so anything added since is not in it.</i>"
     )
 
 
@@ -1676,7 +1701,15 @@ async def _download_highlight(
     username: str,
     index_raw: str,
 ) -> None:
-    """Download one highlight (by its list index) and send its items."""
+    """Download one highlight (by its list index) and send its items.
+
+    The outcome is written under the highlight list, not sent as a second
+    answer to the button: a callback query takes ONE answer, and the
+    "Downloading…" below is it. The result used to go out as another — the
+    error alert included — and Telegram dropped it ("already answered",
+    which _safe_answer ignores), so a download that failed showed nothing
+    at all: the button was tapped and no media, and no reason, ever came.
+    """
     query = update.callback_query
     if not index_raw.lstrip("-").isdecimal():
         await _safe_answer(query, "Invalid highlight.")
@@ -1684,20 +1717,33 @@ async def _download_highlight(
     await _safe_answer(query, "Downloading…")
     service: MonitorService = context.application.bot_data["monitor"]
     result = await service.download_highlight(username, int(index_raw))
-    title = result.get("title") or "(untitled)"
-    if not result.get("ok"):
-        await _safe_answer(
-            query,
-            str(result.get("error") or "Download failed."),
-            show_alert=True,
-        )
-        return
+    title = esc(result.get("title") or "(untitled)")
     count = result.get("count", 0)
-    if count == 0:
-        await _safe_answer(query, f"No items in “{title}”.", show_alert=True)
+    if not result.get("ok"):
+        outcome = (
+            f"⚠️ <b>{title}</b> was not downloaded: "
+            f"<code>{esc(str(result.get('error') or 'Download failed.'))}</code>"
+        )
+    elif count == 0:
+        listed = result.get("items", 0)
+        outcome = (
+            f"⚠️ <b>{title}</b>: {listed} item(s) listed, but none could be "
+            "downloaded — try again shortly."
+        )
     else:
         noun = "item" if count == 1 else "items"
-        await _safe_answer(query, f"Sent {count} {noun} from “{title}”.")
+        outcome = f"✨ Sent {count} {noun} from <b>{title}</b>."
+        outcome += _copy_note_line(result.get("note"))
+    listing = result.get("listing") or {}
+    if listing.get("items"):
+        # Under the list, so the next highlight is one tap away either way.
+        text = f"{_highlights_text(username, listing)}\n\n{outcome}"
+        keyboard = _highlights_keyboard(username, listing)
+    else:
+        text, keyboard = outcome, await _actions_keyboard(username)
+    await _conclude_download(
+        update, context, text, reply_markup=keyboard, sent_any=count > 0
+    )
 
 
 async def _toggle_highlight_tracking(
@@ -1793,6 +1839,7 @@ async def _download_all_highlights(
             f"✨ Sent {count} {item_noun} from {reels} {reel_noun} "
             f"for <b>@{esc(username)}</b>."
         )
+        text += _copy_note_line(result.get("note"))
     await _conclude_download(
         update, context, text, reply_markup=keyboard, sent_any=count > 0
     )
@@ -2064,6 +2111,7 @@ async def _run_bundle_download(
                         lines.append(
                             f"✨ Highlights — {r.get('count', 0)} items "
                             f"from {reels} reel{'s' if reels != 1 else ''} ✓"
+                            + _copy_note_line(r.get("note"))
                         )
                     else:
                         lines.append("✨ Highlights — none to download")
@@ -2086,6 +2134,7 @@ async def _run_bundle_download(
                     lines.append(
                         f"✨ Highlights — {r.get('count', 0)} items "
                         f"from {r.get('reels', 0)} reel{'s' if r.get('reels', 0) != 1 else ''} ✓"
+                        + _copy_note_line(r.get("note"))
                     )
                     if r.get("count", 0):
                         delivered_any = True

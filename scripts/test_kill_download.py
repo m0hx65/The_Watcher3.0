@@ -189,7 +189,15 @@ async def test_kill_during_gather() -> None:
     task = asyncio.create_task(
         service.download_highlights_from_catalog("victim", catalog)
     )
-    await asyncio.sleep(0.05)  # let the gather get going
+    # Let the gather get going: until the download is under way, not for a
+    # fixed 50 ms. It reads the account from the database first, and on a
+    # slow disk that alone took 35-40 ms (measured on Windows, 2026-11-11),
+    # so the kill sometimes landed before there was anything to stop and the
+    # suite failed one run in three.
+    for _ in range(300):
+        if service.download_active:
+            break
+        await asyncio.sleep(0.01)
     killed = service.request_kill()
     result = await asyncio.wait_for(task, timeout=2.0)
 

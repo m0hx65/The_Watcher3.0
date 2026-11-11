@@ -51,6 +51,7 @@ from app.monitor.media_hasher import (
 )
 from app.monitor.public_page import strip_bidi
 from app.monitor.stories import StoriesClient
+from app.monitor.storynavigation import copies_note
 from app.utils.formatting import esc, fmt_timestamp
 from app.utils.logger import logger
 
@@ -200,6 +201,29 @@ def _is_stale_pic(
     if now - since > _STALE_PIC_WINDOW:
         return False
     return current_asset in {pic_asset_id(url) for url, _at in older}
+
+
+# How far short of its interval a scan may be and still be due: a tenth of
+# the interval, 15 minutes at most. See _scan_due.
+_SCAN_SLACK_FRACTION = 0.1
+_SCAN_SLACK_MAX_SECONDS = 900.0
+
+
+def _scan_due(last: Optional[float], interval: float) -> bool:
+    """Whether a scan that runs "once per `interval`" is due, `last` being
+    when it last ran (time.time(); None for never).
+
+    A little early rather than a whole sweep late. The question is put once
+    per sweep, and a sweep is no clock: it starts its interval plus a random
+    delay after the one before, and reaches each account at a different
+    second. With the scan interval the same as the sweep's (both 6 h on the
+    deployment this was measured on), "has a full interval passed?" was
+    settled by that noise — due by two seconds on 2026-11-09 — and a miss
+    leaves the scan to the next sweep, at twice its interval."""
+    if interval <= 0 or last is None:
+        return True
+    slack = min(interval * _SCAN_SLACK_FRACTION, _SCAN_SLACK_MAX_SECONDS)
+    return time.time() - last >= interval - slack
 
 
 def _json_ids(raw: Optional[str]) -> set[str]:
@@ -446,11 +470,13 @@ class _SweepThrottle:
                 and self._consecutive_user_blocks >= self._user_threshold
             ):
                 self._username_door_closed = True
+                refused = self._consecutive_user_blocks
                 logger.warning(
-                    "Instagram refused {} username lookups in a row and "
-                    "answered none — the rest of the sweep skips the username "
-                    "API and reads the page (the numeric id if no page "
-                    "answers)", self._consecutive_user_blocks,
+                    "Instagram refused {} and answered none — the rest of the "
+                    "sweep skips the username API and reads the page (the "
+                    "numeric id if no page answers)",
+                    "the one username lookup it was asked" if refused == 1
+                    else f"{refused} username lookups in a row",
                 )
 
         # Instagram answered if the username side came back 200 — from the
@@ -2419,6 +2445,10 @@ class MonitorService:
             failure_count = await crud.mark_checked(
                 session, account_id, fetch.http_status, success=False
             )
+            misses = (
+                await self._not_found_run(session, account_id, failure_count)
+                if fetch.http_status == 404 else 0
+            )
 
         # Only notify on the first failure or every 5th consecutive failure
         should_notify = not gate_status and (
@@ -2433,14 +2463,21 @@ class MonitorService:
             # still be a flake), or at once when the id itself no longer
             # resolves (two routes then agree the account is gone), and every
             # 5th check after that.
+            #
+            # Counted in "not found" answers (`misses`), not in failed checks.
+            # By failed checks, an account blocked once and then read as
+            # "not found" was announced on that first miss, the flake the
+            # rule exists to sit out; and one blocked more often than that
+            # was not announced until its failures reached a multiple of
+            # five — as "5 checks in a row", some of them blocks.
             first_alert = 1 if (id_probe is not None and id_probe.gone) else 2
-            should_notify = failure_count == first_alert or (
-                failure_count > first_alert and failure_count % 5 == 0
+            should_notify = misses == first_alert or (
+                misses > first_alert and misses % 5 == 0
             )
             change_type = "not_found"
         if should_notify:
             if fetch.http_status == 404:
-                msg = render_not_found_message(username, failure_count, id_probe)
+                msg = render_not_found_message(username, misses, id_probe)
             else:
                 msg = render_failure_message(username, fetch)
             thread_id = await self.topic_for(account_id, username)
@@ -2967,6 +3004,41 @@ class MonitorService:
         account next answers. See _clear_not_found."""
         return f"not_found_alert:{account_id}"
 
+    @staticmethod
+    def _not_found_run_key(account_id: int) -> str:
+        return f"not_found_run:{account_id}"
+
+    async def _not_found_run(
+        self, session: Any, account_id: int, failure_count: int
+    ) -> int:
+        """How many checks in a row have said "not found", this one included.
+
+        Kept as "<run>:<the failure count it was booked at>". The account's
+        consecutive-failure count rises by one per failed check and returns
+        to zero on a success, so the stored run continues only when it was
+        booked at the failure just before this one: a block or an answer in
+        between starts it over without anything having to clear it. Stored,
+        not held in memory, so a restart neither forgets a run nor repeats
+        its alert.
+        """
+        key = self._not_found_run_key(account_id)
+        stored = await crud.get_setting(session, key)
+        run, _, booked_at = (stored or "").partition(":")
+        continues = (
+            run.isdecimal() and booked_at.isdecimal()
+            and int(booked_at) == failure_count - 1
+        )
+        count = int(run) + 1 if continues else 1
+        if stored is None and failure_count > 1 and await crud.get_setting(
+            session, self._not_found_key(account_id)
+        ) is not None:
+            # A run that was announced before runs were counted (2026-11-10),
+            # when failed checks were: it carries on from that count instead
+            # of starting over and being announced a second time.
+            count = failure_count
+        await crud.set_setting(session, key, f"{count}:{failure_count}")
+        return count
+
     async def _clear_not_found(self, account_id: int, username: str) -> None:
         """Correct a standing "doesn't exist" alert once the account answers.
 
@@ -2987,6 +3059,7 @@ class MonitorService:
             if await crud.get_setting(session, key) is None:
                 return
             await crud.delete_setting(session, key)
+            await crud.delete_setting(session, self._not_found_run_key(account_id))
         logger.info(
             "@{} answers again after a \"doesn't exist\" alert — telling the "
             "chat that alert no longer holds", username,
@@ -3230,16 +3303,33 @@ class MonitorService:
                 logger.debug("Highlight item fetch failed for @{}: {}", username, r)
         return items
 
-    def _media_unavailable(self, since: float) -> str:
+    @staticmethod
+    def _copy_note(items: list) -> Optional[str]:
+        """How old the highlight media in `items` is, as one phrase for
+        whoever asked for it ("storynavigation's copy from ~6 h ago"). None
+        when every reel's copy was fetched within minutes, or none of the
+        items came from storynavigation. It fetches a highlight once and
+        serves that copy for a day or more, so media handed to a person says
+        which copy it is: an old one is never passed off as this minute's."""
+        copies = {
+            item.highlight_id: item.copy
+            for item in items
+            if getattr(item, "copy", None) is not None and item.highlight_id
+        }
+        return copies_note(copies.values())
+
+    def _media_unavailable(self, since: float, *, highlights: bool = True) -> str:
         """The error for a download no anonymous source served, `since` being
         when the download started. Every source that said why is quoted:
         guessing at a rate limit hid that saveinsta had stopped serving
-        highlights ("Video is private." for every public account), and
-        storynavigation's usual reason is that it only had an old copy."""
+        highlights ("Video is private." for every public account).
+        `highlights=False` for a story download, which storynavigation is
+        never asked for: its reason for a highlight a sweep listed meanwhile
+        is not this download's."""
         if self.stories is None:
             return _DOWNLOAD_UNAVAILABLE_MSG
         reasons = []
-        storynav = self.stories.highlight_failure_since(since)
+        storynav = self.stories.highlight_failure_since(since) if highlights else None
         if storynav:
             reasons.append(f"storynavigation {storynav}")
         refusal = self.stories.refusal_since(since)
@@ -3305,17 +3395,20 @@ class MonitorService:
         previous_catalog: dict[str, str],
         catalog: dict[str, str],
     ) -> set[str]:
-        """The reels of `items` that were in the catalog when highlight media
-        came back (storynavigation, 2026-11-05) and are listed for the first
-        time since: their items are recorded as seen, not delivered — the way
+        """The reels of `items` that are owed a quiet first listing and are
+        listed now: their items are recorded as seen, not delivered — the way
         an account's first sweep is a baseline. Returns those reel ids.
 
-        No highlight item could be listed for two weeks before that, and the
-        ids recorded earlier came from saveinsta's links, which need not match
-        storynavigation's: without this, a reel's first listing would deliver
-        its old media as if new. A reel that joins the catalog later is news
-        and is delivered, however many of its listings fail first
-        (storynavigation fails about half of its fetches).
+        Owed one: every reel that was in the catalog when highlight media
+        came back (storynavigation, 2026-11-05) — no highlight item could be
+        listed for two weeks before that, and the ids recorded earlier came
+        from saveinsta's links, which need not match storynavigation's — and
+        any reel whose listing came back with nothing when its items were to
+        be recorded without sending (a baseline, an unmute; see
+        _owe_quiet_listing). Without this the first listing that works would
+        deliver the reel's old media as if new. A reel that joins the catalog
+        later is news and is delivered, however many of its listings fail
+        first.
         """
         key = self._quiet_reels_key(account_id)
         async with get_session() as session:
@@ -3337,12 +3430,37 @@ class MonitorService:
                 await crud.set_setting(session, key, json.dumps(sorted(remaining)))
         if held:
             logger.info(
-                "@{}: first listing of {} reel(s) since highlight media came back "
-                "— their {} item(s) recorded as seen, not delivered",
+                "@{}: first listing of {} reel(s) that were owed a quiet one — "
+                "their {} item(s) recorded as seen, not delivered",
                 username, len(held),
                 sum(1 for item in items if item.highlight_id in held),
             )
         return held
+
+    async def _owe_quiet_listing(self, account_id: int, reel_ids: set[str]) -> None:
+        """Leave these reels owed a quiet first listing (see
+        _hold_back_first_listings): their items were to be recorded as seen
+        without being sent, and the listing came back with nothing.
+
+        That is an ordinary outcome — storynavigation's fetch from Instagram
+        can fail, and it then serves the empty answer for a day. Before this,
+        a reel that could not be listed at an account's baseline, or when it
+        was unmuted, had nothing recorded and nothing owed, so the first
+        listing that worked delivered the whole reel as new."""
+        if not reel_ids:
+            return
+        key = self._quiet_reels_key(account_id)
+        async with get_session() as session:
+            raw = await crud.get_setting(session, key)
+            # Never been through _hold_back_first_listings: every reel the
+            # account has is still owed its own.
+            pending = (
+                _json_ids(raw) if raw is not None
+                else set(await crud.get_highlight_catalog(session, account_id))
+            )
+            await crud.set_setting(
+                session, key, json.dumps(sorted(pending | set(reel_ids)))
+            )
 
     @classmethod
     def _highlight_scan_overdue(
@@ -3353,16 +3471,12 @@ class MonitorService:
         asked before the sweep instead of during it, so the sweep can decide
         up front whether an account's reel query is worth asking the phone
         for at all."""
-        interval = settings.highlight_scan_interval
-        if interval <= 0:
-            return True
         raw = stamps.get(cls._highlight_scan_key(account_id))
-        if not raw:
-            return True
         try:
-            return (time.time() - float(raw)) >= interval
+            last = float(raw) if raw else None
         except ValueError:
-            return True
+            last = None
+        return _scan_due(last, settings.highlight_scan_interval)
 
     async def _due_highlight_scan(
         self,
@@ -3390,7 +3504,7 @@ class MonitorService:
             last = float(raw) if raw else None
         except ValueError:
             last = None
-        if last is None or (time.time() - last) >= interval:
+        if last is None or _scan_due(last, interval):  # `last` is read below
             return tracked_catalog, True
         fresh = {
             hid: title
@@ -3729,16 +3843,28 @@ class MonitorService:
                             self._highlight_scan_key(account_id),
                             str(time.time()),
                         )
-                        # Everything listed is seen already, so no reel is
-                        # left owing a quiet first listing.
+                        # What was listed is seen now. A reel whose listing
+                        # came back with nothing has no item on record, so it
+                        # stays owed a quiet first listing: written off here
+                        # as done ("[]"), the first listing that worked
+                        # delivered every item of the reel as new.
+                        unlisted = sorted(
+                            set(catalog)
+                            - {i.highlight_id for i in highlight_items if i.highlight_id}
+                        )
                         await crud.set_setting(
-                            session, self._quiet_reels_key(account_id), "[]"
+                            session, self._quiet_reels_key(account_id),
+                            json.dumps(unlisted),
                         )
                     logger.info(
-                        "Established story/highlight baseline for @{} ({} reels, {} items)",
+                        "Established story/highlight baseline for @{} ({} reels, "
+                        "{} items){}",
                         username,
                         len(catalog),
                         len(stories) + len(highlight_items),
+                        f" — {len(unlisted)} reel(s) could not be listed; their "
+                        "first listing will be recorded, not delivered"
+                        if unlisted else "",
                     )
                     # Nothing is delivered on a baseline (that's the point), so
                     # the status line is the only word this account gets.
@@ -3815,6 +3941,19 @@ class MonitorService:
                     i for i in highlight_items
                     if i.pk and i.pk not in seen_pks and i.highlight_id not in held
                 ]
+                if scan_catalog:
+                    # One line whichever way it went, as for the post grid:
+                    # with only the failures logged, a listing that found
+                    # nothing new and one that never ran looked the same.
+                    note = self._copy_note(highlight_items)
+                    logger.info(
+                        "@{}: highlights — {} of {} reel(s) listed, {} item(s), "
+                        "{} the chat has not seen{}",
+                        username,
+                        len({i.highlight_id for i in highlight_items if i.highlight_id}),
+                        len(scan_catalog), len(highlight_items),
+                        len(new_highlight_items), f" ({note})" if note else "",
+                    )
                 if new_highlight_items:
                     await self._deliver_story_items(
                         account_id, username, new_highlight_items, seen_pks,
@@ -4040,7 +4179,7 @@ class MonitorService:
             last = float(raw) if raw else None
         except ValueError:
             last = None
-        return last is None or (time.time() - last) >= interval
+        return _scan_due(last, interval)
 
     async def _handle_new_posts(
         self,
@@ -4441,6 +4580,11 @@ class MonitorService:
         missed = new_total - total
         if missed:
             summary += f" {missed} item(s) not sent (download failed or stopped)."
+        note = self._copy_note(new_highlights) if h else None
+        if note:
+            # "The whole account" is a claim about now: say which copy of
+            # its highlights that was, when it is not this minute's.
+            summary += f"\n<i>Highlights from {esc(note)}.</i>"
         await self.notifier.send_text(summary, message_thread_id=thread_id)
         logger.info(
             "Public backlog for @{}: {} post/reel, {} highlight, {} story "
@@ -4522,7 +4666,10 @@ class MonitorService:
             # Genuinely no active story right now.
             return {"ok": True, "count": 0, "error": None}
         # Either there IS a story we can't fetch anonymously, or status unknown.
-        return {"ok": False, "count": 0, "error": self._media_unavailable(since)}
+        return {
+            "ok": False, "count": 0,
+            "error": self._media_unavailable(since, highlights=False),
+        }
 
     async def fetch_and_send_story_url(
         self, username: str, story_url: str, *, pk: Optional[str] = None
@@ -4561,7 +4708,10 @@ class MonitorService:
                 items = matched
 
         if not items:
-            return {"ok": False, "count": 0, "error": self._media_unavailable(since)}
+            return {
+                "ok": False, "count": 0,
+                "error": self._media_unavailable(since, highlights=False),
+            }
 
         async with self.download_scope():
             sent = await self._deliver_story_items(
@@ -4626,7 +4776,12 @@ class MonitorService:
         The index refers to the ordering returned by `list_highlights`, which is
         recomputed here so the bot doesn't have to pack a (colon-containing)
         highlight id into Telegram's 64-byte callback budget.
-        Returns {"ok": bool, "count": int, "title": Optional[str], "error": Optional[str]}.
+        Returns {"ok": bool, "count": int, "title": Optional[str], "error":
+        Optional[str]}; on success "items" (how many the reel listed; "count"
+        is how many were sent) and "note": how old the copy they came from is
+        when it is not this minute's (see _copy_note), else None; and, once
+        the list has been read, "listing": that `list_highlights` result, so
+        the caller can show the list again without asking for it twice.
         """
         if self.stories is None:
             return {"ok": False, "count": 0, "title": None, "error": "Stories client unavailable"}
@@ -4639,7 +4794,7 @@ class MonitorService:
         items = listing["items"]
         if index < 0 or index >= len(items):
             return {
-                "ok": False, "count": 0, "title": None,
+                "ok": False, "count": 0, "title": None, "listing": listing,
                 "error": "That highlight is no longer available — refresh the list.",
             }
 
@@ -4659,7 +4814,7 @@ class MonitorService:
 
         if not story_items:
             return {
-                "ok": False, "count": 0, "title": title,
+                "ok": False, "count": 0, "title": title, "listing": listing,
                 "error": self._media_unavailable(since),
             }
 
@@ -4667,7 +4822,11 @@ class MonitorService:
             sent = await self._deliver_story_items(
                 account_id, username, story_items, set(), cancellable=True
             )
-        return {"ok": True, "count": sent, "title": title, "error": None}
+        return {
+            "ok": True, "count": sent, "title": title, "error": None,
+            "listing": listing, "items": len(story_items),
+            "note": self._copy_note(story_items),
+        }
 
     async def download_all_highlights(
         self, username: str, *, message_thread_id: Optional[int] = None
@@ -4677,7 +4836,8 @@ class MonitorService:
         `message_thread_id` routes media to a per-account forum topic (used by
         the private→public backlog grab); on-demand callers leave it None.
         Returns {"ok": bool, "count": int, "reels": int, "error": Optional[str]}
-        where count is the total media items sent and reels the number of reels.
+        where count is the total media items sent and reels the number of reels;
+        on success also "note" (see _copy_note).
         """
         if self.stories is None:
             return {"ok": False, "count": 0, "reels": 0, "error": "Stories client unavailable"}
@@ -4706,7 +4866,10 @@ class MonitorService:
                 account_id, username, story_items, set(),
                 message_thread_id=message_thread_id, cancellable=True,
             )
-        return {"ok": True, "count": sent, "reels": len(items), "error": None}
+        return {
+            "ok": True, "count": sent, "reels": len(items), "error": None,
+            "note": self._copy_note(story_items),
+        }
 
     async def download_highlights_from_catalog(
         self, username: str, catalog: dict[str, str]
@@ -4715,10 +4878,12 @@ class MonitorService:
 
         `catalog` is {highlight_id: title}, e.g. the (id, title) pairs the
         bulk-download panel already fetched and showed the user. The media
-        comes straight from saveinsta by highlight id — no Instagram web/graphql
-        call happens here, so this still works when Instagram is 401-blocking
-        the datacenter IP (which is what list-based re-resolution dies on).
-        Returns {"ok", "count", "reels", "error"}.
+        comes straight from the anonymous sources by highlight id — no
+        Instagram web/graphql call happens here, so this still works when
+        Instagram is 401-blocking the datacenter IP (which is what list-based
+        re-resolution dies on).
+        Returns {"ok", "count", "reels", "error"}, and on success "note" (see
+        _copy_note).
         """
         if self.stories is None:
             return {"ok": False, "count": 0, "reels": 0, "error": "Stories client unavailable"}
@@ -4745,7 +4910,10 @@ class MonitorService:
             sent = await self._deliver_story_items(
                 account_id, username, story_items, set(), cancellable=True
             )
-        return {"ok": True, "count": sent, "reels": len(catalog), "error": None}
+        return {
+            "ok": True, "count": sent, "reels": len(catalog), "error": None,
+            "note": self._copy_note(story_items),
+        }
 
     async def download_posts(
         self,
@@ -4951,19 +5119,25 @@ class MonitorService:
         tracked = highlight_id in listing["untracked"]  # flip: muted -> track
 
         if tracked and self.stories is not None:
+            story_items: list = []
             try:
                 story_items = await self.stories.fetch_highlight_items(
                     username, highlight_id, title
                 )
-                async with get_session() as session:
-                    await crud.mark_story_items_seen(
-                        session, account.id, story_items
-                    )
             except Exception as exc:  # pragma: no cover - network failure path
                 logger.debug(
                     "Unmute re-baseline failed for @{} ({}): {}",
                     username, highlight_id, exc,
                 )
+            if story_items:
+                async with get_session() as session:
+                    await crud.mark_story_items_seen(
+                        session, account.id, story_items
+                    )
+            else:
+                # Nothing to record them from just now, so the reel's next
+                # listing records its items instead of delivering them.
+                await self._owe_quiet_listing(account.id, {highlight_id})
 
         async with get_session() as session:
             ok = await crud.set_highlight_tracked(
@@ -4979,8 +5153,11 @@ class MonitorService:
     async def set_all_highlight_tracking(self, username: str, tracked: bool) -> dict:
         """Mute or unmute sweep auto-download for ALL of an account's highlights.
 
-        Unmuting re-baselines every reel first (items posted while muted are
-        marked seen, not sent). Returns {"ok", "count", "error"}.
+        Unmuting re-baselines the muted reels first (items posted while muted
+        are marked seen, not sent; a reel that cannot be listed just then has
+        its next listing recorded the same way). A reel that was never muted
+        is left alone: marking its items seen here could swallow one the
+        sweep has not delivered yet. Returns {"ok", "count", "error"}.
         """
         username = username.strip().lstrip("@").lower()
         async with get_session() as session:
@@ -4994,12 +5171,20 @@ class MonitorService:
         if tracked and self.stories is not None:
             async with get_session() as session:
                 catalog = await crud.get_highlight_catalog(session, account.id)
-            if catalog:
-                story_items = await self._gather_highlight_items(username, catalog)
+                untracked = await crud.get_untracked_highlight_ids(
+                    session, account.id
+                )
+            muted = {hid: title for hid, title in catalog.items() if hid in untracked}
+            if muted:
+                story_items = await self._gather_highlight_items(username, muted)
                 async with get_session() as session:
                     await crud.mark_story_items_seen(
                         session, account.id, story_items
                     )
+                await self._owe_quiet_listing(
+                    account.id,
+                    set(muted) - {i.highlight_id for i in story_items if i.highlight_id},
+                )
 
         async with get_session() as session:
             count = await crud.set_all_highlights_tracked(

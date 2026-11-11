@@ -164,7 +164,7 @@ the_watcher_V3.0/
 │   │   ├── service.py       # MonitorService — orchestrate fetch/diff/persist/notify
 │   │   ├── change_detector.py # ChangeSet diffing logic
 │   │   ├── stories.py       # StoriesClient — stories & highlights
-│   │   └── storynavigation.py # Highlight media, fresh copies only
+│   │   └── storynavigation.py # Highlight media, each copy with its age
 │   ├── workers/
 │   │   └── scheduler.py     # WatcherScheduler (APScheduler wrapper)
 │   └── utils/
@@ -293,7 +293,10 @@ x-ig-app-id: 936619743392459
   id route, which ran first: the id still answering under the same name
   is a glitch (quiet); the id gone means deactivated/deleted (announced at
   once); the id route blocked means a rename can't be confirmed (announced
-  on the second consecutive miss and every 5th after)
+  on the second consecutive miss and every 5th after — counted in "not
+  found" answers, `not_found_run:<id>`, not in failed checks: an account
+  that was blocked twice before it first read "not found" is announced on
+  its second miss, as "2 checks in a row")
 
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
@@ -343,6 +346,30 @@ before `crud.OG_ERA_CUTOFF`, deleting what the withdrawn `og:` parser wrote —
 the account card reads the newest snapshot and would otherwise keep stating a
 wrong number as current. The cutoff sits in the gap between the two parsers, so
 it never touches the payload-sourced rows the current fallback writes.
+
+**One page with no payload is an answer: Instagram's "isn't available" page
+(2026-11-10).** For a username with no profile — renamed away from,
+deactivated, deleted — Instagram serves a logged-out visitor its "Profile
+isn't available" page with **HTTP 200**, not a 404. The bot read it as "no
+profile payload — login wall or markup change": when @8dvuu vanished that day
+it failed its check and its retry as a block, with no word about why, and
+each try counted against the page door (three such strikes skip the door for
+30 minutes and move the page tunnel off a working exit). The page says what
+it is in the route it was served for — `PolarisErrorRoot`, pageID
+`httpErrorPage`, where a profile is `profilePage` and the login page
+`CAAIGLoginHomepage` — and `public_page.is_unavailable_page` reads that. A
+profile Instagram shows only to logged-in visitors (an age-restricted brand
+account) is still `profilePage` with `"xig_user_by_username":null`, and stays
+a refusal. `InstagramClient._unavailable_page` hands the page on as a 404 —
+no strike, and the check reports "not found" the way a page 404 always did —
+through this host's door and the home fetcher's (whose worker sends the route
+block along: it sits ~230 KB into the page, past the 64 KB it uploads of a
+page without a payload). One guard, because the username API began answering
+404 for every username on 2026-11-04 and six live accounts were reported
+missing: more than three different usernames in a row with no profile read
+between them is Instagram answering that way for everyone, and from then on
+the page is booked as a refusal for every username until a page carries a
+profile again.
 
 Parsing is bounded — a 4 MB scan window, a 200 KB object ceiling, brace-matched
 in one pass, and run off the event loop. An earlier version used a lazy `(.*?)`
@@ -565,29 +592,71 @@ Instagram's own gate, so it keeps working when the API path is 401-blocked.
 During an outage the story media still arrives; only the live *status* goes
 unknown, and the bot says so rather than guessing.
 
-**Highlight media: storynavigation.com, fresh copies only (2026-11-05).**
-saveinsta has answered "Video is private." for every highlight since
-2026-10-23, so `fetch_highlight_items` asks `app/monitor/storynavigation.py`
-first and saveinsta only when that gives nothing. storynavigation's page posts
-`{highlightId}` to `/get-highlight-stories` with the Laravel CSRF token from its
-home page (no captcha, no login of ours) and gets the reel's items as Instagram
-CDN links. Measured the same day: the first request for a reel fetches it from
-Instagram (3.5–13 s; about half of those fetches fail with an empty body), and
-whatever came back — items, or `[]` — is then served from storage for a day or
-more (0.2–0.33 s, identical signed links). Under the no-stale-data rule an
-answer counts only when it took seconds (≥ 2.5 s: this request fetched it), or
-when it is the copy this client fetched live within the last 15 minutes. A
-quick answer is refused as "only had a stored copy", an empty one as "sent
-nothing for this highlight" — never as an empty highlight — and the download
-error names every source's reason. Its own highlight list and profile data are
-never used: the list said `[]` for an account with three reels, and profiles
-are cached (natgeo's follower count did not move in 10 minutes).
+**Highlight media: storynavigation.com, each copy with its age (2026-11-05,
+reworked 2026-11-10).** saveinsta has answered "Video is private." for every
+highlight since 2026-10-23, so `fetch_highlight_items` asks
+`app/monitor/storynavigation.py` first and saveinsta only when that gives
+nothing. storynavigation's page posts `{highlightId}` to
+`/get-highlight-stories` with the Laravel CSRF token from its home page (no
+captcha, no login of ours) and gets the reel's items as Instagram CDN links.
+The first request for a reel makes it fetch the reel from Instagram (1.2–6.3 s
+on six reels on 2026-11-10; 3.5–13 s five days before; some fetches fail with
+an empty body), and whatever came back — items, or `[]` — is then served from
+storage for a day or more (0.2–0.8 s, identical signed links). Nothing in an
+answer, or its headers, says how old it is.
 
-When highlight media came back, every reel already in a catalog was owed one
-quiet first listing (`highlight_quiet_reels:<id>`): its items are recorded as
-seen, not delivered, because two weeks of reels had no media and the ids
-recorded before came from saveinsta's links. A reel that joins the catalog
-later is always delivered, however many of its listings fail first.
+The first version took an answer only when it had taken ≥ 2.5 s ("this
+request fetched it") or was this client's own copy of the last 15 minutes.
+From 2026-11-07 to 11-10 that served 3 of about 24 sweep listings and neither
+of two downloads asked for by hand. A sweep's own request is what makes
+storynavigation fetch, so the copy it then stores is all anyone is offered for
+the next day; a fetch can finish in half of 2.5 s, and was then refused as "a
+stored copy, of unknown age"; and one reel's live fetch dropped the record of
+every other reel's.
+
+Now every answer that carries media is served, and what is worked out is the
+age of its copy (`storynavigation.Copy`):
+
+- **exact** when this client saw the fetch: the request took ≥ 2.5 s, or —
+  for a time between a stored answer's (< 0.9 s) and that — a second ask came
+  back with the same copy at least 0.7 s quicker;
+- **at most** when the copy replaced one this client was served before (it
+  was fetched since then);
+- **unknown** otherwise: a first look at a reel, answered from storage.
+
+A copy is told by its links' signatures (`oh`; Instagram signs every fetch
+anew) and is never re-dated by timing once seen. The record lives in memory,
+so after a restart every stored copy is of unknown age until storynavigation
+next fetches it. A sweep delivers whatever the chat has not seen from the copy
+it is served, and logs one line per listing (`@user: highlights — 2 of 2
+reel(s) listed, 9 item(s), 0 the chat has not seen (storynavigation's copies,
+up to ~6 h old)`). Media handed to a person says which copy it was — "Source:
+storynavigation's copy from ~6 h ago. It re-reads a highlight about once a
+day, so anything added since is not in it." — unless it was fetched within 15
+minutes: an old copy is never passed off as this minute's. Still refused, each
+with its reason: an empty answer ("sent nothing for this highlight", never an
+empty highlight), a copy with an expired link (`oe`), anything but a 200.
+`HIGHLIGHT_COPY_MAX_AGE` (seconds; default `0` = any copy) also refuses a
+copy older than that or of unknown age — `900` is the first version's rule.
+The download error names every source's reason; a story's error never quotes
+storynavigation, which a story is not asked of. Its own highlight list and
+profile data are never used: the list said `[]` for an account with three
+reels, and profiles are cached (natgeo's follower count did not move in 10
+minutes).
+
+The outcome of a tap on one highlight is written under the highlight list. It
+used to be sent as a second answer to the button, and a callback query takes
+one: Telegram dropped it, so a download that failed showed nothing at all.
+
+A reel can be owed one quiet first listing (`highlight_quiet_reels:<id>`): its
+items are recorded as seen, not delivered. Every reel already in a catalog
+when highlight media came back was (two weeks of reels had no media, and the
+ids recorded before came from saveinsta's links), and so is any reel whose
+listing came back with nothing when its items were to be recorded without
+sending — at an account's baseline, or when it is unmuted. Without that the
+first listing that worked delivered the whole reel as new. A reel that joins
+the catalog later is always delivered, however many of its listings fail
+first.
 
 ### 6.7 Cloudflare Worker Proxy
 
@@ -1089,7 +1158,8 @@ All settings are read from environment variables (or a `.env` file locally).
 | Env Var | Default | Description |
 |---|---|---|
 | `STORY_STATUS_HEARTBEAT` | `true` | Posts a story/live status line on every check, so every public account's state is always stated (`⭕ NO STORY` included). Never sent on top of the media that already announced the same story. `false` = announced only when it changes |
-| `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight's media. New reels are always listed immediately. `0` = every sweep (~12× traffic) |
+| `HIGHLIGHT_SCAN_INTERVAL` | `21600` | Seconds between full re-lists of every highlight's media. New reels are always listed immediately. `0` = every sweep (~12× traffic). A scan up to a tenth of the interval short (15 minutes at most) counts as due: it is asked once per sweep, and with both at 6 h a few seconds of jitter used to push it to the next sweep |
+| `HIGHLIGHT_COPY_MAX_AGE` | `0` | The oldest copy of a highlight storynavigation may serve, in seconds. `0` takes any copy and says how old it is wherever its media is handed to a person. A number refuses older copies and ones of unknown age (`900` = the 2026-11-05 rule, under which a highlight could be downloaded only in the minutes after storynavigation's own daily fetch) |
 | `AUTO_GRAB_ON_PUBLIC` | `true` | Deliver the backlog (only items not already delivered/baselined — repeated flips never re-send) when a target flips private → public |
 | `DARK_RADAR_DAYS` | `3` | Flag a target after this many days with no story/post/reel (`0` disables) |
 | `FOLLOWER_ANOMALY_ABS_MIN` | `500` | Follower-jump alert fires only when the change is large in **both** absolute and relative terms |

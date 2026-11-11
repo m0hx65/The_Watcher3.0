@@ -25,7 +25,11 @@ from curl_cffi.requests.exceptions import RequestException, Timeout
 from app.config import settings
 from app.monitor import home_fetch, page_tunnel
 from app.monitor.health import IG_PROFILE, IG_REEL, fetch_health
-from app.monitor.public_page import PARTIAL_FIELDS, parse_public_profile
+from app.monitor.public_page import (
+    PARTIAL_FIELDS,
+    is_unavailable_page,
+    parse_public_profile,
+)
 from app.utils.logger import logger
 
 INSTAGRAM_HOST = "www.instagram.com"
@@ -331,6 +335,11 @@ class InstagramClient:
         # through the tunnel (so it is refusing the IP, not losing the path).
         self._direct_page_epoch = page_tunnel.tunnel.epoch
         self._direct_page_tunnel_answered = False
+        # The usernames whose page came back as Instagram's "isn't available"
+        # page since a page last carried a profile, and whether that run has
+        # grown too long to be about those accounts. See _unavailable_page.
+        self._unavailable_run: set[str] = set()
+        self._unavailable_distrusted = False
         # The Worker's reel route. Refused per colo, and each refusal is ~9 s
         # of upstream retries; after a few in a row the phone is asked first
         # for a while, the Worker only when the phone has no answer — and a
@@ -457,6 +466,10 @@ class InstagramClient:
     _DIRECT_PAGE_HANDOVER_FAILURES = 2
     _DIRECT_PAGE_COOLDOWN = 1800.0
     _DIRECT_PAGE_TIMEOUT = 12.0
+    # How many different usernames in a row may come back as Instagram's
+    # "isn't available" page, with no page carrying a profile between them,
+    # and still be taken at its word. See _unavailable_page.
+    _UNAVAILABLE_TRUSTED = 3
     # The Worker's reel route: refusals in a row before the phone is asked
     # first, and for how long. The wait for a live phone answer.
     _WORKER_REEL_BREAKER_FAILURES = 3
@@ -1103,9 +1116,12 @@ class InstagramClient:
         parsed = outcome.get("parsed")
         if parsed is None:
             if outcome.get("status") == 404:
-                # The page itself says the username does not exist. That is a
-                # real answer (the login wall and the rate limit come back as
-                # 200 shells or 429s, never 404), so hand it up as one and let
+                # The page itself says the username does not exist: with a
+                # 404, or — what Instagram sends a logged-out visitor now —
+                # its "isn't available" page under a 200, which
+                # _unavailable_page hands on as this status. That is a real
+                # answer (the login wall is a redirect and the rate limit a
+                # 429, neither of them this), so hand it up as one and let
                 # the check weigh it against the numeric-id route.
                 fetch_health.record_status(IG_PROFILE, 404)
                 return ProfileFetchResult(
@@ -1325,6 +1341,68 @@ class InstagramClient:
                 ", or until the page tunnel's next config is up" if moving else "",
             )
 
+    def _profile_page_read(self) -> None:
+        """A page carried a profile: whatever run of "isn't available" pages
+        came before it is over."""
+        self._unavailable_run.clear()
+        self._unavailable_distrusted = False
+
+    def _unavailable_page(self, username: str, result: dict[str, Any], how: str) -> None:
+        """Book a page that is Instagram's own "isn't available" page (see
+        public_page.is_unavailable_page), served with HTTP 200.
+
+        For one username it is the answer the page's 404 used to be: no
+        profile under that name — renamed, deactivated or deleted. The
+        outcome is handed on as a 404, so it is not a refusal of this host
+        (no strike against the page door or the tunnel's exit), and the check
+        reports the account as not found instead of as blocked. Until
+        2026-11-10 it read as "no profile payload — login wall or markup
+        change": a target that was gone failed every sweep as a block, with
+        no word about why, and each try counted against the door.
+
+        For one username after another it is no answer at all. Instagram's
+        username API began answering 404 for every username on 2026-11-04,
+        and six live accounts were reported missing. So the run is counted:
+        past _UNAVAILABLE_TRUSTED different usernames with no profile read
+        between them, the page is booked as the refusal it then is, for every
+        username, until a page carries a profile again.
+        """
+        self._unavailable_run.add(username.lower())
+        if (
+            len(self._unavailable_run) > self._UNAVAILABLE_TRUSTED
+            and not self._unavailable_distrusted
+        ):
+            self._unavailable_distrusted = True
+            logger.warning(
+                "Instagram served its “isn't available” page for {} different "
+                "usernames in a row ({}) with no profile between them — that "
+                "is its answer for every profile now, not a verdict on these "
+                "accounts; read as a refusal until a page carries a profile",
+                len(self._unavailable_run),
+                ", ".join(f"@{name}" for name in sorted(self._unavailable_run)),
+            )
+        if self._unavailable_distrusted:
+            result["error"] = (
+                "Instagram's “isn't available” page, as for every other "
+                "profile asked — not a verdict"
+            )
+            logger.info(
+                "Public page for @{}: Instagram's “isn't available” page {} "
+                "({} bytes), as for {} other username(s) in a row — not a "
+                "verdict", username, how, result.get("bytes", 0),
+                len(self._unavailable_run) - 1,
+            )
+            return
+        result["status"] = 404
+        result["error"] = (
+            "Instagram's “isn't available” page — no profile under this username"
+        )
+        logger.info(
+            "Public page for @{}: Instagram served its “isn't available” page "
+            "{} ({} bytes) — no profile under that username: renamed, "
+            "deactivated or deleted", username, how, result.get("bytes", 0),
+        )
+
     @staticmethod
     def _page_route_unanswered(route: str, reason: str) -> None:
         """A page request that got no answer at all, through the page tunnel,
@@ -1393,7 +1471,9 @@ class InstagramClient:
         parsed = await asyncio.to_thread(parse_public_profile, body, username)
         result["parsed"] = parsed
         final_url = str(getattr(response, "url", "") or "")
-        if parsed is None and "/accounts/login" in final_url:
+        if parsed is not None:
+            self._profile_page_read()
+        elif "/accounts/login" in final_url:
             # Instagram sent this host to its login page instead of the
             # profile — the refusal it gives an IP it does not trust (measured
             # 2026-10-18: Render's ~416 KB "page" was the 417 KB login page).
@@ -1404,6 +1484,8 @@ class InstagramClient:
                 "page ({} bytes) — the page door is shut to that IP",
                 username, route, len(body),
             )
+        elif is_unavailable_page(body):
+            self._unavailable_page(username, result, f"via {route}")
         elif parsed is None:
             result["error"] = "no profile payload in the page"
             logger.info(
@@ -1468,6 +1550,11 @@ class InstagramClient:
             return result
         parsed = await asyncio.to_thread(parse_public_profile, page.body, username)
         result["parsed"] = parsed
+        if parsed is not None:
+            self._profile_page_read()
+        elif is_unavailable_page(page.body):
+            self._unavailable_page(username, result, "to the home fetcher")
+            return result
         if parsed is None and _is_grid_block_only(page.body):
             # A home_fetcher.py from before 2026-10-18 extracts the FIRST of
             # the page's two payload blocks, and for some accounts that is

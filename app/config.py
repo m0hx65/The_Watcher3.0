@@ -203,6 +203,17 @@ class Settings(BaseSettings):
     # re-listed at most this often. 0 re-lists every reel on every sweep (the
     # old behavior) at roughly 12× the traffic.
     highlight_scan_interval: int = Field(default=21600, alias="HIGHLIGHT_SCAN_INTERVAL")
+    # The oldest copy of a highlight storynavigation may serve (seconds). It
+    # fetches a highlight from Instagram once and serves that copy for a day
+    # or more, so nearly every answer is a stored one. 0 (the default) takes
+    # any copy and says how old it is wherever its media is handed to a
+    # person ("storynavigation's copy from ~6 h ago"). A number refuses a copy
+    # older than that, and one whose age nothing establishes — the reason is
+    # then the answer. 900 is the rule of 2026-11-05, under which a highlight
+    # could be downloaded only in the minutes after storynavigation's own
+    # daily fetch: 3 of 24 sweep listings and neither of two downloads by
+    # hand over the three days that followed.
+    highlight_copy_max_age: int = Field(default=0, alias="HIGHLIGHT_COPY_MAX_AGE")
 
     # Per-sweep story/live status line ("HAS STORY" / "NO STORY" / "LIVE NOW").
     # ON by default: every check says where each public account stands, so

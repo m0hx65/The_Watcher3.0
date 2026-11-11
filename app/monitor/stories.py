@@ -20,7 +20,7 @@ gracefully (returns [] / None) so a dead source never breaks the sweep, and the
 graphql story/live status + highlight-name detection stays the reliable signal.
 
 Highlight media come from storynavigation.com first (storynavigation.py,
-fresh copies only): saveinsta has answered "Video is private." for every
+each copy with its age): saveinsta has answered "Video is private." for every
 highlight since 2026-10-23 and is asked only when storynavigation has nothing.
 """
 
@@ -42,7 +42,7 @@ from curl_cffi.requests import AsyncSession
 
 from app.config import settings
 from app.monitor.health import SAVEINSTA, fetch_health
-from app.monitor.storynavigation import StoryNavigation
+from app.monitor.storynavigation import Copy, Reel, StoryNavigation
 from app.utils.logger import logger
 from app.utils.downloads import RefusedURL, account_media_dir, fetch_public
 
@@ -86,6 +86,9 @@ class StoryItem:
     source: str             # "story" or "highlight"
     highlight_id: Optional[str] = None
     highlight_title: Optional[str] = None
+    # For a highlight item storynavigation served: how old the copy of the
+    # reel it came from is (see storynavigation.Copy). None from saveinsta.
+    copy: Optional[Copy] = None
 
 
 class StoriesClient:
@@ -142,10 +145,11 @@ class StoriesClient:
         """Return the story items for one highlight reel (login-free).
 
         `highlight_id` is the numeric id from Instagram's own catalog.
-        storynavigation is asked first and serves fresh copies only; saveinsta
-        (which expects the id as /stories/highlights/<id>/) only when that
-        gives nothing — it has refused every highlight since 2026-10-23, and
-        stays asked in case it serves them again.
+        storynavigation is asked first; its items carry the age of the copy
+        they came from (`copy`), for the caller to say when that matters.
+        saveinsta (which expects the id as /stories/highlights/<id>/) only
+        when that gives nothing — it has refused every highlight since
+        2026-10-23, and stays asked in case it serves them again.
         """
         numeric = str(highlight_id).split(":")[-1]
         items = self._storynav_items(
@@ -433,13 +437,13 @@ class StoriesClient:
             )
         return items
 
-    def _storynav_items(self, media: list[tuple[str, str]]) -> list[StoryItem]:
+    def _storynav_items(self, reel: Reel) -> list[StoryItem]:
         """storynavigation's (type, Instagram CDN URL) pairs as highlight
         items, de-duplicated and keyed like saveinsta's: by the media id in
-        the CDN path."""
+        the CDN path. Each carries the age of the copy it came from."""
         items: list[StoryItem] = []
         seen: set[str] = set()
-        for media_type, url in media:
+        for media_type, url in reel.media:
             pk = self._derive_pk(url, url)
             if pk in seen:
                 continue
@@ -447,7 +451,7 @@ class StoriesClient:
             items.append(
                 StoryItem(
                     pk=pk, taken_at=0, media_type=media_type, url=url,
-                    source="highlight",
+                    source="highlight", copy=reel.copy,
                 )
             )
         return items

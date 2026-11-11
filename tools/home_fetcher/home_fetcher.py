@@ -128,6 +128,15 @@ WORKER_VERSION = 3
 # When the page carries no payload (login wall, 404, block page) the bot only
 # needs enough of it to say what it was.
 NO_PAYLOAD_BODY_LIMIT = 64 * 1024
+# ...and one thing more. Instagram's own "isn't available" page, which it
+# serves with HTTP 200 for a username that has no profile, says so in its
+# route block, some 230 KB into the page (measured 2026-11-10) and so past
+# the limit above. That block goes along, or the bot cannot tell an account
+# that is gone from a login wall. (WORKER_VERSION is not raised for it: the
+# bot reads an older copy's upload as it always did, as a page with no
+# payload, so nothing forces an update.)
+_ERROR_ROUTE_MARK = b'"pageID":"httpErrorPage"'
+_ERROR_ROUTE_CONTEXT = 2048
 
 _session = (
     curl_requests.Session(impersonate="chrome120", timeout=IG_TIMEOUT_SECONDS)
@@ -358,6 +367,18 @@ def extract_payload(body: bytes) -> Optional[bytes]:
     return None
 
 
+def no_payload_body(body: bytes) -> bytes:
+    """What to send the bot for a page that carries no payload: its head,
+    and, when it is Instagram's "isn't available" page, the route block that
+    says so (see _ERROR_ROUTE_MARK)."""
+    head = body[:NO_PAYLOAD_BODY_LIMIT]
+    at = body.find(_ERROR_ROUTE_MARK, NO_PAYLOAD_BODY_LIMIT)
+    if at < 0:
+        return head
+    start = max(NO_PAYLOAD_BODY_LIMIT, at - _ERROR_ROUTE_CONTEXT)
+    return head + b"\n" + body[start:at + len(_ERROR_ROUTE_MARK) + 256]
+
+
 # ------------------------------------------------------------- the device
 
 def read_battery() -> tuple[Optional[int], Optional[bool]]:
@@ -508,7 +529,7 @@ def deliver(url: str, token: str, worker: str, job_id: str, username: str,
         payload = body if ig_status == 200 and body.lstrip().startswith(b"{") else None
     else:
         payload = extract_payload(body) if ig_status == 200 else None
-    data = payload if payload is not None else body[:NO_PAYLOAD_BODY_LIMIT]
+    data = payload if payload is not None else no_payload_body(body)
     if payload is None and ig_status == 200:
         head = " ".join(body[:120].decode("utf-8", "replace").split())
         _log(f"@{username}: {kind} came back without a payload - it starts: {head!r}")

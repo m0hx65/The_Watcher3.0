@@ -48,11 +48,16 @@ reads as a page view rather than a private-API call.
 Blocked pages and login walls simply parse to None, leaving the caller's error
 intact. Absent fields stay absent (never `None` written over a known value, and
 never a `0` invented for a count Instagram omitted).
+
+One page with no payload IS an answer: Instagram's own "isn't available" page,
+which it serves — with HTTP 200 — for a username that has no profile (see
+`is_unavailable_page`).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from typing import Any, Optional
 
@@ -90,6 +95,38 @@ PARTIAL_FIELDS = (
     "external_url",
     "instagram_id",
 )
+
+
+# The route a page was served for, as the logged-out web app names it in the
+# page's own bootstrap data. A profile is "profilePage", the login page
+# "CAAIGLoginHomepage", and the page for a username with no profile is the
+# error route.
+_ERROR_ROUTE_RE = re.compile(
+    r'"polarisRouteConfig":\{[^{}]*"pageID":"httpErrorPage"'
+    r'|"canonicalRouteName":"comet\.igweb\.PolarisErrorRoute"'
+)
+
+
+def is_unavailable_page(page: str) -> bool:
+    """True for Instagram's own "Profile isn't available" page: what it
+    serves for a username that has no profile — renamed away from,
+    deactivated, deleted, or never taken.
+
+    It comes with HTTP 200, not 404 (measured 2026-11-10 from a home
+    connection: a made-up username and @8dvuu, a target that had answered
+    until that day, got the same 516 KB page, and the bot's own log had read
+    it as "no profile payload — login wall or markup change" twice that
+    afternoon). So the status says nothing; the page says it itself, in the
+    route it was served for: `PolarisErrorRoot`, pageID "httpErrorPage",
+    where a profile's page is "profilePage" and carries the payload.
+
+    The two refusals this must not be confused with look different, on pages
+    captured the same day. A login wall for the IP is a redirect to
+    /accounts/login/ (pageID "CAAIGLoginHomepage"). A profile Instagram shows
+    only to logged-in visitors (an age-restricted brand account) is still
+    "profilePage", with `"xig_user_by_username":null`. Neither matches.
+    """
+    return bool(page) and _ERROR_ROUTE_RE.search(page, 0, _SCAN_LIMIT) is not None
 
 
 def strip_bidi(text: str) -> str:
