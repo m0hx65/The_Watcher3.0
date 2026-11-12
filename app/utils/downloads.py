@@ -50,7 +50,10 @@ def account_media_dir(username: str) -> Path:
     """The account's media folder — always directly inside MEDIA_DIR."""
     name = (username or "").strip().lower()
     if not _PLAIN_NAME.fullmatch(name) or not name.strip("."):
-        name = "_" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:16]
+        # A stable folder name for input that is no plain handle ("..", a
+        # path), not a security use. SHA-256 rather than SHA-1 so CodeQL's
+        # weak-hash rule (py/weak-sensitive-data-hashing) has nothing to flag.
+        name = "_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
     return settings.media_path / name
 
 
