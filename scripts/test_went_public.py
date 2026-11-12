@@ -478,10 +478,13 @@ async def test_concurrent_grab_guard() -> None:
 
 class ScriptedInstagram:
     """is_private follows a scripted sequence, one value per profile fetch
-    (the last value repeats)."""
+    (the last value repeats). `instagram_id` is the id the profile carries:
+    one per account, as on Instagram — two usernames answering with the same
+    id are one account under two names (see test_rename_by_id)."""
 
-    def __init__(self, sequence: list[bool]) -> None:
+    def __init__(self, sequence: list[bool], *, instagram_id: str = "555") -> None:
         self.sequence = list(sequence)
+        self.instagram_id = instagram_id
         self.calls = 0
 
     async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
@@ -495,9 +498,9 @@ class ScriptedInstagram:
                 "reels_count": 0, "story_count": 0, "is_private": is_private,
                 "is_verified": False, "is_business": False,
                 "profile_pic_url": None, "external_url": None,
-                "instagram_id": "555",
+                "instagram_id": self.instagram_id,
             },
-            raw_response={"data": {"user": {"id": "555"}}},
+            raw_response={"data": {"user": {"id": self.instagram_id}}},
         )
 
     async def fetch_reel_user(self, user_id):
@@ -551,7 +554,9 @@ async def test_flip_flop_end_to_end() -> None:
 
     fake = FakeStories(posts=[_item("fp1"), _item("fp2")], stories=[_item("fs1", source="story")])
     service = _make_service(fake)
-    service.instagram = ScriptedInstagram([True, False, True, False, True, False, False])
+    service.instagram = ScriptedInstagram(
+        [True, False, True, False, True, False, False], instagram_id="556",
+    )
     story_phase: list[str] = []
 
     async def spy_story(account_id, username, **kw):

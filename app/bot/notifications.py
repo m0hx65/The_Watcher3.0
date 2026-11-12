@@ -16,7 +16,12 @@ from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 
 from app.config import settings
 from app.monitor.change_detector import ChangeSet
-from app.monitor.instagram import IdProbe, ProfileFetchResult
+from app.monitor.instagram import (
+    ROUTE_REEL,
+    ROUTE_USER_INFO,
+    IdProbe,
+    ProfileFetchResult,
+)
 from app.utils.formatting import esc, fmt_delta, fmt_number, fmt_timestamp, truncate
 from app.utils.logger import logger
 
@@ -550,16 +555,28 @@ def render_failure_message(username: str, fetch: ProfileFetchResult) -> str:
     )
 
 
-def render_rename_message(old: str, new: str, *, collided: bool = False) -> str:
+def render_rename_message(
+    old: str, new: str, *, collided: bool = False, confirmed_by: str = "id"
+) -> str:
     """A username change found through the numeric id (or a fetched profile).
 
     Sent by the one place that persists a rename, so a rename is one message
-    no matter how many sources go on to notice it."""
-    lines = [
-        f"🔁 <b>@{esc(old)}</b> changed username → <b>@{esc(new)}</b>",
-        "<i>Found through the stored Instagram ID — same account, followed "
-        "under its new name from now on.</i>",
-    ]
+    no matter how many sources go on to notice it. `confirmed_by` says what
+    tied the new name to this account: "id" when an id route answered with
+    it, "profile" when a profile read under the new name carried this
+    account's Instagram ID."""
+    lines = [f"🔁 <b>@{esc(old)}</b> changed username → <b>@{esc(new)}</b>"]
+    if confirmed_by == "profile":
+        lines.append(
+            f"<i>Confirmed by the Instagram ID on @{esc(new)}'s own profile — "
+            "same account, followed under its new name from now on, with its "
+            "history.</i>"
+        )
+    else:
+        lines.append(
+            "<i>Found through the stored Instagram ID — same account, followed "
+            "under its new name from now on.</i>"
+        )
     if collided:
         lines.append(
             f"<i>@{esc(new)} is already monitored as a separate entry, so this "
@@ -580,11 +597,39 @@ def render_found_again_message(username: str) -> str:
     )
 
 
+_ID_ROUTE_NAMES = {ROUTE_REEL: "reel query", ROUTE_USER_INFO: "user info"}
+
+
+def describe_routes(routes: Optional[dict]) -> str:
+    """What each id route said — "reel query: HTTP 401; user info: HTTP 403"
+    — from a {route: status} mapping; "" when it names none."""
+    if not isinstance(routes, dict) or not routes:
+        return ""
+    return "; ".join(
+        f"{_ID_ROUTE_NAMES.get(route, str(route))}: "
+        + (f"HTTP {status}" if status else "no answer")
+        for route, status in routes.items()
+    )
+
+
+def describe_id_routes(id_probe: Optional[IdProbe]) -> str:
+    """`describe_routes` for one probe; "" when there is none."""
+    return describe_routes(id_probe.routes) if id_probe is not None else ""
+
+
 def render_not_found_message(
-    username: str, failure_count: int, id_probe: Optional[IdProbe]
+    username: str,
+    failure_count: int,
+    id_probe: Optional[IdProbe],
+    *,
+    foreign_id: Optional[str] = None,
+    stored_id: Optional[str] = None,
+    twin: Optional[str] = None,
 ) -> str:
-    """Instagram says the username does not exist. What that means depends on
-    what the numeric-id route said about the same account."""
+    """The username no longer leads to the monitored account: Instagram says
+    it does not exist, or (`foreign_id`) it now answers as another account.
+    What that means depends on what the numeric-id routes said about the
+    same account. `twin` is another entry that holds the same Instagram ID."""
     times = "once" if failure_count == 1 else f"{failure_count} checks in a row"
     if id_probe is not None and id_probe.gone:
         # The id route is asked first and answered 404 for the id itself —
@@ -595,10 +640,20 @@ def render_not_found_message(
             "<i>Instagram answers 404 for the ID itself, so the account looks "
             "deactivated or deleted, not renamed — a rename keeps the ID.</i>"
         )
-    lines = [
-        f"❓ <b>@{esc(username)}</b> — Instagram says this username doesn't "
-        f"exist ({times})."
-    ]
+    if foreign_id:
+        lines = [
+            f"❓ <b>@{esc(username)}</b> — this username now belongs to a "
+            f"different Instagram account ({times}).",
+            f"<i>It answers with Instagram ID <code>{esc(foreign_id)}</code>; "
+            f"the account monitored here is ID <code>{esc(stored_id or '?')}"
+            "</code>. Nothing from that other account is recorded here.</i>",
+        ]
+    else:
+        lines = [
+            f"❓ <b>@{esc(username)}</b> — Instagram says this username doesn't "
+            f"exist ({times})."
+        ]
+    can_relink = False
     if id_probe is None:
         lines.append(
             "<i>No Instagram ID is stored for this account, so a rename can't "
@@ -614,9 +669,24 @@ def render_not_found_message(
             "is likely a temporary glitch on Instagram's side.</i>"
         )
     else:
+        said = describe_id_routes(id_probe)
         lines.append(
-            "<i>The Instagram ID lookup was blocked, so a rename couldn't be "
-            "confirmed this time — it is re-tried on every check.</i>"
+            "<i>The Instagram ID lookup was blocked"
+            + (f" ({esc(said)})" if said else "")
+            + ", so a rename couldn't be confirmed this time — it is re-tried "
+            "on every check.</i>"
+        )
+        can_relink = True
+    if twin:
+        lines.append(
+            f"<i>The same Instagram ID is already monitored as @{esc(twin)} — "
+            "that entry is this account under its current name.</i>"
+        )
+    elif can_relink:
+        lines.append(
+            "<i>Know the new username? Send <code>/add newname</code> — it is "
+            "matched to this entry by its Instagram ID, so the history stays "
+            "and nothing is duplicated.</i>"
         )
     return "\n".join(lines)
 

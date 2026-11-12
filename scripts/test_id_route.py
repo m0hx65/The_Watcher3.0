@@ -445,6 +445,14 @@ async def _door_closed_in_db() -> bool:
         return await crud.get_setting(session, "username_api_closed_at") is not None
 
 
+def _sweep_id(username: str) -> str:
+    """The Instagram ID `_sweep_with` gives the account named "<prefix><i>".
+    A profile read by username carries its account's own id, and a reading
+    with any other id is another account's (see test_rename_by_id) — so a
+    fake reading for one of these accounts has to carry this one."""
+    return str(1000 + int(username.lstrip("abcdefghijklmnopqrstuvwxyz_")))
+
+
 async def _sweep_with(profile, probe, usernames: list[str], *,
                       door_known_closed: bool = False) -> tuple[dict, list[str], ScriptedInstagram]:
     """Run check_all over a fresh set of accounts (everything else paused)."""
@@ -567,7 +575,8 @@ async def test_a_door_found_shut_last_sweep_is_knocked_once() -> None:
     # usernames are unique in the table.)
     reopen = [f"reopen{i}" for i in range(4)]
     result, texts, ig = await _sweep_with(
-        lambda u: _api(u), lambda i: _answered(i, f"reopen{int(i) - 1000}"),
+        lambda u: _api(u, instagram_id=_sweep_id(u)),
+        lambda i: _answered(i, f"reopen{int(i) - 1000}"),
         reopen, door_known_closed=True,
     )
     summary = texts[-1]
@@ -1342,7 +1351,7 @@ async def test_no_counts_is_said_once() -> None:
         page = lambda u: ProfileFetchResult(  # noqa: E731
             username=u, http_status=200, source="public_page", api_status=401,
             parsed={"username": u, "followers_count": 10, "following_count": 5,
-                    "is_private": True, "instagram_id": "42"},
+                    "is_private": True, "instagram_id": _sweep_id(u)},
         )
         _, texts, _ = await _sweep_with(
             page, _names("blindc"), [f"blindc{k}" for k in range(2)],

@@ -113,6 +113,10 @@ _RETRIABLE_STATUSES = (401, 403, 429, 0)
 # What a username may be before it is stored or names a folder: Instagram's
 # alphabet, up to 30 characters (the same rule as the bot's commands).
 _VALID_HANDLE = re.compile(r"[a-z0-9._]{1,30}")
+# The longest a newly added username waits for the check of the entry it
+# turned out to be (see _relink_to_known_entry). A check is seconds; past
+# this the relink is left to the next check rather than held open.
+_RELINK_LOCK_WAIT_SECONDS = 30.0
 
 # app_settings key holding when a sweep last found the username API refusing
 # every lookup. Read by the next sweep (one knock instead of a threshold's
@@ -606,6 +610,20 @@ class MonitorService:
         # (account_id, phase) -> the lock that keeps two checks, or two story
         # phases, of one account from running at once. See _account_lock.
         self._account_locks: dict[tuple[int, str], asyncio.Lock] = {}
+        # account_id -> (the username a rename gave it this process, the names
+        # it was renamed from). A sweep builds its list of (id, username)
+        # once and its retry rounds reuse it, so a check queued before a
+        # rename would otherwise go on asking Instagram for the old name —
+        # which now reads "not found". Only a check that arrives under one of
+        # those old names is redirected. See _run_check; written only by
+        # _apply_rename.
+        self._current_usernames: dict[int, tuple[str, frozenset[str]]] = {}
+        # account_id -> the entry it was folded into this process (see
+        # _relink_to_known_entry and _apply_rename). A sweep builds its list
+        # before its checks run, so the check of an entry removed meanwhile
+        # is still queued — and must not write readings for a row that is
+        # gone. See _run_check.
+        self._merged_into: dict[int, int] = {}
         # When a sweep last found the username API refusing every lookup
         # (None = it was answering). Loaded from app_settings on first use so
         # the memory survives a restart; see username_api_known_closed().
@@ -900,12 +918,27 @@ class MonitorService:
         # A door the last sweep found shut is not knocked on here: someone is
         # waiting, and each knock is a ten-second Worker call for a known
         # answer. The sweep re-tests it once per pass.
+        skip_api = await self.username_api_known_closed()
         result = await self._run_check(
             account_id, username, notify_unchanged=notify_unchanged,
-            skip_username_api=await self.username_api_known_closed(),
+            skip_username_api=skip_api,
         )
+        relinked_id = result.get("relinked_account_id")
+        if relinked_id is not None:
+            # This username turned out to be an account already monitored
+            # under an older name (_relink_to_known_entry): that entry has
+            # taken the name, and the check is its check — read against its
+            # history, with its story phase.
+            relinked_from = result.get("relinked_from")
+            account_id = relinked_id
+            username = result.get("username", username)
+            result = await self._run_check(
+                account_id, username, notify_unchanged=notify_unchanged,
+                skip_username_api=skip_api,
+            )
+            result["relinked_from"] = relinked_from
 
-        if self.stories is not None and result.get("ok"):
+        if self.stories is not None and result.get("ok") and not result.get("foreign_id"):
             meta = await self._load_account_story_meta(account_id)
             is_private = result.get("is_private")
             if is_private is None:
@@ -932,6 +965,27 @@ class MonitorService:
                         always_report=True,
                     )
         return result
+
+    @staticmethod
+    async def _id_held_elsewhere(
+        session: Any, account: MonitoredAccount, instagram_id: str
+    ) -> bool:
+        """True when another entry already holds `instagram_id`, so it must
+        not be written to `account` too: the id is what tells two entries
+        apart, and the same one on both would make them one Instagram
+        account monitored twice with nothing left to say which is which.
+        The account's own check deals with it (_relink_to_known_entry)."""
+        holder = await crud.get_account_by_instagram_id(
+            session, str(instagram_id), exclude_id=account.id
+        )
+        if holder is None:
+            return False
+        logger.warning(
+            "Not storing Instagram ID {} for @{}: the entry @{} (account_id={}) "
+            "already holds it — the same account under two names",
+            instagram_id, account.username, holder.username, holder.id,
+        )
+        return True
 
     async def backfill_instagram_ids(self) -> dict:
         """Resolve and store instagram_id for accounts that do not have one yet."""
@@ -972,6 +1026,9 @@ class MonitorService:
                     snapshot.raw_response if snapshot else None
                 )
                 if instagram_id:
+                    if await self._id_held_elsewhere(session, current, instagram_id):
+                        failed += 1
+                        continue
                     current.instagram_id = instagram_id
                     from_snapshot += 1
                     resolved += 1
@@ -995,7 +1052,15 @@ class MonitorService:
                         instagram_id = str(pk)
                     async with get_session() as session:
                         current = await session.get(MonitoredAccount, account.id)
-                        if current is not None and not current.instagram_id:
+                        if (
+                            current is not None
+                            and not current.instagram_id
+                            and await self._id_held_elsewhere(
+                                session, current, instagram_id
+                            )
+                        ):
+                            failed += 1
+                        elif current is not None and not current.instagram_id:
                             current.instagram_id = instagram_id
                             if resolved_username and resolved_username != current.username:
                                 existing = await crud.get_account(
@@ -1025,7 +1090,15 @@ class MonitorService:
             if instagram_id:
                 async with get_session() as session:
                     current = await session.get(MonitoredAccount, account.id)
-                    if current is not None and not current.instagram_id:
+                    if (
+                        current is not None
+                        and not current.instagram_id
+                        and await self._id_held_elsewhere(
+                            session, current, str(instagram_id)
+                        )
+                    ):
+                        failed += 1
+                    elif current is not None and not current.instagram_id:
                         current.instagram_id = str(instagram_id)
                         from_fetch += 1
                         resolved += 1
@@ -1313,6 +1386,21 @@ class MonitorService:
         for target_account_id, uname, r in outcomes:
             if r.get("crashed"):
                 continue
+            if r.get("relinked_account_id") is not None or r.get("removed"):
+                # This entry was a second copy of an account monitored under
+                # an older name and no longer exists; that account's own
+                # check, in this sweep or the next, runs its story phase.
+                continue
+            if r.get("foreign_id"):
+                # The story phase asks for stories BY USERNAME, and this
+                # username answers as another Instagram account now. What it
+                # returned would be that account's stories, delivered as this
+                # one's.
+                logger.info(
+                    "@{}: skipping the story phase — the username now belongs "
+                    "to Instagram ID {}", uname, r["foreign_id"],
+                )
+                continue
             result_username = r.get("username", uname)
             # A successful check already knows privacy and the numeric id —
             # only fall back to the two-query DB lookup when the result
@@ -1425,7 +1513,7 @@ class MonitorService:
         # reported "17 profiles did get through" over a list of 17 failures.
         checked = sum(
             1 for _, _, r in outcomes
-            if not r.get("crashed") and not r.get("skipped")
+            if not r.get("crashed") and not r.get("skipped") and not r.get("removed")
         )
         answered = sum(1 for _, _, r in outcomes if r.get("ok"))
         id_only = sum(
@@ -1441,7 +1529,7 @@ class MonitorService:
         failed_usernames = [
             r.get("username", uname)
             for _, uname, r in outcomes
-            if not r.get("ok") and not r.get("skipped")
+            if not r.get("ok") and not r.get("skipped") and not r.get("removed")
         ]
         failed = len(failed_usernames)
 
@@ -2071,6 +2159,24 @@ class MonitorService:
         async with self._account_lock(account_id, "check"), self._semaphore:
             if not paced:
                 await self._await_off_schedule_slot()
+            merged = self._merged_into.get(account_id)
+            if merged is not None:
+                # This entry was the same Instagram account as another and
+                # was folded into it after the check was queued. Nothing is
+                # asked and nothing is written: the row is gone.
+                logger.info(
+                    "@{} (account_id={}) was folded into account_id={} — "
+                    "skipping its queued check", username, account_id, merged,
+                )
+                return {
+                    "ok": False, "username": username, "status": None,
+                    "removed": True, "merged_into": merged,
+                }
+            # Read under the lock: the check that renamed this account may be
+            # the very one this call was waiting behind.
+            renamed = self._current_usernames.get(account_id)
+            if renamed is not None and username in renamed[1]:
+                username = renamed[0]
             try:
                 started = time.monotonic()
                 result = await self._do_check(
@@ -2162,11 +2268,19 @@ class MonitorService:
         if not instagram_id:
             instagram_id = await self._stored_instagram_id(account_id)
         probe: Optional[IdProbe] = None
+        # Whether the SECOND id route (users/<id>/info) has had its turn this
+        # check. A sweep lets it follow a refused reel query in the same
+        # call; a manual check asks the reel query alone up front — someone
+        # is waiting, and a refusal through the Worker is ~9 s — and comes
+        # back for the second route only if the username side then fails.
+        user_info_asked = False
         if instagram_id:
             clock = time.monotonic()
             probe = await self.instagram.probe_by_id(
-                instagram_id, cached_ok=not thorough, knock_refusing=thorough
+                instagram_id, cached_ok=not thorough, knock_refusing=thorough,
+                user_info=not thorough,
             )
+            user_info_asked = not thorough and probe.via != "cache-miss"
             timings[f"id/{probe.via}" if probe.via else "id"] = time.monotonic() - clock
             if probe.gone:
                 return await self._id_gone(account_id, username, probe, timings)
@@ -2196,6 +2310,30 @@ class MonitorService:
         timings["username side"] = time.monotonic() - clock
         timings.update(fetch.timings)
 
+        # WHOSE profile answered? The username is only what an account is
+        # called today; the numeric id is what it is. A reading that carries
+        # another id is another account's — the handle was given up (a
+        # rename) and someone else took it — and treating it as this one's
+        # would write a stranger's numbers into this account's history and
+        # announce them as changes. It is not stored: for THIS account the
+        # username no longer leads anywhere, which is what a 404 says, and
+        # the id routes are asked where the account went.
+        foreign_id = self._foreign_owner(fetch, instagram_id)
+        if foreign_id:
+            logger.warning(
+                "@{} now answers as Instagram ID {}, not the monitored "
+                "account's ID {} — the handle has a new owner; nothing from "
+                "that reading is stored here", username, foreign_id, instagram_id,
+            )
+            fetch = replace(
+                fetch, http_status=404, parsed=None, raw_response=None,
+                foreign_id=foreign_id,
+                error=(
+                    f"@{username} now belongs to a different Instagram account "
+                    f"(ID {foreign_id}), not the monitored one (ID {instagram_id})"
+                ),
+            )
+
         if (
             not fetch.success
             and probe is not None
@@ -2213,20 +2351,29 @@ class MonitorService:
                 "delivered it yet — leaving it to the retry round rather than "
                 "settling for an id-only reading", username,
             )
-        elif not fetch.success and probe is not None and probe.via == "cache-miss":
-            # The sweep skipped the live id route because the phone's page was
-            # going to answer — and the page did not. Ask by id now, through
-            # the Worker only (the phone already had its turn). Without this a
-            # renamed or deleted account failed every sweep in silence: its
-            # old username's page is an error shell, and the one route that
-            # can tell "renamed" from "gone" from "bad page" was never asked.
-            # One Worker call, and only for an account that has otherwise
-            # failed.
+        elif (
+            not fetch.success
+            and probe is not None
+            and not probe.answered
+            and not user_info_asked
+        ):
+            # The username side failed and no id route has answered yet: ask
+            # by id now, through the Worker only (the phone already had its
+            # turn at the page). Two ways to get here. A sweep skipped the
+            # live id routes because a page door was going to answer — and
+            # the page did not; without this a renamed or deleted account
+            # failed every sweep in silence, its old username's page being an
+            # error shell and the routes that can tell "renamed" from "gone"
+            # from "bad page" never asked. Or a manual check asked the reel
+            # query alone up front, and it was refused: then only the second
+            # route is asked, the first having just answered for itself.
             clock = time.monotonic()
-            probe = await self.instagram.probe_by_id(
-                instagram_id, ask_phone=False, knock_refusing=thorough
+            rescue = await self.instagram.probe_by_id(
+                instagram_id, ask_phone=False, knock_refusing=thorough,
+                reel=probe.via == "cache-miss", user_info=True,
             )
-            timings[f"id/{probe.via or 'live'}"] = time.monotonic() - clock
+            timings[f"id/{rescue.via or 'live'}"] = time.monotonic() - clock
+            probe = probe.joined(rescue)
             if probe.gone:
                 return await self._id_gone(account_id, username, probe, timings)
             if probe.answered and probe.username and probe.username != username:
@@ -2235,6 +2382,16 @@ class MonitorService:
                 )
 
         id_status = probe.status if probe is not None else None
+        if fetch.success and not instagram_id:
+            # An entry with no id of its own, read for the first time. If the
+            # id it carries is one another entry already holds, this is that
+            # account under its current name — see _relink_to_known_entry.
+            relinked = await self._relink_to_known_entry(account_id, username, fetch)
+            if relinked is not None:
+                relinked["id_status"] = id_status
+                relinked["api_status"] = fetch.api_status
+                relinked["timings"] = timings
+                return relinked
         if fetch.success:
             clock = time.monotonic()
             result = await self._handle_success(
@@ -2280,6 +2437,13 @@ class MonitorService:
             result["id_status"] = id_status
             result["api_status"] = fetch.api_status
             result["timings"] = timings
+            if fetch.foreign_id and username.lower() == (fetch.username or "").lower():
+                # The id still names this handle while the handle's own page
+                # answers as someone else: the story phase works by username,
+                # and must not fetch that someone's stories as this account's.
+                # (Renamed by the id route meanwhile, the check continues
+                # under the new name, which is this account's own.)
+                result["foreign_id"] = fetch.foreign_id
             return result
 
         result = await self._handle_failure(
@@ -2289,6 +2453,176 @@ class MonitorService:
         result["api_status"] = fetch.api_status
         result["timings"] = timings
         return result
+
+    @staticmethod
+    def _foreign_owner(
+        fetch: ProfileFetchResult, instagram_id: Optional[str]
+    ) -> Optional[str]:
+        """The numeric id a successful reading carries when it is NOT the
+        monitored account's; None when the two agree or either is unknown.
+
+        Only two real ids that differ count. A reading with no id, an
+        account with none stored yet, or anything that is not a positive
+        number says nothing about whose profile it is, and is taken as
+        before."""
+        if not fetch.success or not instagram_id:
+            return None
+        seen = MonitorService._real_id((fetch.parsed or {}).get("instagram_id"))
+        stored = MonitorService._real_id(instagram_id)
+        if seen is None or stored is None:
+            return None
+        return seen if seen != stored else None
+
+    @staticmethod
+    def _real_id(value: Any) -> Optional[str]:
+        """`value` as an Instagram numeric id, or None when it is not one: an
+        id is a positive whole number, and nothing else — an empty field, a
+        placeholder 0 — may decide which account a reading belongs to."""
+        text = str(value if value is not None else "").strip()
+        if not (text.isascii() and text.isdigit()) or int(text) <= 0:
+            return None
+        return str(int(text))
+
+    async def _relink_to_known_entry(
+        self, account_id: int, username: str, fetch: ProfileFetchResult
+    ) -> Optional[dict]:
+        """Recognise a newly added username as an account already monitored
+        under an older name, and fold the new entry into that one.
+
+        Since 2026-11-04 Instagram answers no anonymous lookup by numeric id,
+        so a renamed target cannot always be found from its id alone. Going
+        the other way still works: every profile read by NAME carries the
+        id. So when the owner adds the new username, its first reading says
+        which account it is — and if another entry already holds that id,
+        this is that account under its current name, not a new one.
+
+        The older entry is the account: it keeps its row, its id, its
+        snapshots, its topic and its settings, and takes the new username
+        (announced once, by _apply_rename). The entry just added has nothing
+        on record yet and is removed; it is never both. Returns the result
+        the check answers with, or None when there is nothing to relink —
+        including an entry that has history of its own, which is left alone:
+        two histories are not merged behind the owner's back.
+        """
+        parsed = fetch.parsed or {}
+        seen_id = self._real_id(parsed.get("instagram_id"))
+        if seen_id is None:
+            return None
+        seen_name = (parsed.get("username") or username).strip().lstrip("@").lower()
+        if seen_name != username.strip().lstrip("@").lower():
+            # The reading is not about the username that was asked for. An
+            # entry is renamed on the strength of this reading, so it has to
+            # be one that agrees with itself.
+            return None
+        async with get_session() as session:
+            account = await session.get(MonitoredAccount, account_id)
+            if account is None or account.instagram_id:
+                return None
+            known = await crud.get_account_by_instagram_id(
+                session, seen_id, exclude_id=account_id
+            )
+            if known is None:
+                return None
+            known_id = known.id
+        # Under the known entry's own check lock: a check of it that is in
+        # flight under the old name finishes first, and one that is queued
+        # reads the new name when its turn comes (_run_check). The wait is
+        # bounded — this check holds a fetch slot the other may be waiting
+        # for — and a relink that could not start is simply left to the next
+        # check: nothing has been written for either entry yet.
+        lock = self._account_lock(known_id, "check")
+        try:
+            await asyncio.wait_for(lock.acquire(), _RELINK_LOCK_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.info(
+                "@{} is the account monitored as account_id={}, whose own "
+                "check is still running — relinking on the next check",
+                username, known_id,
+            )
+            return {
+                "ok": False,
+                "username": username,
+                "status": None,
+                "error": (
+                    "this is an account already monitored under another name; "
+                    "its check is still running, so the relink waits for the "
+                    "next check"
+                ),
+            }
+        try:
+            async with get_session() as session:
+                account = await session.get(MonitoredAccount, account_id)
+                known = await session.get(MonitoredAccount, known_id)
+                if (
+                    account is None or account.instagram_id
+                    or known is None or known.instagram_id != seen_id
+                ):
+                    return None  # changed while this waited for the lock
+                if await crud.account_has_history(session, account_id):
+                    logger.warning(
+                        "@{} carries Instagram ID {}, which the entry @{} "
+                        "(account_id={}) already holds — one Instagram account "
+                        "monitored twice. Both have history, so neither is "
+                        "touched; the id stays with that entry",
+                        account.username, seen_id, known.username, known.id,
+                    )
+                    return None
+                old_name = known.username
+                media_only = await crud.is_media_only(session, account_id)
+                await crud.delete_account(
+                    session, account_id,
+                    setting_keys=self._account_setting_keys(account_id),
+                )
+                if media_only:
+                    # /addmedia on an account already monitored switches it —
+                    # the same thing, said under its new name.
+                    await crud.set_media_only(session, known_id, True)
+                # Adding an account that is paused resumes it (crud.add_account).
+                known.active = True
+            self._topic_cache.pop(account_id, None)
+            self._current_usernames.pop(account_id, None)
+            self._merged_into[account_id] = known_id
+            logger.info(
+                "@{} is Instagram ID {} — the account monitored as @{} "
+                "(account_id={}). Relinked: that entry takes the new username "
+                "and keeps its history; the entry just added is dropped",
+                seen_name, seen_id, old_name, known_id,
+            )
+            current = await self._apply_rename(
+                known_id, old_name, seen_name, confirmed_by="profile"
+            )
+        finally:
+            lock.release()
+        return {
+            "ok": True,
+            "username": current,
+            "status": 200,
+            "changed": current != old_name,
+            "change_count": 1 if current != old_name else 0,
+            "instagram_id": seen_id,
+            "relinked_from": old_name,
+            "relinked_account_id": known_id,
+        }
+
+    @classmethod
+    def _account_setting_keys(cls, account_id: int) -> list[str]:
+        """Every app_settings key kept for one account, so an entry that is
+        removed leaves none behind for a later account id to inherit."""
+        return [
+            f"topic:{account_id}",
+            f"media_only:{account_id}",
+            cls._dark_state_key(account_id),
+            cls._not_found_key(account_id),
+            cls._not_found_run_key(account_id),
+            cls._identity_key(account_id),
+            cls._rename_collision_key(account_id),
+            cls._story_state_key(account_id),
+            cls._story_announce_key(account_id),
+            cls._highlight_scan_key(account_id),
+            cls._quiet_reels_key(account_id),
+            cls._post_scan_key(account_id),
+            cls._public_grab_key(account_id),
+        ]
 
     async def _id_gone(
         self, account_id: int, username: str, probe: IdProbe,
@@ -2321,7 +2655,9 @@ class MonitorService:
             recovered = self._extract_instagram_id(
                 previous.raw_response if previous else None
             )
-            if recovered:
+            if recovered and not await self._id_held_elsewhere(
+                session, account, str(recovered)
+            ):
                 account.instagram_id = str(recovered)
                 await session.flush()
                 logger.info(
@@ -2330,7 +2666,9 @@ class MonitorService:
                 )
             return str(recovered) if recovered else None
 
-    async def _apply_rename(self, account_id: int, old: str, new: str) -> str:
+    async def _apply_rename(
+        self, account_id: int, old: str, new: str, *, confirmed_by: str = "id"
+    ) -> str:
         """Persist and announce a username change, found through the numeric
         id or a fetched profile. Returns the username to continue with.
 
@@ -2341,6 +2679,21 @@ class MonitorService:
         a rename is never thrown away because the profile fetch after it was
         blocked — which is exactly what happened to a target renamed while
         the username route was shut.
+
+        The account row is the same row before and after: only its username
+        changes, so its id, snapshots, topic and settings all stay with it.
+        `confirmed_by` is what tied the new name to this account, for the
+        message ("id": an id route answered with it; "profile": a profile
+        read under the new name carried this account's id).
+
+        When the new username is already an entry of its own, there are two
+        cases. An entry with no id and nothing on record is the owner having
+        added the new name before the bot could confirm it: it is this
+        account, added twice, and is folded in (see _relink_to_known_entry
+        for the same thing met from the other side). Any other entry is left
+        alone, this one keeps its old name in the list, and that is said
+        ONCE — until 2026-11-11 it was said again on every check, since every
+        check found the same unapplied rename.
         """
         new = (new or "").strip().lstrip("@").lower()
         old = (old or "").strip().lstrip("@").lower()
@@ -2355,6 +2708,9 @@ class MonitorService:
                 "username", old, new,
             )
             return old
+        collision_key = self._rename_collision_key(account_id)
+        absorbed: Optional[int] = None
+        was = old  # the username on the row before the change
         async with get_session() as session:
             account = await session.get(MonitoredAccount, account_id)
             if account is None:
@@ -2363,19 +2719,57 @@ class MonitorService:
                 return new  # already applied — another path got there first
             existing = await crud.get_account(session, new)
             collided = existing is not None and existing.id != account_id
+            if collided and not existing.instagram_id and not (
+                await crud.account_has_history(session, existing.id)
+            ):
+                # The new name, added by hand before this rename was known.
+                absorbed = existing.id
+                if await crud.is_media_only(session, absorbed):
+                    await crud.set_media_only(session, account_id, True)
+                await crud.delete_account(
+                    session, absorbed,
+                    setting_keys=self._account_setting_keys(absorbed),
+                )
+                collided = False
+                logger.info(
+                    "@{} was already added as an entry of its own "
+                    "(account_id={}) with nothing on record — it is this "
+                    "account (account_id={}) under its new name, so the two "
+                    "are one entry now", new, absorbed, account_id,
+                )
             if collided:
+                if await crud.get_setting(session, collision_key) == new:
+                    # Found, said, and still standing: not said again.
+                    return new
+                await crud.set_setting(session, collision_key, new)
                 logger.warning(
                     "@{} is now @{}, but that username is already monitored as "
                     "account_id={} — keeping this entry under its old name",
                     account.username, new, existing.id,
                 )
             else:
+                was = account.username
                 account.username = new
                 await session.flush()
+                await crud.delete_setting(session, collision_key)
+                # The account is found: whatever said its username led
+                # nowhere no longer holds.
+                await crud.delete_setting(session, self._identity_key(account_id))
+        if absorbed is not None:
+            self._topic_cache.pop(absorbed, None)
+            self._current_usernames.pop(absorbed, None)
+            self._merged_into[absorbed] = account_id
+        if not collided:
+            earlier = self._current_usernames.get(account_id, ("", frozenset()))[1]
+            self._current_usernames[account_id] = (
+                new, frozenset((earlier | {old, was}) - {new}),
+            )
         logger.info(
             "Username changed: @{} -> @{} (account_id={})", old, new, account_id
         )
-        msg = render_rename_message(old, new, collided=collided)
+        msg = render_rename_message(
+            old, new, collided=collided, confirmed_by=confirmed_by
+        )
         thread_id = await self.topic_for(account_id, new)
         delivered = await self.notifier.send_text(msg, message_thread_id=thread_id)
         async with get_session() as session:
@@ -2449,6 +2843,24 @@ class MonitorService:
                 await self._not_found_run(session, account_id, failure_count)
                 if fetch.http_status == 404 else 0
             )
+            stored_id: Optional[str] = None
+            twin: Optional[str] = None
+            if fetch.http_status == 404:
+                # The username no longer leads to this account. Put that on
+                # record, with what the id routes said, so the card stops
+                # presenting it as monitored and well — and look for the same
+                # id under another entry: an account re-added under its new
+                # name before this was understood is that account.
+                account = await session.get(MonitoredAccount, account_id)
+                stored_id = account.instagram_id if account is not None else None
+                if stored_id:
+                    other = await crud.get_account_by_instagram_id(
+                        session, stored_id, exclude_id=account_id
+                    )
+                    twin = other.username if other is not None else None
+                await self._note_identity_lost(
+                    session, account_id, fetch, id_probe, twin, misses
+                )
 
         # Only notify on the first failure or every 5th consecutive failure
         should_notify = not gate_status and (
@@ -2477,7 +2889,10 @@ class MonitorService:
             change_type = "not_found"
         if should_notify:
             if fetch.http_status == 404:
-                msg = render_not_found_message(username, misses, id_probe)
+                msg = render_not_found_message(
+                    username, misses, id_probe,
+                    foreign_id=fetch.foreign_id, stored_id=stored_id, twin=twin,
+                )
             else:
                 msg = render_failure_message(username, fetch)
             thread_id = await self.topic_for(account_id, username)
@@ -2494,6 +2909,8 @@ class MonitorService:
                         "error": fetch.error,
                         "consecutive_failures": failure_count,
                         "id_status": id_probe.status if id_probe else None,
+                        "id_routes": dict(id_probe.routes) if id_probe else None,
+                        "foreign_id": fetch.foreign_id,
                     },
                     message=msg,
                     delivered=delivered,
@@ -2506,12 +2923,17 @@ class MonitorService:
                         datetime.now(timezone.utc).isoformat(),
                     )
 
-        return {
+        result = {
             "ok": False,
             "username": username,
             "status": fetch.http_status,
             "error": fetch.error,
         }
+        if fetch.foreign_id:
+            # Read by the sweep: the story phase works by username, and this
+            # username is someone else's now.
+            result["foreign_id"] = fetch.foreign_id
+        return result
 
     async def _handle_success(
         self,
@@ -2932,19 +3354,43 @@ class MonitorService:
             # brought up to date by _apply_rename at the top)
             stored_id: Optional[str] = None
             account = await session.get(MonitoredAccount, account_id)
+            was_failing = False
             if account is not None:
-                # Store Instagram ID if account doesn't have one yet
+                was_failing = (account.consecutive_failures or 0) > 0
+                # Store Instagram ID if account doesn't have one yet — unless
+                # another entry already holds it. The id is what an account
+                # IS, so it belongs to one entry; the same one on two would
+                # leave nothing to tell them apart by. (A newly added entry
+                # never gets this far: _relink_to_known_entry folds it into
+                # the one that holds the id.)
                 if parsed_instagram_id and not account.instagram_id:
-                    account.instagram_id = str(parsed_instagram_id)
-                    await session.flush()  # Ensure ID is persisted immediately
-                    logger.info(
-                        "Stored Instagram ID for @{}: {}",
-                        account.username,
-                        parsed_instagram_id,
+                    holder = await crud.get_account_by_instagram_id(
+                        session, str(parsed_instagram_id), exclude_id=account_id
                     )
+                    if holder is None:
+                        account.instagram_id = str(parsed_instagram_id)
+                        await session.flush()  # Ensure ID is persisted immediately
+                        logger.info(
+                            "Stored Instagram ID for @{}: {}",
+                            account.username,
+                            parsed_instagram_id,
+                        )
+                    else:
+                        logger.warning(
+                            "@{} carries Instagram ID {}, which the entry @{} "
+                            "(account_id={}) already holds — the same account "
+                            "monitored twice; the id is not stored a second time",
+                            account.username, parsed_instagram_id,
+                            holder.username, holder.id,
+                        )
                 stored_id = account.instagram_id
 
             await crud.mark_checked(session, account_id, 200, success=True)
+            if was_failing:
+                # It answers, as itself: nothing says its username leads
+                # nowhere any more. (Only a failed check sets that, so an
+                # account that was not failing has nothing to clear.)
+                await self._clear_identity_lost(session, account_id)
 
         await self._dispatch_changes(
             account_id,
@@ -3007,6 +3453,68 @@ class MonitorService:
     @staticmethod
     def _not_found_run_key(account_id: int) -> str:
         return f"not_found_run:{account_id}"
+
+    @staticmethod
+    def _identity_key(account_id: int) -> str:
+        """Set while an account's username no longer leads to it and its
+        current one is not known. See _note_identity_lost."""
+        return f"identity_lost:{account_id}"
+
+    @staticmethod
+    def _rename_collision_key(account_id: int) -> str:
+        """The new username a rename could not take because another entry
+        holds it — kept so that is said once. See _apply_rename."""
+        return f"rename_collision:{account_id}"
+
+    async def _note_identity_lost(
+        self,
+        session: Any,
+        account_id: int,
+        fetch: ProfileFetchResult,
+        id_probe: Optional[IdProbe],
+        twin: Optional[str],
+        misses: int,
+    ) -> None:
+        """Record that this account's username no longer leads to it, and
+        why its current one is not known.
+
+        It is what the account card and /status read to say so: a failing
+        check used to leave the card saying "🟢 active" with a number under
+        it, which reads as monitored and well. `misses` is the run of such
+        answers this one belongs to (see _not_found_run): the card speaks
+        from the second, as the alert does, since one can be a flake. The
+        time the run began is kept, so the card can say since when. Cleared
+        by the next reading that succeeds and by a rename
+        (_clear_identity_lost, _apply_rename).
+        """
+        if fetch.foreign_id:
+            reason = "foreign"
+        elif id_probe is None:
+            reason = "no_id"
+        elif id_probe.gone:
+            reason = "id_gone"
+        else:
+            reason = "id_blocked"
+        key = self._identity_key(account_id)
+        since = datetime.now(timezone.utc).isoformat()
+        if misses > 1:
+            try:
+                earlier = json.loads(await crud.get_setting(session, key) or "{}")
+            except ValueError:
+                earlier = {}
+            if isinstance(earlier, dict) and earlier.get("since"):
+                since = str(earlier["since"])
+        await crud.set_setting(session, key, json.dumps({
+            "since": since,
+            "misses": misses,
+            "reason": reason,
+            "routes": dict(id_probe.routes) if id_probe is not None else {},
+            "foreign_id": fetch.foreign_id,
+            "twin": twin,
+        }))
+
+    async def _clear_identity_lost(self, session: Any, account_id: int) -> None:
+        await crud.delete_setting(session, self._identity_key(account_id))
 
     async def _not_found_run(
         self, session: Any, account_id: int, failure_count: int

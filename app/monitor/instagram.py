@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
@@ -91,6 +92,10 @@ class ProfileFetchResult:
     # hand and had not delivered it yet — late, not refused. A sweep's retry
     # round will find that page waiting; settling for less now loses it.
     page_pending: bool = False
+    # Set when this username DID answer, but as another Instagram account:
+    # the numeric id it carries, which is not the monitored account's. The
+    # reading is then nobody's to store here (see MonitorService._do_check).
+    foreign_id: Optional[str] = None
 
     @property
     def success(self) -> bool:
@@ -101,9 +106,17 @@ class ProfileFetchResult:
         return self.source != "api"
 
 
+# The two routes that take a numeric id, as IdProbe.routes names them.
+ROUTE_REEL = "reel"            # graphql reel query (query_id=9957820854288654)
+ROUTE_USER_INFO = "user_info"  # users/<id>/info/
+# An Instagram handle: its alphabet, up to 30 characters. A username taken
+# from a payload is stored on the account row, so it is held to this first.
+_HANDLE_RE = re.compile(r"[a-z0-9._]{1,30}")
+
+
 @dataclass
 class IdProbe:
-    """What Instagram's NUMERIC-ID route said about one account.
+    """What Instagram's NUMERIC-ID routes said about one account.
 
     The id is the key that survives a rename, and — measured 2026-09-05 — the
     route Instagram still answers anonymously: web_profile_info (by username)
@@ -111,11 +124,20 @@ class IdProbe:
     included, while the graphql reel query by id keeps answering through the
     Worker. So this is the sweep's first question per account.
 
-    `status` is the HTTP answer: 200 = answered (username, avatar URL and
-    reel data filled in), 404 = the id no longer resolves (the account was
-    deactivated or deleted — a rename keeps the id), 401/403 = blocked,
-    0 = no HTTP answer at all. It knows nothing about counts, bio or the
-    privacy flag; callers must not invent those.
+    Since 2026-11-04 the reel query is login-walled too ("require_login",
+    "igweb_rollout"), for every id and from every network measured — which
+    left the bot with no way from a stored id to the current username. It
+    had been the ONLY id route asked: `users/<id>/info/` was consulted only
+    to fill in a reel answer that had already arrived. That route is now a
+    second, independent one (`probe_by_id(user_info=True)`), so a rename is
+    found the moment EITHER answers.
+
+    `status` is the HTTP answer: 200 = answered (username and avatar URL
+    filled in; reel data too when the reel query was the route), 404 = the id
+    no longer resolves (the account was deactivated or deleted — a rename
+    keeps the id; only the reel query's 404 is taken as that), 401/403 =
+    blocked, 0 = no HTTP answer at all. It knows nothing about counts, bio or
+    the privacy flag; callers must not invent those.
     """
 
     user_id: str
@@ -123,12 +145,17 @@ class IdProbe:
     username: Optional[str] = None
     profile_pic_url: Optional[str] = None
     # {"has_public_story", "is_live", "highlights"} — the shape the story
-    # phase consumes, so one probe serves the whole check.
+    # phase consumes, so one probe serves the whole check. None when the
+    # user-info route answered: it knows the handle and the avatar only.
     reel_data: Optional[dict[str, Any]] = None
-    # Which route answered: "cache", "worker", "direct", "home" (the phone);
-    # "worker-shut" when a sweep did not ask the Worker because it has been
-    # refusing (the status is then the refusal it last gave).
+    # Which route answered: "cache", "worker", "direct", "home" (the phone),
+    # "user-info"; "worker-shut" when a sweep did not ask the Worker because
+    # it has been refusing (the status is then the refusal it last gave).
     via: str = ""
+    # What each id route said on this probe, by ROUTE_* name. A route that is
+    # missing was not asked. Kept apart from `status` so a failure can name
+    # every route that was tried instead of "the id lookup was blocked".
+    routes: dict[str, int] = field(default_factory=dict)
 
     @property
     def answered(self) -> bool:
@@ -141,6 +168,28 @@ class IdProbe:
     @property
     def blocked(self) -> bool:
         return self.status in (401, 403)
+
+    def joined(self, later: "IdProbe") -> "IdProbe":
+        """This probe and one made after it in the same check, as one.
+
+        An answer (or a 404) from either is the result. With neither, the
+        first refusal stands as the status and both sets of routes are kept,
+        so the check reports everything that was asked."""
+        if later.answered or later.gone:
+            best, status = later, later.status
+        elif self.answered or self.gone:
+            best, status = self, self.status
+        else:
+            best, status = later, self.status or later.status
+        return IdProbe(
+            user_id=best.user_id,
+            status=status,
+            username=best.username,
+            profile_pic_url=best.profile_pic_url,
+            reel_data=best.reel_data,
+            via=best.via,
+            routes={**self.routes, **later.routes},
+        )
 
 
 def _build_headers() -> dict[str, str]:
@@ -347,6 +396,13 @@ class InstagramClient:
         self._worker_reel_failures = 0
         self._worker_reel_blocked_until = 0.0
         self._worker_reel_last_status = 0
+        # The user-info route (users/<id>/info/), booked the same way and for
+        # the same reason: refused through the Worker it costs ~9 s a call
+        # (measured 2026-11-11), so a sweep knocks once per cooldown and takes
+        # the last refusal as the answer in between.
+        self._user_info_failures = 0
+        self._user_info_blocked_until = 0.0
+        self._user_info_last_status = 0
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -416,14 +472,36 @@ class InstagramClient:
         did not carry one. The Worker route is tried first when allowed, then
         the direct request.
         """
+        _status, user = await self._user_info_lookup(user_id, allow_proxy=allow_proxy)
+        return user
+
+    async def _user_info_lookup(
+        self, user_id: str, *, allow_proxy: bool = True
+    ) -> tuple[int, Optional[dict[str, Any]]]:
+        """One `users/<id>/info/` lookup: (status, user object or None).
+
+        `status` is what Instagram said — 200 with the object, 401/403 when it
+        refuses (403 "something went wrong" to an anonymous caller and 401
+        through the Worker, both measured 2026-11-11), 0 when nothing produced
+        an HTTP answer. The Worker route is tried first when allowed, then the
+        direct request; a refusal seen on either beats a 0.
+
+        The id goes into the URL path, so anything that is not a plain number
+        is not asked about at all.
+        """
+        user_id = str(user_id or "").strip()
+        if not (user_id.isascii() and user_id.isdigit()):
+            return 0, None
+        status = 0
         if allow_proxy and settings.ig_proxy_url:
             try:
                 response = await self._session.get(
-                    settings.ig_proxy_url, params={"hd_user_id": str(user_id)}
+                    settings.ig_proxy_url, params={"hd_user_id": user_id}
                 )
                 if response.status_code == 200:
                     user = response.json().get("user")
-                    return user if isinstance(user, dict) else None
+                    return 200, user if isinstance(user, dict) else None
+                status = int(response.status_code or 0)
                 logger.debug(
                     "Proxy mobile user-info HTTP {} for user_id={}",
                     response.status_code, user_id,
@@ -435,7 +513,7 @@ class InstagramClient:
                     "Proxy mobile user-info failed for user_id={}: {}", user_id, exc
                 )
 
-        url = f"https://{MOBILE_HOST}/api/v1/users/{user_id}/info/"
+        url = f"https://{MOBILE_HOST}{MOBILE_USER_INFO_PATH.format(user_id=user_id)}"
         headers: dict[str, str] = {
             "User-Agent": _ANDROID_UA,
             "x-ig-app-id": FORCED_IG_APP_ID,
@@ -447,14 +525,40 @@ class InstagramClient:
             response = await self._session.get(url, headers=headers)
             if response.status_code == 200:
                 user = response.json().get("user")
-                return user if isinstance(user, dict) else None
+                return 200, user if isinstance(user, dict) else None
             logger.debug(
                 "Mobile API returned HTTP {} for user_id={}",
                 response.status_code, user_id,
             )
+            status = int(response.status_code or 0) or status
         except Exception as exc:
             logger.debug("Mobile user-info failed for user_id={}: {}", user_id, exc)
-        return None
+        return status, None
+
+    @staticmethod
+    def _user_info_username(user: dict[str, Any], user_id: str) -> Optional[str]:
+        """The handle a user-info answer gives for `user_id`, or None.
+
+        None when the object names another account. A rename is written to
+        the account row on the strength of this answer, so it has to be about
+        the id that was asked: an answer whose own `pk` says otherwise (a
+        cached or misrouted reply) is not one.
+        """
+        for key in ("pk", "pk_id"):
+            value = user.get(key)
+            if value is not None and str(value).strip() not in ("", str(user_id)):
+                logger.warning(
+                    "A user-info answer for id {} is about id {} — not used",
+                    user_id, value,
+                )
+                return None
+        raw = user.get("username")
+        if not isinstance(raw, str):
+            return None
+        handle = raw.strip().lstrip("@").lower()
+        if not _HANDLE_RE.fullmatch(handle) or not handle.strip("."):
+            return None
+        return handle
 
     # This host's page door: refusals in a row before it is skipped, for how
     # long, and the most one attempt may take (redirect to the login page
@@ -475,6 +579,12 @@ class InstagramClient:
     _WORKER_REEL_BREAKER_FAILURES = 3
     _WORKER_REEL_COOLDOWN = 600.0
     _HOME_REEL_TIMEOUT = 15.0
+    # The user-info route (the second way from an id to a username): the
+    # same count and cooldown, for the same ~9 s a refusal through the Worker
+    # costs. Booked on its own — it is another endpoint behind another gate,
+    # and either may open while the other stays shut.
+    _USER_INFO_BREAKER_FAILURES = 3
+    _USER_INFO_COOLDOWN = 600.0
 
     # How long to skip the reel query after a hard block (401/403) before probing
     # again. Keeps card opens and sweeps fast where the graphql endpoint is
@@ -518,6 +628,8 @@ class InstagramClient:
         cached_ok: bool = False,
         ask_phone: bool = True,
         knock_refusing: bool = True,
+        reel: bool = True,
+        user_info: bool = False,
     ) -> IdProbe:
         """Ask Instagram about a NUMERIC id and report exactly what it said.
 
@@ -544,14 +656,44 @@ class InstagramClient:
         upstream retries on every failing account of every sweep. One knock
         per cooldown still notices the route opening again; a manual check
         (someone is waiting, and this is the only rename route) always knocks.
+
+        `user_info=True` goes on to the second id route, `users/<id>/info/`,
+        when the reel query gave no answer. It knows the handle and the
+        avatar and nothing else, which is exactly what finding a rename
+        takes. Until 2026-11-11 it was asked only to fill in a reel answer
+        that had already come, so when the reel query was login-walled
+        (2026-11-04) nothing was left that could turn an id into a username.
+        The same `knock_refusing` rule applies to it. `reel=False` asks that
+        second route alone: for a check whose reel question was refused a
+        moment ago, where asking it again is ~9 s for the same refusal.
         """
-        probe = IdProbe(user_id=str(user_id or ""))
+        probe = IdProbe(user_id=str(user_id or "").strip())
         if not probe.user_id:
             return probe
         cached = self._cached_reel(probe.user_id)
         if cached is not None:
             return await self._fill_probe(probe, 200, cached, via="cache")
+        if reel:
+            probe = await self._probe_reel(
+                probe, cached_ok=cached_ok, ask_phone=ask_phone,
+                knock_refusing=knock_refusing,
+            )
+            if probe.answered or probe.gone or probe.via == "cache-miss":
+                return probe
+        if user_info:
+            await self._probe_user_info(probe, knock_refusing=knock_refusing)
+        return probe
 
+    async def _probe_reel(
+        self,
+        probe: IdProbe,
+        *,
+        cached_ok: bool,
+        ask_phone: bool,
+        knock_refusing: bool,
+    ) -> IdProbe:
+        """The reel query's part of `probe_by_id`: the phone's prefetched
+        answer, the Worker, the phone live. See there for the order."""
         phone = bool(settings.home_fetch_token and home_fetch.broker.connected)
         if cached_ok and settings.home_fetch_token:
             home = home_fetch.broker.cached_reel(probe.user_id)
@@ -576,6 +718,7 @@ class InstagramClient:
         if worker_refusing and not phone and not knock_refusing:
             probe.status = self._worker_reel_last_status
             probe.via = "worker-shut"
+            probe.routes[ROUTE_REEL] = probe.status
             return probe
         order = ["home", "worker"] if (phone and worker_refusing) else ["worker", "home"]
         status, parsed = 0, None
@@ -595,7 +738,89 @@ class InstagramClient:
                         return await self._fill_probe(probe, h_status, h_parsed, via="home")
                     status = status or h_status
         probe.status = status
+        probe.routes[ROUTE_REEL] = status
         return probe
+
+    async def _probe_user_info(
+        self, probe: IdProbe, *, knock_refusing: bool = True
+    ) -> IdProbe:
+        """Ask `users/<id>/info/` for the handle behind the probe's id.
+
+        An answer fills in the username and the avatar and makes the probe
+        an answered one (`via="user-info"`, no reel data: this route does not
+        know a story from none). Anything else leaves the probe as the reel
+        query left it — never as a 404. That status means "the id is gone",
+        and a route that refuses anonymous callers is in no position to say
+        so: only the reel query's own 404 is taken as that.
+
+        While the route is known to be refusing, a caller that does not
+        `knock_refusing` (a sweep) is handed its last refusal instead of
+        spending another ~9 s on it; one knock per cooldown notices it open.
+        """
+        if ROUTE_USER_INFO in probe.routes:
+            return probe  # already asked on this probe, to fill in a reel answer
+        if time.monotonic() < self._user_info_blocked_until and not knock_refusing:
+            status = self._user_info_last_status
+            probe.routes[ROUTE_USER_INFO] = status
+            if not probe.status and status in (401, 403):
+                probe.status = status
+            return probe
+        status, username, pic = await self._ask_user_info(probe)
+        if username:
+            probe.status = 200
+            probe.via = "user-info"
+            probe.username = username
+            probe.profile_pic_url = pic
+            logger.info(
+                "Instagram ID {} resolves to @{} on the user-info route (the "
+                "reel query {})", probe.user_id, username,
+                f"answered HTTP {probe.routes[ROUTE_REEL]}"
+                if probe.routes.get(ROUTE_REEL) else "gave no answer",
+            )
+        elif not probe.status and status in (401, 403):
+            probe.status = status
+        return probe
+
+    async def _ask_user_info(
+        self, probe: IdProbe
+    ) -> tuple[int, Optional[str], Optional[str]]:
+        """One user-info lookup for `probe`: (status, username, avatar URL),
+        booked on the probe and on the route's breaker. A 200 that names no
+        account for this id is no answer (status 0, nothing taken from it).
+
+        With a session cookie configured the direct request is the one that
+        can answer, and the Worker must never see the cookie: skip that hop.
+        """
+        status, user = await self._user_info_lookup(
+            probe.user_id, allow_proxy=not settings.ig_session_cookie
+        )
+        username = self._user_info_username(user, probe.user_id) if user else None
+        pic = user.get("profile_pic_url") if (user and username) else None
+        if status == 200 and not username:
+            status = 0
+        probe.routes[ROUTE_USER_INFO] = status
+        self._note_user_info(status)
+        return status, username, pic if isinstance(pic, str) and pic else None
+
+    def _note_user_info(self, status: int) -> None:
+        if status == 200:
+            self._user_info_failures = 0
+            self._user_info_blocked_until = 0.0
+            return
+        self._user_info_failures += 1
+        self._user_info_last_status = status
+        if (
+            self._user_info_failures >= self._USER_INFO_BREAKER_FAILURES
+            and time.monotonic() >= self._user_info_blocked_until
+        ):
+            self._user_info_blocked_until = time.monotonic() + self._USER_INFO_COOLDOWN
+            logger.info(
+                "The user-info route (users/<id>/info) was refused {} times in "
+                "a row (last HTTP {}) — a sweep skips it for the next {:.0f} "
+                "min; a manual check still asks",
+                self._user_info_failures, status or "no answer",
+                self._USER_INFO_COOLDOWN / 60,
+            )
 
     def _note_worker_reel(self, status: int) -> None:
         if status in (200, 404):
@@ -638,6 +863,7 @@ class InstagramClient:
     ) -> IdProbe:
         probe.status = status
         probe.via = via
+        probe.routes[ROUTE_REEL] = status
         if parsed is None:
             return probe
         if via in ("home",) and self._cached_reel(probe.user_id) is None:
@@ -656,14 +882,9 @@ class InstagramClient:
         if not probe.profile_pic_url or not probe.username:
             # The reel payload normally carries both; when it does not, the
             # mobile user-info route (same numeric key) usually does.
-            info = await self._mobile_user_info(probe.user_id)
-            if info:
-                probe.profile_pic_url = (
-                    probe.profile_pic_url or info.get("profile_pic_url") or None
-                )
-                raw_name = info.get("username")
-                if not probe.username and isinstance(raw_name, str) and raw_name.strip():
-                    probe.username = raw_name.strip().lstrip("@").lower()
+            _status, name, pic = await self._ask_user_info(probe)
+            probe.profile_pic_url = probe.profile_pic_url or pic
+            probe.username = probe.username or name
         return probe
 
     def reel_in_hand(self, user_id: str) -> Optional[dict[str, Any]]:
@@ -838,11 +1059,20 @@ class InstagramClient:
         return 0, None
 
     async def fetch_username_by_id(self, user_id: str) -> Optional[str]:
-        """Resolve the current username for a stable Instagram numeric user ID."""
+        """Resolve the current username for a stable Instagram numeric user ID.
+
+        The reel query first, as ever; when it gives no username, the
+        user-info route (`/add <numeric id>` has someone waiting, so it always
+        knocks). None when neither route names the account.
+        """
         parsed = await self.fetch_reel_user(user_id)
-        if parsed is None:
+        if parsed is not None and parsed.get("username"):
+            return parsed.get("username")
+        probe = IdProbe(user_id=str(user_id or "").strip())
+        if not probe.user_id:
             return None
-        return parsed.get("username")
+        await self._probe_user_info(probe)
+        return probe.username if probe.answered else None
 
     async def fetch_profile(
         self,

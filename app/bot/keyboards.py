@@ -278,7 +278,10 @@ def accounts_list(accounts: Sequence, page: int = 0) -> InlineKeyboardMarkup:
 
     rows: list[list[InlineKeyboardButton]] = []
     for a in accounts[start:end]:
-        marker = "🟢" if a.active else "⏸"
+        # Green means checked and answering. An account whose checks are
+        # failing is still monitored, but showing it green said it was well.
+        failing = (getattr(a, "consecutive_failures", 0) or 0) > 0
+        marker = "⏸" if not a.active else "⚠️" if failing else "🟢"
         rows.append(
             [
                 InlineKeyboardButton(

@@ -98,7 +98,9 @@ User (Telegram)
     the sweep pauses outright, as 401/403 blocks pile up)
 3.  Per account:
     a.  InstagramClient.probe_by_id(stored id)  →  current username, avatar,
-        story/live status, highlight catalog (graphql reel query, BY ID).
+        story/live status, highlight catalog (graphql reel query, BY ID),
+        and — when that query gives no answer — the username and avatar
+        from the second id route, users/<id>/info.
         A changed username is persisted + announced here (_apply_rename);
         a 404 by id means the account is gone, not renamed
     b.  InstagramClient.fetch_profile(username)  →  200 JSON from Instagram.
@@ -106,9 +108,16 @@ User (Telegram)
         SWEEP_BREAKER_THRESHOLD lookups in a row with none answering; the
         page doors still run — this host's own request, then the home
         fetcher (HOME_FETCH_TOKEN: a phone/PC on a trusted connection that
-        polls /home-fetch/jobs for work)
+        polls /home-fetch/jobs for work).
+        The reading's own Instagram ID is compared with the stored one: a
+        username that answers as ANOTHER id is not this account (the handle
+        has a new owner) and nothing from it is stored
     c.  If (b) is blocked but (a) answered: an id-only PARTIAL reading —
-        username + picture live, everything else carried forward, labelled
+        username + picture live, everything else carried forward, labelled.
+        If (b) says the username is gone and (a) could not resolve the id:
+        the account is recorded as "username gone, current one not found"
+        (identity_lost:<id>), alerted on the second miss, shown that way on
+        its card — never as "🟢 active" — and asked again every sweep
     d.  MediaHasher.hash_url()  →  download + perceptual hash
     e.  detect_changes(previous_snapshot, new_snapshot)
     f.  If changed: INSERT AccountSnapshot, log NotificationLog
@@ -296,7 +305,10 @@ x-ig-app-id: 936619743392459
   on the second consecutive miss and every 5th after — counted in "not
   found" answers, `not_found_run:<id>`, not in failed checks: an account
   that was blocked twice before it first read "not found" is announced on
-  its second miss, as "2 checks in a row")
+  its second miss, as "2 checks in a row"). The alert names what each id
+  route answered ("reel query: HTTP 401; user info: HTTP 403") and how to
+  relink the entry (`/add newname`), or the entry that already holds the
+  same Instagram ID when there is one
 
 **Proxy path:** When `IG_PROXY_URL` is set, requests are routed through the
 Cloudflare Worker instead of hitting Instagram directly.
@@ -504,6 +516,47 @@ sweep itself is paced by `_SweepThrottle`:
   first pass does not settle for an id-only reading — that would count as an
   answer and the retry round would never come back for the full page. Only a
   page still late in the retry round falls back to the id route.
+- **Identity is the Instagram ID (2026-11-11).** The username is what an
+  account is called today; the numeric id is what it is. Four rules follow,
+  each from something that went wrong or was about to:
+  - *A reading under the stored username that carries another id is not this
+    account* (`_foreign_owner`). A target that renames frees its old handle,
+    and whoever takes it would have been read as the target: a stranger's
+    counts written into the history as "changes", a stranger's stories
+    delivered (the story phase works by username). The reading is not stored,
+    the check fails as "this username now belongs to a different Instagram
+    account" (alerted on the second such answer), the id routes are asked
+    where the account went, and a sweep skips that account's story phase.
+  - *A username that is gone, with an id nobody will resolve, is said to be
+    exactly that.* `_handle_failure` keeps `identity_lost:<id>` (since when,
+    why, what each id route answered); the card's State reads "🔴 active —
+    username gone, current one not found" from the second miss, with the
+    reason and what to do, the account list marks a failing account ⚠️, and
+    `/status` tells it from a block ("@x (9×, username gone)").
+    "🟢 active" is for an account that is monitored AND answering: it used to
+    mean only "not paused", so nine failed checks read as being followed
+    normally. A 401/403 is still never read as deleted or renamed — it sets
+    no such note, sends no such alert, and the card says "not answering".
+  - *A new username added by hand is matched to the entry that holds its id*
+    (`_relink_to_known_entry`). Every profile read BY NAME carries the id, so
+    `/add newname` works even while no id route answers: the entry that has
+    the id takes the new username and keeps its row, id, snapshots, topic and
+    settings; the entry just added (nothing on record yet) is removed;
+    `/addmedia`'s setting carries over; one rename message says it was
+    confirmed by the id on the new profile. Before, this made a second entry
+    with the same id while the first failed forever. An entry with history of
+    its own is never merged, and an id is never written to a second entry
+    (`_id_held_elsewhere`). The relink runs under the older entry's own check
+    lock, and `_run_check` reads the current username under that lock
+    (`_current_usernames`), so a check queued under the old name — a sweep's
+    list, a retry round — asks for the new one. Only a real id decides any of
+    this (`_real_id`: a positive number; an empty field or a placeholder 0
+    says nothing about whose profile a reading is).
+  - *A rename that cannot be applied is said once.* When the new username is
+    already another entry with an id or history of its own, this entry keeps
+    its old name and says so — once (`rename_collision:<id>`); it used to
+    announce the same rename on every check. When that other entry is an
+    empty copy added before the rename was known, it is folded in instead.
 
 ### 6.3 WatcherScheduler (`app/workers/scheduler.py`)
 
@@ -687,6 +740,30 @@ first when one is connected, and a sweep without one does not ask the Worker
 at all (`probe_by_id(knock_refusing=False)` — the last refusal stands as the
 answer), so each window costs a sweep one knock instead of ~9 s on every
 failing account. A manual check always knocks.
+
+**`?hd_user_id=` is the second id route, asked on its own (2026-11-11).** It
+was only ever asked to fill in a reel answer that had already arrived, so
+when the reel query was walled it was unreachable exactly when it was the one
+route left that could turn an id into a username — and a renamed target
+(@8dvuu) sat at nine failed checks with its id on file. Now
+`probe_by_id(user_info=True)` goes on to `users/<id>/info` whenever the reel
+query gives no answer: a sweep in the same call, a manual check only after
+its username side has failed (`reel=False` — the reel query was refused a
+moment earlier and is not asked twice). Its answer is used only when it names
+the id that was asked (`pk`) and a valid handle; its 404 is never read as
+"id gone" (a route that refuses anonymous callers cannot say so — only the
+reel query's own 404 can). It has its own three-refusal, 10-minute breaker
+(`_note_user_info`). Measured the same day, for the target's id and for
+@instagram's own: the reel query 401 `require_login` + `igweb_rollout`
+directly, 401 through the Worker; `users/<id>/info` 403 directly, 401 through
+the Worker (9.4 s); `www…/users/<id>/info` a redirect to the login page. So
+**no anonymous route resolves an id today** — the second route makes the
+recovery automatic the moment either reopens. With `IG_SESSION_COOKIE` set it
+is asked of Instagram directly, with the cookie, and never through the Worker
+(the route the HD-avatar lookup uses with a session, so expected to answer;
+not measured — no session was used). Until then the way back to a renamed
+account is its new username, matched by id — see §6.2, "Identity is the
+Instagram ID".
 
 **Cloudflare edge IPs are not immune — they are just better odds.** Worth
 stating plainly, because the opposite assumption shaped earlier versions of
@@ -1001,7 +1078,7 @@ keeps the real Chrome fingerprint. The Worker remains the free default.
 | Command | Description |
 |---|---|
 | `/start` or `/menu` | Open the main panel |
-| `/add @username` | Start monitoring an account (runs first check immediately) |
+| `/add @username` | Start monitoring an account (runs first check immediately). If its profile carries the Instagram ID of an entry already monitored under an older name, that entry takes the new username and keeps its history — nothing is added twice |
 | `/addmedia @username` | Same, alerting only on stories, posts and the avatar (media-only); switches an account already monitored |
 | `/remove @username` | Stop monitoring, deletes all snapshots |
 | `/list` | Paginated list of monitored accounts |
@@ -1016,7 +1093,7 @@ keeps the real Chrome fingerprint. The Worker remains the free default.
 | `/rhythm @username` | Hour-of-day and day-of-week activity histogram |
 | `/darkradar` | Targets ranked by how long they've been silent |
 | `/story @username` / `/highlights @username` | On-demand media for **any** public account, monitored or not |
-| `/probe @username` | Test every profile source and report which answer — API, public page (HTTP status + byte count), media downloader |
+| `/probe @username` | Test every profile source and report which answer — API, both ID routes (the reel query and `users/<id>/info`, each with its own status), public page (HTTP status + byte count), media downloader |
 | `/digest [off\|daily\|weekly]` | Show, preview, or set the roll-up mode |
 | `/synctopics` | Create one forum topic per account (needs `TELEGRAM_FORUM_TOPICS=true`) |
 | `/kill` (alias `/stop`) | Abort an in-progress on-demand download; already-sent media stays |

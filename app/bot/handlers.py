@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import json
 import re
 import tempfile
 from collections import OrderedDict
@@ -26,6 +27,7 @@ from telegram.ext import (
 )
 
 from app.bot import keyboards
+from app.bot.notifications import describe_routes
 from app.config import settings
 from app.database import crud
 from app.database.session import get_session
@@ -703,6 +705,107 @@ async def _fill_story_line(
     spawn(_fill(), name=f"card-story:{username}")
 
 
+def _identity_lost(raw: Optional[str]) -> Optional[dict]:
+    """The stored note that an account's username no longer leads to it
+    (MonitorService._note_identity_lost), when it is one to act on.
+
+    From the second such answer in a row, as the alert is — one can be a
+    flake — or at once when the Instagram ID itself no longer resolves."""
+    if not raw:
+        return None
+    try:
+        note = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(note, dict):
+        return None
+    try:
+        misses = int(note.get("misses") or 0)
+    except (TypeError, ValueError):
+        misses = 0
+    if misses < 2 and note.get("reason") != "id_gone":
+        return None
+    return note
+
+
+def _state_label(account, lost: Optional[dict]) -> str:
+    """The card's State value. "🟢 active" is kept for an account that is
+    monitored AND answering: until 2026-11-11 it was shown for any account
+    that was not paused, so one that had failed nine checks in a row read as
+    being followed normally."""
+    if not account.active:
+        return "⏸ paused"
+    fails = account.consecutive_failures or 0
+    if lost is not None:
+        if lost.get("reason") == "id_gone":
+            return "🔴 active — the Instagram ID no longer resolves"
+        if lost.get("reason") == "foreign":
+            return "🔴 active — this username is another account's now"
+        return "🔴 active — username gone, current one not found"
+    if fails:
+        return (
+            f"⚠️ active — not answering ({fails} check"
+            f"{'s' if fails != 1 else ''} failed in a row)"
+        )
+    return "🟢 active"
+
+
+def _identity_lost_lines(account, lost: Optional[dict]) -> list[str]:
+    """What is known about an account whose username no longer leads to it,
+    and what the owner can do — for the card. Nothing is guessed: a rename
+    that no id route confirmed is said to be unconfirmed."""
+    if lost is None:
+        return []
+    name = esc(account.username)
+    raw_since = lost.get("since")
+    since = _parse_iso(raw_since if isinstance(raw_since, str) else None)
+    when = f"Since {fmt_timestamp(since)}: " if since else ""
+    reason = lost.get("reason")
+    stored_id = esc(account.instagram_id or "?")
+    lines: list[str] = []
+    if reason == "id_gone":
+        lines.append(
+            f"<i>{when}Instagram answers 404 for the ID itself, so the "
+            "account looks deactivated or deleted, not renamed — a rename "
+            "keeps the ID.</i>"
+        )
+        return lines
+    if reason == "foreign":
+        lines.append(
+            f"<i>{when}@{name} answers as Instagram ID "
+            f"<code>{esc(str(lost.get('foreign_id') or '?'))}</code>, a "
+            f"different account from the one monitored here (ID "
+            f"<code>{stored_id}</code>). Nothing from it is recorded.</i>"
+        )
+    else:
+        lines.append(f"<i>{when}Instagram has no profile under @{name}.</i>")
+    if reason == "no_id":
+        lines.append(
+            "<i>No Instagram ID is stored for this account, so it cannot be "
+            "followed to a new name.</i>"
+        )
+    else:
+        said = describe_routes(lost.get("routes"))
+        lines.append(
+            "<i>Its current username could not be read from the ID: Instagram "
+            "refused the lookup" + (f" ({esc(said)})" if said else "")
+            + ". Renamed, deactivated or deleted cannot be told apart until "
+            "it answers; it is asked again on every check.</i>"
+        )
+    if lost.get("twin"):
+        lines.append(
+            f"<i>The same Instagram ID is monitored as @{esc(str(lost['twin']))} "
+            "— that entry is this account under its current name.</i>"
+        )
+    elif reason != "no_id":
+        lines.append(
+            "<i>Know the new username? Send <code>/add newname</code> — it is "
+            "matched to this entry by its Instagram ID, so the history stays "
+            "and nothing is duplicated.</i>"
+        )
+    return lines
+
+
 async def _render_account_card(
     username: str,
     service: Optional[MonitorService] = None,
@@ -727,8 +830,12 @@ async def _render_account_card(
             session, account.id
         )
         media_only = await crud.is_media_only(session, account.id)
+        # Read only for an account that is failing: nothing else sets it.
+        lost = _identity_lost(
+            await crud.get_setting(session, MonitorService._identity_key(account.id))
+            if (account.consecutive_failures or 0) > 0 else None
+        )
 
-    marker = "🟢 active" if account.active else "⏸ paused"
     last = fmt_timestamp(account.last_checked_at) if account.last_checked_at else "never"
     status = f"HTTP {account.last_status_code}" if account.last_status_code else "—"
     fails = account.consecutive_failures or 0
@@ -736,13 +843,14 @@ async def _render_account_card(
     lines = [
         f"<b>@{esc(account.username)}</b>",
         f"Instagram ID: <code>{esc(account.instagram_id or 'unknown')}</code>",
-        f"State: {marker}",
+        f"State: {_state_label(account, lost)}",
     ]
     if media_only:
         lines.append("Alerts: 🎞 media only (stories, posts &amp; avatar)")
     lines.append(f"Last check: <code>{last}</code> · {status}")
     if fails:
         lines.append(f"Consecutive failures: <b>{fails}</b>")
+    lines.extend(_identity_lost_lines(account, lost))
 
     if snapshot:
         lines.append("")
@@ -969,6 +1077,7 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
         last_sweep_raw = await crud.get_setting(session, SETTING_LAST_SWEEP_AT)
         digest_raw = await crud.get_setting(session, SETTING_DIGEST_MODE)
         dark_flags = await crud.get_settings_by_prefix(session, "dark_state:")
+        lost_notes = await crud.get_settings_by_prefix(session, "identity_lost:")
 
     scheduler_state = context.application.bot_data.get("scheduler_state", "unknown")
     next_run = context.application.bot_data.get("next_run")
@@ -993,8 +1102,23 @@ async def _render_status_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     attention_line = ""
     if failing:
         shown = failing[:5]
+
+        def why(account) -> str:
+            # A username that no longer leads to its account is a different
+            # problem from a block, and the one the owner can act on.
+            lost = _identity_lost(
+                lost_notes.get(MonitorService._identity_key(account.id))
+            )
+            if lost is None:
+                return ""
+            if lost.get("reason") == "id_gone":
+                return ", ID gone"
+            if lost.get("reason") == "foreign":
+                return ", username taken over"
+            return ", username gone"
+
         names = ", ".join(
-            f"@{esc(a.username)} ({a.consecutive_failures}×)" for a in shown
+            f"@{esc(a.username)} ({a.consecutive_failures}×{why(a)})" for a in shown
         )
         extra = f" +{len(failing) - 5} more" if len(failing) > 5 else ""
         attention_line = (
@@ -1262,13 +1386,39 @@ async def _do_add(
         # compare it against, so "No changes detected" would say nothing. Show
         # what it read instead: the account card, in place of the note above.
         result = await service.check_username(account.username, notify_unchanged=False)
-        if result.get("ok"):
+        # The username may have turned out to be an account already monitored
+        # under an older name: its first reading carried that entry's
+        # Instagram ID, so the entry took the new name and nothing was added.
+        relinked_from = result.get("relinked_from")
+        if relinked_from and not result.get("ok") and chat_id is not None:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔁 <b>@{esc(account.username)}</b> is the account "
+                    f"already monitored as <b>@{esc(relinked_from)}</b> (same "
+                    "Instagram ID) — that entry now carries the new username "
+                    "and keeps its history. Its check under the new name "
+                    f"failed just now: <code>{esc(str(result.get('error')))}"
+                    "</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        elif result.get("ok"):
             username = result.get("username", account.username)
             card = await _render_account_card(
                 username, service, story_state=STORY_CHECKING
             )
             if card is not None and status_msg is not None:
-                text = f"✅ <b>Now monitoring</b>\n\n{card}"
+                header = "✅ <b>Now monitoring</b>"
+                if relinked_from:
+                    header = (
+                        f"🔁 <b>@{esc(username)}</b> is the account already "
+                        f"monitored as <b>@{esc(relinked_from)}</b> — same "
+                        "Instagram ID. That entry now carries the new "
+                        "username and keeps its history; nothing was added "
+                        "twice."
+                    )
+                text = f"{header}\n\n{card}"
                 keyboard = await _actions_keyboard(username, context)
                 await status_msg.edit_text(
                     text,
@@ -2887,14 +3037,27 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         stored_id = monitored.instagram_id if monitored else None
     probe = None
     if stored_id:
-        probe = await service.instagram.probe_by_id(str(stored_id))
-        if probe.answered:
+        # Both id routes: the reel query, and users/<id>/info when that gives
+        # no answer. Either one finding a username is what finds a rename.
+        probe = await service.instagram.probe_by_id(str(stored_id), user_info=True)
+        said = describe_routes(probe.routes)
+        if probe.answered and probe.reel_data is not None:
             reel = probe.reel_data or {}
             line = (
                 f"✅ <b>ID route</b> (graphql by id <code>{esc(str(stored_id))}</code>)"
                 f" — resolves to <b>@{esc(probe.username or '?')}</b>, "
                 f"story: {'yes' if reel.get('has_public_story') else 'no'}, "
                 f"highlights: {len(reel.get('highlights') or {})}"
+            )
+            if probe.username and probe.username != username.lower():
+                line += " — <b>renamed</b>; the next check follows the new name"
+            lines.append(line)
+        elif probe.answered:
+            line = (
+                f"✅ <b>ID route</b> (user info by id <code>{esc(str(stored_id))}"
+                f"</code>) — resolves to <b>@{esc(probe.username or '?')}</b>; "
+                "story status and highlights not read"
+                + (f" (<code>{esc(said)}</code>)" if said else "")
             )
             if probe.username and probe.username != username.lower():
                 line += " — <b>renamed</b>; the next check follows the new name"
@@ -2906,7 +3069,9 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         else:
             lines.append(
-                f"❌ <b>ID route</b> — <code>HTTP {probe.status or 'no answer'}</code>"
+                "❌ <b>ID route</b> — <code>"
+                + esc(said or f"HTTP {probe.status or 'no answer'}")
+                + "</code>"
             )
     else:
         lines.append(

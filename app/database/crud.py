@@ -65,6 +65,65 @@ async def get_account(session: AsyncSession, username: str) -> Optional[Monitore
     return result.scalar_one_or_none()
 
 
+async def get_account_by_instagram_id(
+    session: AsyncSession,
+    instagram_id: str,
+    *,
+    exclude_id: Optional[int] = None,
+) -> Optional[MonitoredAccount]:
+    """The entry that holds this Instagram id — the oldest one, should there
+    be several — leaving `exclude_id` out of the search.
+
+    The numeric id is what an account IS; the username is only what it is
+    called today. This is how a reading taken under one name is recognised as
+    an account already monitored under another."""
+    stmt = select(MonitoredAccount).where(
+        MonitoredAccount.instagram_id == str(instagram_id)
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(MonitoredAccount.id != exclude_id)
+    result = await session.execute(stmt.order_by(MonitoredAccount.id).limit(1))
+    return result.scalar_one_or_none()
+
+
+async def account_has_history(session: AsyncSession, account_id: int) -> bool:
+    """True once an entry holds anything worth keeping: a reading that
+    succeeded, a story or post it delivered, a highlight catalog, a stored
+    picture. An entry that was only just added has none of them."""
+    probes = (
+        select(AccountSnapshot.id).where(
+            AccountSnapshot.account_id == account_id,
+            AccountSnapshot.http_status == 200,
+        ),
+        select(SeenStory.id).where(SeenStory.account_id == account_id),
+        select(StoredHighlight.id).where(StoredHighlight.account_id == account_id),
+        select(ProfileMediaHash.id).where(ProfileMediaHash.account_id == account_id),
+    )
+    for stmt in probes:
+        if (await session.execute(stmt.limit(1))).first() is not None:
+            return True
+    return False
+
+
+async def delete_account(
+    session: AsyncSession, account_id: int, *, setting_keys: Iterable[str] = ()
+) -> bool:
+    """Remove one entry by id, with its rows and the per-account settings the
+    caller names. The child rows are deleted here, not left to the database's
+    cascade, so it behaves the same on SQLite (which does not enforce one)."""
+    for model in (
+        AccountSnapshot, ProfileMediaHash, NotificationLog, StoredHighlight, SeenStory,
+    ):
+        await session.execute(delete(model).where(model.account_id == account_id))
+    keys = list(setting_keys)
+    if keys:
+        await session.execute(delete(AppSetting).where(AppSetting.key.in_(keys)))
+    result = await session.execute(
+        delete(MonitoredAccount).where(MonitoredAccount.id == account_id)
+    )
+    return result.rowcount > 0
+
+
 async def list_accounts(
     session: AsyncSession, only_active: bool = True
 ) -> List[MonitoredAccount]:

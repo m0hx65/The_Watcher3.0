@@ -197,7 +197,13 @@ class ScriptedInstagram:
         self.in_hand_calls: list[str] = []
 
     async def fetch_profile(self, username: str, **kw) -> ProfileFetchResult:
-        return self.profile(username)
+        result = self.profile(username)
+        if result.parsed is not None and username in _ACCOUNT_IDS:
+            # A profile read by username carries its account's own Instagram
+            # ID; a reading with any other id is another account's, and is
+            # not accepted as this one's (see test_rename_by_id).
+            result.parsed["instagram_id"] = _ACCOUNT_IDS[username]
+        return result
 
     async def probe_by_id(self, user_id: str, **kw) -> IdProbe:
         self.probe_calls.append(str(user_id))
@@ -243,7 +249,14 @@ def _sent(service) -> list[str]:
     return [c.args[0] for c in service.notifier.send_text.await_args_list]
 
 
+# username -> the Instagram ID its account was created with, for the fake
+# client to stamp on that account's readings (ScriptedInstagram.fetch_profile).
+_ACCOUNT_IDS: dict[str, str] = {}
+
+
 async def _new_account(username: str, instagram_id: Optional[str] = "42") -> int:
+    if instagram_id is not None:
+        _ACCOUNT_IDS[username] = instagram_id
     async with get_session() as session:
         account = MonitoredAccount(
             username=username, active=True, instagram_id=instagram_id
