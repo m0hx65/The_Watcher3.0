@@ -968,7 +968,10 @@ def instagram_route() -> str:
     if not settings.ig_proxy_url:
         return "DIRECT — this host's own IP (datacenter IPs are 401-blocked)"
     host = urlparse(settings.ig_proxy_url).hostname or settings.ig_proxy_url
-    route = f"Cloudflare Worker ({host})"
+    # Whether this bot sends the Worker its key (IG_PROXY_KEY) — never the
+    # key itself.
+    keyed = ", keyed" if settings.ig_proxy_key else ", no key"
+    route = f"Cloudflare Worker ({host}{keyed})"
     if settings.proxy:
         # PROXY_URL wraps the whole session, so it applies to the hop that
         # reaches the worker — not to the worker's own egress to Instagram.

@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     # When unset, requests go out unauthenticated.
     ig_session_cookie: Optional[str] = Field(default=None, alias="IG_SESSION_COOKIE")
     ig_proxy_url: Optional[str] = Field(default=None, alias="IG_PROXY_URL")
+    # The shared secret the Cloudflare Worker checks (its WATCHER_KEY secret),
+    # sent as the X-Watcher-Key header on Worker requests only — never to
+    # Instagram. The Worker's URL is public in this repository, and without a
+    # key anyone can use it as their own Instagram proxy, spending its free
+    # quota under the same request fingerprint this bot uses. Empty = no header
+    # (a Worker without WATCHER_KEY set accepts that, as before).
+    ig_proxy_key: Optional[str] = Field(default=None, alias="IG_PROXY_KEY")
     # The home fetcher (tools/home_fetcher): a phone or PC on a connection
     # Instagram trusts polls this bot for profile pages to fetch and posts them
     # back — no tunnel, no inbound port. This is the shared secret it presents;
@@ -303,6 +310,15 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_database_url(cls, v: str) -> str:
         return normalize_db_url(v)
+
+    @field_validator("ig_proxy_key")
+    @classmethod
+    def strip_proxy_key(cls, v: Optional[str]) -> Optional[str]:
+        # A key pasted with a trailing newline or space would never match the
+        # Worker's, and the failure reads like Instagram blocking every call.
+        if v is None:
+            return None
+        return v.strip() or None
 
     @field_validator("telegram_webhook_secret")
     @classmethod

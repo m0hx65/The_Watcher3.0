@@ -45,6 +45,11 @@ MOBILE_USER_INFO_PATH = "/api/v1/users/{user_id}/info/"
 PROFILE_PAGE_HOST = INSTAGRAM_HOST
 FORCED_IG_APP_ID = "936619743392459"
 CHROME_IMPERSONATE = "chrome120"
+# The header the Cloudflare Worker checks against its WATCHER_KEY secret, and
+# the error it answers (HTTP 403) when the key is missing or wrong. Both are
+# matched by the Worker's source (ig-proxy-worker/src/index.js).
+WORKER_KEY_HEADER = "X-Watcher-Key"
+WORKER_KEY_REFUSED = "bad watcher key"
 # Android Instagram UA — used for the mobile API endpoint to retrieve hd_profile_pic_url_info
 _ANDROID_UA = (
     "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; "
@@ -403,6 +408,9 @@ class InstagramClient:
         self._user_info_failures = 0
         self._user_info_blocked_until = 0.0
         self._user_info_last_status = 0
+        # Whether the Worker's refusal of this bot's key has been logged since
+        # it last answered. See _note_worker_reply.
+        self._worker_key_warned = False
         if session is not None:
             self._session: _SessionLike = session
             self._own_session = False
@@ -420,6 +428,58 @@ class InstagramClient:
     async def close(self) -> None:
         if self._own_session:
             await self._session.close()
+
+    @staticmethod
+    def _worker_headers() -> dict[str, str]:
+        """The key header for a request to the Cloudflare Worker, or nothing
+        when IG_PROXY_KEY is unset. Only Worker requests are given it: the
+        key is this bot's credential with its own proxy, and Instagram never
+        sees it."""
+        key = settings.ig_proxy_key
+        return {WORKER_KEY_HEADER: key} if key else {}
+
+    async def _worker_get(self, params: dict[str, str]) -> Any:
+        """One GET to the Cloudflare Worker with `params`, carrying the key."""
+        headers = self._worker_headers()
+        if headers:
+            response = await self._session.get(
+                settings.ig_proxy_url, params=params, headers=headers
+            )
+        else:
+            response = await self._session.get(settings.ig_proxy_url, params=params)
+        self._note_worker_reply(response)
+        return response
+
+    def _note_worker_reply(self, response: Any) -> None:
+        """Say plainly when the Worker refused this bot's key.
+
+        The refusal is an HTTP 403, which every caller books as Instagram
+        blocking the request — true to its effect (no answer), but the cause
+        would otherwise be invisible: every Worker route reading as blocked,
+        with nothing anywhere saying that the key is wrong. Logged once, and
+        again only after the Worker has answered in between. The key itself
+        is never logged."""
+        status = getattr(response, "status_code", 0)
+        if status == 200:
+            self._worker_key_warned = False
+            return
+        if status != 403 or self._worker_key_warned:
+            return
+        try:
+            body = response.json()
+        except Exception:
+            return
+        if not isinstance(body, dict) or body.get("error") != WORKER_KEY_REFUSED:
+            return
+        self._worker_key_warned = True
+        logger.warning(
+            "The Cloudflare Worker refused this bot's key (HTTP 403 \"{}\") — {}. "
+            "Until that is fixed every Worker route reads as blocked",
+            WORKER_KEY_REFUSED,
+            "IG_PROXY_KEY must equal the Worker's WATCHER_KEY secret"
+            if settings.ig_proxy_key
+            else "the Worker requires a key and IG_PROXY_KEY is not set here",
+        )
 
     async def __aenter__(self) -> "InstagramClient":
         return self
@@ -495,9 +555,7 @@ class InstagramClient:
         status = 0
         if allow_proxy and settings.ig_proxy_url:
             try:
-                response = await self._session.get(
-                    settings.ig_proxy_url, params={"hd_user_id": user_id}
-                )
+                response = await self._worker_get({"hd_user_id": user_id})
                 if response.status_code == 200:
                     user = response.json().get("user")
                     return 200, user if isinstance(user, dict) else None
@@ -972,9 +1030,7 @@ class InstagramClient:
         and a direct attempt is still worth making.
         """
         try:
-            response = await self._session.get(
-                settings.ig_proxy_url, params={"user_id": user_id}
-            )
+            response = await self._worker_get({"user_id": user_id})
         except Exception as exc:
             logger.debug("Proxy reel query failed for id={}: {}", user_id, exc)
             return 0, None
@@ -1111,7 +1167,7 @@ class InstagramClient:
         if settings.ig_proxy_url:
             fetch_url = settings.ig_proxy_url
             fetch_params: dict[str, str] = {"username": username}
-            fetch_headers: dict[str, str] = {}
+            fetch_headers: dict[str, str] = self._worker_headers()
         else:
             fetch_url = PROFILE_URL
             fetch_params = {"username": username}
@@ -1132,6 +1188,8 @@ class InstagramClient:
                     params=fetch_params,
                     headers=fetch_headers,
                 )
+                if settings.ig_proxy_url:
+                    self._note_worker_reply(response)
                 last_status = response.status_code
 
                 if response.status_code == 200:

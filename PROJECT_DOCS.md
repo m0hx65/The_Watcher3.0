@@ -734,6 +734,34 @@ Set `IG_PROXY_URL` in environment variables to enable. The bot falls back to
 direct Instagram requests if the proxy is unreachable, and serves repeated
 reel queries from a 90-second in-memory cache to keep request volume low.
 
+**The Worker takes a key (2026-11-12).** Its URL is public in this repository
+(and its git history), and until now it proxied Instagram for anyone who
+called it — spending its free quota and sending more traffic under the bot's
+own request fingerprint. With the Worker secret `WATCHER_KEY` set, every
+request must carry the same value in the `X-Watcher-Key` header, or it is
+answered `403 {"error":"bad watcher key"}` before anything reaches Instagram
+(compared in constant time). The bot sends the header from `IG_PROXY_KEY`,
+on Worker requests only (`InstagramClient._worker_get` / `_worker_headers`):
+never to Instagram, never logged. A Worker refusing the key would read as
+Instagram blocking every route, so the bot says so in one WARNING naming both
+settings (`_note_worker_reply`), and `/probe`'s route line says whether the
+Worker is keyed. The Worker source lives outside this repository
+(`ig-proxy-worker/src/index.js`, deployed with `npx wrangler deploy`).
+
+Turning it on, in an order that never locks the bot out (the bot sends no
+header until `IG_PROXY_KEY` is set; the Worker checks nothing until
+`WATCHER_KEY` is set):
+
+1. Deploy the bot. With `IG_PROXY_KEY` unset nothing changes.
+2. Generate a key — `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+   — and set it as `IG_PROXY_KEY` in the Render dashboard. The bot now sends
+   the header, which the Worker still ignores.
+3. In `ig-proxy-worker`: `npx wrangler deploy`, then
+   `npx wrangler secret put WATCHER_KEY` and paste the same key. From that
+   moment the Worker answers only the bot.
+4. Check: the Worker URL with `?username=instagram` and no header answers 403,
+   and the bot's log shows no "refused this bot's key" warning.
+
 Since 2026-11-04 the `?user_id=` route answers 401 for every id. After three
 refusals in a row it is skipped for 10 minutes: the home fetcher is asked
 first when one is connected, and a sweep without one does not ask the Worker
@@ -1202,6 +1230,7 @@ All settings are read from environment variables (or a `.env` file locally).
 |---|---|---|
 | `IG_SESSION_COOKIE` | — | Full cookie string from a logged-in browser session (enables HD profile pictures). Optional — login-free is the default and recommended mode |
 | `IG_PROXY_URL` | — | Cloudflare Worker proxy URL for datacenter IP bypass |
+| `IG_PROXY_KEY` | — | The Worker's access key, sent as `X-Watcher-Key` on Worker requests only (never to Instagram). Must equal the Worker's `WATCHER_KEY` secret; see §6.7 |
 | `IG_SWEEP_AUTH_ATTEMPTS` | `1` | Worker re-asks per blocked check during a sweep (each call is already 6 upstream attempts) |
 | `IG_MANUAL_AUTH_ATTEMPTS` | `3` | Worker re-asks for an on-demand check — a repeat call may land on a different colo |
 
